@@ -1,0 +1,125 @@
+//! File-based fixtures: each `.mojo` file under `assets/<category>/` is run through
+//! the whole pipeline and asserted to land at the outcome its folder names. Drop a
+//! real Mojo file into the matching folder to add coverage — no code changes.
+//!
+//! Categories: `ok` (lex+parse+check+eval all succeed), `parse_error` (rejected at
+//! lex/parse), `type_error` (checker rejects), `runtime_error` (fails at eval,
+//! including the `Unsupported` "parse now, run later" gaps).
+//!
+//! A file may optionally pin the exact message with a top comment
+//! `# expect: <substring>` (valid Mojo, skipped by the lexer): the reported error
+//! must then contain `<substring>`.
+
+use mojo_lite::{check, parse, Evaluator};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+/// The pipeline stage at which a program is first rejected (or `Ok`).
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum Outcome {
+    Ok,
+    ParseError,
+    TypeError,
+    RuntimeError,
+}
+
+impl Outcome {
+    fn label(self) -> &'static str {
+        match self {
+            Outcome::Ok => "ok",
+            Outcome::ParseError => "parse_error",
+            Outcome::TypeError => "type_error",
+            Outcome::RuntimeError => "runtime_error",
+        }
+    }
+}
+
+/// Run the full pipeline, returning where it first fails and the message.
+fn classify(source: &str) -> (Outcome, String) {
+    let program = match parse(source) {
+        Ok(p) => p,
+        Err(e) => return (Outcome::ParseError, e.to_string()),
+    };
+    if let Err(e) = check(&program) {
+        return (Outcome::TypeError, e.to_string());
+    }
+    let mut evaluator = Evaluator::new();
+    match evaluator.eval_program(&program) {
+        Ok(()) => (Outcome::Ok, String::new()),
+        Err(e) => (Outcome::RuntimeError, e.to_string()),
+    }
+}
+
+/// The `# expect: <substring>` directive (if any), pinning the error message.
+fn expected_substring(source: &str) -> Option<String> {
+    source.lines().find_map(|line| {
+        line.trim_start()
+            .strip_prefix('#')?
+            .trim_start()
+            .strip_prefix("expect:")
+            .map(|s| s.trim().to_string())
+    })
+}
+
+/// The `.mojo` files in `assets/<category>/`, sorted (empty if the dir is absent).
+fn fixtures(category: &str) -> Vec<PathBuf> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets").join(category);
+    let mut files: Vec<PathBuf> = match fs::read_dir(&dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "mojo"))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    files.sort();
+    files
+}
+
+/// Assert every fixture in a category lands at `expected`, reporting all
+/// mismatches (and any unmet `# expect:` pin) at once.
+fn check_category(category: &str, expected: Outcome) {
+    let mut failures = Vec::new();
+    for path in fixtures(category) {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let source = fs::read_to_string(&path).expect("read fixture");
+        let (got, message) = classify(&source);
+        let shown = if message.is_empty() { "no error" } else { message.as_str() };
+        if got != expected {
+            failures.push(format!(
+                "  {name}: expected {}, got {} ({shown})",
+                expected.label(),
+                got.label(),
+            ));
+        } else if let Some(sub) = expected_substring(&source)
+            && !message.contains(&sub)
+        {
+            failures.push(format!("  {name}: error did not contain '{sub}' (got: {shown})"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "\n{} fixture(s) in assets/{category}/ did not match:\n{}",
+        failures.len(),
+        failures.join("\n"),
+    );
+}
+
+#[test]
+fn assets_ok() {
+    check_category("ok", Outcome::Ok);
+}
+
+#[test]
+fn assets_parse_error() {
+    check_category("parse_error", Outcome::ParseError);
+}
+
+#[test]
+fn assets_type_error() {
+    check_category("type_error", Outcome::TypeError);
+}
+
+#[test]
+fn assets_runtime_error() {
+    check_category("runtime_error", Outcome::RuntimeError);
+}
