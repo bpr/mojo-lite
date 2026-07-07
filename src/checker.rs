@@ -21,7 +21,9 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use crate::ast::{Dtype, Expr, InfixOp, Method, PrefixOp, Stmt, Type};
+use crate::ast::{
+    ArgConvention, Dtype, Expr, ExprKind, InfixOp, Method, PrefixOp, Stmt, StmtKind, Type,
+};
 use crate::error::TypeError;
 
 /// A type in the checker's lattice. Scalars mirror `ast::Type`; `Func` is
@@ -52,6 +54,11 @@ enum Ty {
         ret: Box<Ty>,
         required: usize,
         variadic: Option<Box<Ty>>,
+        /// The argument convention of each regular parameter (same order as
+        /// `params`). A `mut`/`ref` parameter *borrows* its argument (so passing a
+        /// non-Copyable value to it is fine); a `read`/`owned`/default parameter
+        /// *consumes* by value (requiring a Copyable value or a `^` transfer).
+        conventions: Vec<Option<ArgConvention>>,
     },
     /// A *generic* function synthesized from a `def` with a `[params]` list. Kept
     /// distinct from `Func` because a call site infers/supplies its parameters.
@@ -64,7 +71,10 @@ enum Ty {
     /// A type parameter (`T`) inside a generic `def`/`struct` body, carrying its
     /// trait `bounds`. It supports no operators, and only the methods required by
     /// its bound traits (you can otherwise just store, pass, and return it).
-    Param { name: String, bounds: Vec<String> },
+    Param {
+        name: String,
+        bounds: Vec<String>,
+    },
     /// `Self` inside a trait method requirement — the (abstract) conforming type.
     /// Substituted for the concrete/parameter type when a struct's method is
     /// checked against the requirement, or when a bounded `T`'s method is typed.
@@ -77,7 +87,10 @@ enum Ty {
     Struct(String, Vec<TyArg>),
     /// A SIMD vector type `SIMD[DType.<dtype>, width]` (built-in). The scalar
     /// aliases (`Int32`, `Float32`, …) are `Simd` with `width == 1`.
-    Simd { dtype: Dtype, width: i64 },
+    Simd {
+        dtype: Dtype,
+        width: i64,
+    },
     /// The built-in `Error` type (what `raise` raises and `except` binds).
     Error,
     /// The built-in `List[T]` collection type (a value type; element type `T`).
@@ -277,7 +290,9 @@ impl Checker {
             // checker's `Ty::Func` only ever arises from a `def` (with names/arity),
             // so a function-typed binding is not modeled yet.
             Type::Func { .. } => {
-                return Err(TypeError::Unsupported("function type annotation".to_string()));
+                return Err(TypeError::Unsupported(
+                    "function type annotation".to_string(),
+                ));
             }
             // A `ref [origin] T` reference type parses (its origin discarded) but
             // reference semantics / origins are not modeled.
@@ -290,7 +305,10 @@ impl Checker {
                 if args.is_empty()
                     && let Some(bounds) = self.lookup_tparam(name)
                 {
-                    return Ok(Ty::Param { name: name.clone(), bounds });
+                    return Ok(Ty::Param {
+                        name: name.clone(),
+                        bounds,
+                    });
                 }
                 // SIMD vector types and their fixed-width scalar aliases.
                 if let Some(dtype) = Dtype::from_scalar_alias(name) {
@@ -336,9 +354,10 @@ impl Checker {
             // `Self.T` — one of the enclosing struct's *type* parameters (a value
             // parameter is not a type, so `Self.n` in type position is an error).
             Type::SelfParam(name) => match self.self_decls.iter().find(|d| d.name() == name) {
-                Some(ParamDecl::Type { bounds, .. }) => {
-                    Ty::Param { name: name.clone(), bounds: bounds.clone() }
-                }
+                Some(ParamDecl::Type { bounds, .. }) => Ty::Param {
+                    name: name.clone(),
+                    bounds: bounds.clone(),
+                },
                 _ => return Err(TypeError::UnknownSelfParam(name.clone())),
             },
             // Bare `Self` — the enclosing struct type or a trait's abstract Self.
@@ -358,13 +377,17 @@ impl Checker {
     /// type parameter takes a type (bound-checked); a value parameter takes a
     /// comptime `Int`. A lone-identifier value argument is reinterpreted as a
     /// type when the parameter is a type parameter.
-    fn resolve_param_arg(&self, decl: &ParamDecl, arg: &crate::ast::ParamArg) -> Result<TyArg, TypeError> {
+    fn resolve_param_arg(
+        &self,
+        decl: &ParamDecl,
+        arg: &crate::ast::ParamArg,
+    ) -> Result<TyArg, TypeError> {
         use crate::ast::ParamArg;
         match decl {
             ParamDecl::Type { name, bounds } => {
                 let ty = match arg {
                     ParamArg::Type(t) => self.ty_from_anno(t)?,
-                    ParamArg::Value(Expr::Identifier(id)) => {
+                    ParamArg::Value(Expr { kind: ExprKind::Identifier(id), .. }) => {
                         self.ty_from_anno(&Type::Named(id.clone(), vec![]))?
                     }
                     ParamArg::Value(_) => {
@@ -409,9 +432,9 @@ impl Checker {
         match &args[0] {
             crate::ast::ParamArg::Type(t) => Ok(Ty::List(Box::new(self.ty_from_anno(t)?))),
             // A bare-identifier arg is reinterpreted as a type (as elsewhere).
-            crate::ast::ParamArg::Value(Expr::Identifier(id)) => {
-                Ok(Ty::List(Box::new(self.ty_from_anno(&Type::Named(id.clone(), vec![]))?)))
-            }
+            crate::ast::ParamArg::Value(Expr { kind: ExprKind::Identifier(id), .. }) => Ok(Ty::List(Box::new(
+                self.ty_from_anno(&Type::Named(id.clone(), vec![]))?,
+            ))),
             crate::ast::ParamArg::Value(_) => Err(TypeError::TypeMismatch {
                 expected: "a type".to_string(),
                 found: "a value".to_string(),
@@ -427,7 +450,7 @@ impl Checker {
             elems.push(match arg {
                 crate::ast::ParamArg::Type(t) => self.ty_from_anno(t)?,
                 // A bare-identifier arg is reinterpreted as a type (as elsewhere).
-                crate::ast::ParamArg::Value(Expr::Identifier(id)) => {
+                crate::ast::ParamArg::Value(Expr { kind: ExprKind::Identifier(id), .. }) => {
                     self.ty_from_anno(&Type::Named(id.clone(), vec![]))?
                 }
                 crate::ast::ParamArg::Value(_) => {
@@ -493,15 +516,15 @@ impl Checker {
     /// and `+ - * // % **` / unary `-`. Rejects anything non-comptime (a value
     /// parameter, a call, a non-`Int` operation).
     fn eval_ct(&self, expr: &Expr) -> Result<i64, TypeError> {
-        match expr {
-            Expr::Int(n) => Ok(*n),
-            Expr::Identifier(name) => self
+        match &expr.kind {
+            ExprKind::Int(n) => Ok(*n),
+            ExprKind::Identifier(name) => self
                 .comptimes
                 .get(name)
                 .copied()
                 .ok_or_else(|| TypeError::NotComptime(name.clone())),
-            Expr::Prefix(PrefixOp::Neg, e) => Ok(-self.eval_ct(e)?),
-            Expr::Infix(op, l, r) => {
+            ExprKind::Prefix(PrefixOp::Neg, e) => Ok(-self.eval_ct(e)?),
+            ExprKind::Infix(op, l, r) => {
                 let (a, b) = (self.eval_ct(l)?, self.eval_ct(r)?);
                 match op {
                     InfixOp::Add => Ok(a + b),
@@ -515,7 +538,9 @@ impl Checker {
                     )),
                 }
             }
-            _ => Err(TypeError::NotComptime("not a comptime Int expression".to_string())),
+            _ => Err(TypeError::NotComptime(
+                "not a comptime Int expression".to_string(),
+            )),
         }
     }
 
@@ -560,9 +585,10 @@ impl Checker {
         ret: Option<&Ty>,
         in_loop: bool,
     ) -> Result<(), TypeError> {
-        match stmt {
-            Stmt::VarDecl { name, ty, value } => {
+        match &stmt.kind {
+            StmtKind::VarDecl { name, ty, value } => {
                 let found = self.infer(value)?;
+                self.check_consuming(value, &found, &format!("variable '{name}'"))?;
                 let declared = match ty {
                     // Annotated: the value must coerce to the annotation.
                     Some(anno) => {
@@ -582,8 +608,9 @@ impl Checker {
                 self.declare(name, declared)
             }
 
-            Stmt::Assign { name, value } => {
+            StmtKind::Assign { name, value } => {
                 let found = self.infer(value)?;
+                self.check_consuming(value, &found, &format!("assignment to '{name}'"))?;
                 match self.lookup(name).cloned() {
                     // Re-assignment: the value must keep the variable's type.
                     Some(target) => {
@@ -612,7 +639,7 @@ impl Checker {
                 }
             }
 
-            Stmt::AugAssign { place, op, value } => {
+            StmtKind::AugAssign { place, op, value } => {
                 // `target OP= value` means `target = target OP value`: the place
                 // must be writable, and the result of the operator must keep the
                 // place's type. Typing `place OP value` reuses `infer_infix`.
@@ -631,13 +658,13 @@ impl Checker {
             // Tuple unpacking `a, b = t` is parsed and grammar-documented, but its
             // semantics (splitting a tuple across targets) are deferred — flagged
             // here, consistent with the other syntax-first parse-only constructs.
-            Stmt::Unpack { .. } => Err(TypeError::Unsupported("tuple unpacking".to_string())),
+            StmtKind::Unpack { .. } => Err(TypeError::Unsupported("tuple unpacking".to_string())),
 
             // `with` blocks parse, but the context-manager (`__enter__`/`__exit__`)
             // protocol is deferred — flagged, like the other parse-only constructs.
-            Stmt::With { .. } => Err(TypeError::Unsupported("with statement".to_string())),
+            StmtKind::With { .. } => Err(TypeError::Unsupported("with statement".to_string())),
 
-            Stmt::SetPlace { place, value } => {
+            StmtKind::SetPlace { place, value } => {
                 // The place must be a writable location (a field/index chain
                 // rooted at a mutable variable or `mut self`); the value must
                 // keep the place's type. A width-1 SIMD target (a lane write, or
@@ -659,7 +686,7 @@ impl Checker {
             }
 
             // `raises` is parsed but its effect is not analyzed (deferred).
-            Stmt::Def {
+            StmtKind::Def {
                 name,
                 type_params,
                 params,
@@ -673,9 +700,13 @@ impl Checker {
                 // Conventions / markers / `**kwargs` are parsed but not implemented;
                 // **default values** and a trailing **`*args`** are supported on
                 // non-generic functions.
-                if let Some(feature) =
-                    Self::advanced_param_feature(params, *positional_only, *keyword_only, false, false)
-                {
+                if let Some(feature) = Self::advanced_param_feature(
+                    params,
+                    *positional_only,
+                    *keyword_only,
+                    false,
+                    false,
+                ) {
                     return Err(TypeError::Unsupported(feature.to_string()));
                 }
                 let has_default = params.iter().any(|p| p.default.is_some());
@@ -686,7 +717,9 @@ impl Checker {
                 }
                 // A `*args` variadic must be a single, trailing parameter, on a
                 // non-generic function.
-                let variadic_idx = params.iter().position(|p| p.kind == crate::ast::ParamKind::Variadic);
+                let variadic_idx = params
+                    .iter()
+                    .position(|p| p.kind == crate::ast::ParamKind::Variadic);
                 if let Some(vi) = variadic_idx {
                     if !type_params.is_empty() {
                         return Err(TypeError::Unsupported(
@@ -755,6 +788,7 @@ impl Checker {
                         ret: Box::new(ret_ty.clone()),
                         required,
                         variadic: variadic_idx.map(|vi| Box::new(param_tys[vi].clone())),
+                        conventions: regular.iter().map(|p| p.convention).collect(),
                     }
                 } else {
                     Ty::GenericFunc {
@@ -810,15 +844,31 @@ impl Checker {
                 result
             }
 
-            Stmt::Struct { name, type_params, conforms, fields, methods, fieldwise_init, decorators: _ } => {
-                self.check_struct(name, type_params, conforms, fields, methods, *fieldwise_init)
-            }
+            StmtKind::Struct {
+                name,
+                type_params,
+                conforms,
+                fields,
+                methods,
+                fieldwise_init,
+                decorators: _,
+            } => self.check_struct(
+                name,
+                type_params,
+                conforms,
+                fields,
+                methods,
+                *fieldwise_init,
+            ),
 
-            Stmt::Trait { name, refines, methods, comptime_members } => {
-                self.check_trait(name, refines, methods, comptime_members)
-            }
+            StmtKind::Trait {
+                name,
+                refines,
+                methods,
+                comptime_members,
+            } => self.check_trait(name, refines, methods, comptime_members),
 
-            Stmt::Comptime { name, value } => {
+            StmtKind::Comptime { name, value } => {
                 let v = self.eval_ct(value)?;
                 self.comptimes.insert(name.clone(), v);
                 // Also an ordinary `Int` binding, so it is usable at runtime.
@@ -828,14 +878,10 @@ impl Checker {
             // `comptime if` / `comptime for` parse and are grammar-documented, but
             // compile-time branch selection / loop unrolling is deferred — flagged
             // here, like the other syntax-first parse-only constructs.
-            Stmt::ComptimeIf { .. } => {
-                Err(TypeError::Unsupported("comptime if".to_string()))
-            }
-            Stmt::ComptimeFor { .. } => {
-                Err(TypeError::Unsupported("comptime for".to_string()))
-            }
+            StmtKind::ComptimeIf { .. } => Err(TypeError::Unsupported("comptime if".to_string())),
+            StmtKind::ComptimeFor { .. } => Err(TypeError::Unsupported("comptime for".to_string())),
 
-            Stmt::If { branches, orelse } => {
+            StmtKind::If { branches, orelse } => {
                 for (cond, body) in branches {
                     self.expect_bool(cond, "if condition")?;
                     self.check_scoped_block(body, ret, in_loop)?;
@@ -846,7 +892,7 @@ impl Checker {
                 Ok(())
             }
 
-            Stmt::While { cond, body } => {
+            StmtKind::While { cond, body } => {
                 self.expect_bool(cond, "while condition")?;
                 self.check_scoped_block(body, ret, true)
             }
@@ -854,7 +900,7 @@ impl Checker {
             // `raise` — its operand must be an `Error` (or a `String`, the
             // shorthand). The raises *effect* (that this must be in a `raises`
             // function or a `try`) is deliberately not analyzed.
-            Stmt::Raise(expr) => {
+            StmtKind::Raise(expr) => {
                 let ty = self.infer(expr)?;
                 if ty != Ty::Error && ty != Ty::String {
                     return Err(TypeError::TypeMismatch {
@@ -868,9 +914,14 @@ impl Checker {
 
             // Imports are parsed but not resolved (no module system yet), so
             // they are a checker no-op — imported names are not made available.
-            Stmt::Import { .. } | Stmt::FromImport { .. } => Ok(()),
+            StmtKind::Import { .. } | StmtKind::FromImport { .. } => Ok(()),
 
-            Stmt::Try { body, except, orelse, finalbody } => {
+            StmtKind::Try {
+                body,
+                except,
+                orelse,
+                finalbody,
+            } => {
                 self.check_scoped_block(body, ret, in_loop)?;
                 if let Some((name, ex_body)) = except {
                     self.scopes.push(HashMap::new());
@@ -893,7 +944,7 @@ impl Checker {
                 Ok(())
             }
 
-            Stmt::For { var, iter, body } => {
+            StmtKind::For { var, iter, body } => {
                 // The loop variable's type comes from the iterable: `Int` for a
                 // `range`, or the element type for a `List`.
                 let elem_ty = match self.infer(iter)? {
@@ -916,7 +967,7 @@ impl Checker {
                 result
             }
 
-            Stmt::Break => {
+            StmtKind::Break => {
                 if in_loop {
                     Ok(())
                 } else {
@@ -924,7 +975,7 @@ impl Checker {
                 }
             }
 
-            Stmt::Continue => {
+            StmtKind::Continue => {
                 if in_loop {
                     Ok(())
                 } else {
@@ -932,7 +983,7 @@ impl Checker {
                 }
             }
 
-            Stmt::Return(expr) => {
+            StmtKind::Return(expr) => {
                 let expected = match ret {
                     Some(ty) => ty,
                     None => return Err(TypeError::ReturnOutsideFunction),
@@ -941,6 +992,9 @@ impl Checker {
                     Some(e) => self.infer(e)?,
                     None => Ty::None,
                 };
+                if let Some(e) = expr {
+                    self.check_consuming(e, &found, "return value")?;
+                }
                 // Returning a function value is an escape, regardless of the
                 // declared return type — match the evaluator's ClosureEscape.
                 if matches!(found, Ty::Func { .. } | Ty::GenericFunc { .. }) {
@@ -956,9 +1010,9 @@ impl Checker {
                 Ok(())
             }
 
-            Stmt::Pass => Ok(()),
+            StmtKind::Pass => Ok(()),
 
-            Stmt::Expr(expr) => {
+            StmtKind::Expr(expr) => {
                 self.infer(expr)?;
                 Ok(())
             }
@@ -982,7 +1036,7 @@ impl Checker {
         flag_defaults: bool,
         flag_variadic: bool,
     ) -> Option<&'static str> {
-        use crate::ast::ParamKind;
+        use crate::ast::{ArgConvention, ParamKind};
         if flag_defaults && params.iter().any(|p| p.default.is_some()) {
             return Some("default argument values");
         }
@@ -992,8 +1046,12 @@ impl Checker {
         if params.iter().any(|p| p.kind == ParamKind::KwVariadic) {
             return Some("variadic '**kwargs' parameters");
         }
-        if params.iter().any(|p| p.convention.is_some()) {
-            return Some("argument conventions (mut/owned/out/read/ref)");
+        // `owned`/`read` bind by value; `mut`/`ref` are references whose mutations
+        // are written back to the caller (modeled — see `eval_call`). Only `out`
+        // (an uninitialized out-parameter, i.e. a hand-written `__init__`) still
+        // has semantics we don't model.
+        if params.iter().any(|p| matches!(p.convention, Some(ArgConvention::Out))) {
+            return Some("the 'out' argument convention");
         }
         if positional_only.is_some() {
             return Some("positional-only '/' parameters");
@@ -1026,13 +1084,18 @@ impl Checker {
                         ty: only.clone(),
                     });
                 }
-                decls.push(ParamDecl::Value { name: tp.name.clone() });
+                decls.push(ParamDecl::Value {
+                    name: tp.name.clone(),
+                });
                 continue;
             }
             for bound in &tp.bounds {
                 self.check_trait_name(bound)?;
             }
-            decls.push(ParamDecl::Type { name: tp.name.clone(), bounds: tp.bounds.clone() });
+            decls.push(ParamDecl::Type {
+                name: tp.name.clone(),
+                bounds: tp.bounds.clone(),
+            });
         }
         Ok(decls)
     }
@@ -1075,9 +1138,13 @@ impl Checker {
         let result = (|| {
             let mut sigs: HashMap<String, MethodSig> = HashMap::new();
             for m in methods {
-                if let Some(feature) =
-                    Self::advanced_param_feature(&m.params, m.positional_only, m.keyword_only, true, true)
-                {
+                if let Some(feature) = Self::advanced_param_feature(
+                    &m.params,
+                    m.positional_only,
+                    m.keyword_only,
+                    true,
+                    true,
+                ) {
                     return Err(TypeError::Unsupported(feature.to_string()));
                 }
                 let sig = MethodSig {
@@ -1096,7 +1163,8 @@ impl Checker {
         })();
         self.self_ty = saved_self_ty;
         self.self_decls = saved_self_decls;
-        self.traits.insert(name.to_string(), TraitInfo { methods: result? });
+        self.traits
+            .insert(name.to_string(), TraitInfo { methods: result? });
         Ok(())
     }
 
@@ -1127,7 +1195,15 @@ impl Checker {
         let self_ty = Ty::Struct(name.to_string(), decls.iter().map(param_as_arg).collect());
         let saved_self_decls = std::mem::replace(&mut self.self_decls, decls.clone());
         let saved_self_ty = self.self_ty.replace(self_ty.clone());
-        let result = self.check_struct_members(name, decls, conforms, fields, methods, fieldwise_init, &self_ty);
+        let result = self.check_struct_members(
+            name,
+            decls,
+            conforms,
+            fields,
+            methods,
+            fieldwise_init,
+            &self_ty,
+        );
         self.self_decls = saved_self_decls;
         self.self_ty = saved_self_ty;
         result
@@ -1200,17 +1276,28 @@ impl Checker {
             Some(info) => info,
             None => return Ok(()), // a built-in trait — nothing to check
         };
-        let struct_info = self.structs.get(name).expect("registered before conformance");
+        let struct_info = self
+            .structs
+            .get(name)
+            .expect("registered before conformance");
         for (mname, req_sig) in &trait_info.methods {
-            let got = struct_info.methods.get(mname).ok_or_else(|| TypeError::MissingTraitMethod {
-                struct_name: name.to_string(),
-                trait_name: tr.to_string(),
-                method: mname.clone(),
-            })?;
+            let got =
+                struct_info
+                    .methods
+                    .get(mname)
+                    .ok_or_else(|| TypeError::MissingTraitMethod {
+                        struct_name: name.to_string(),
+                        trait_name: tr.to_string(),
+                        method: mname.clone(),
+                    })?;
             // The requirement's `Self` becomes this struct's type. `mut_self` is
             // not part of conformance checking yet, so mirror the implementation.
             let want = MethodSig {
-                params: req_sig.params.iter().map(|t| substitute_self(t, self_ty)).collect(),
+                params: req_sig
+                    .params
+                    .iter()
+                    .map(|t| substitute_self(t, self_ty))
+                    .collect(),
                 ret: substitute_self(&req_sig.ret, self_ty),
                 mut_self: got.mut_self,
             };
@@ -1237,20 +1324,18 @@ impl Checker {
                 "a method without a 'self' receiver (@staticmethod)".to_string(),
             ));
         }
-        // `out self` / `owned self` / `ref self` receivers (hand-written
-        // `__init__`, moving/consuming methods, parametric-mutability references)
-        // are parsed but their semantics are deferred; a plain `self`, `read self`,
-        // or `mut self` receiver is fine.
+        // `out self` (hand-written `__init__`) and `ref self` (parametric-mutability
+        // references) need init / reference semantics that aren't modeled yet, so
+        // they stay flagged. A plain `self`, `read self`, `mut self`, or **`owned
+        // self`** (a consuming method — notably `__del__(owned self)`) is fine:
+        // `owned self` binds the receiver by value (like `read self`), and its
+        // consuming meaning is handled by the ownership analysis / ASAP drops.
         if matches!(
             m.self_convention,
-            Some(
-                crate::ast::ArgConvention::Out
-                    | crate::ast::ArgConvention::Owned
-                    | crate::ast::ArgConvention::Ref
-            )
+            Some(crate::ast::ArgConvention::Out | crate::ast::ArgConvention::Ref)
         ) {
             return Err(TypeError::Unsupported(
-                "'out self' / 'owned self' / 'ref self' receiver".to_string(),
+                "'out self' / 'ref self' receiver".to_string(),
             ));
         }
         let ret_ty = match &m.ret {
@@ -1291,8 +1376,16 @@ impl Checker {
     /// Type a struct construction `Name[param_args](args)` (the fieldwise
     /// constructor). Type parameters are supplied explicitly or inferred from the
     /// field arguments; value parameters must be supplied explicitly.
-    fn infer_construction(&self, name: &str, param_args: &[crate::ast::ParamArg], args: &[Expr]) -> Result<Ty, TypeError> {
-        let info = self.structs.get(name).expect("caller checked it is a struct");
+    fn infer_construction(
+        &self,
+        name: &str,
+        param_args: &[crate::ast::ParamArg],
+        args: &[Expr],
+    ) -> Result<Ty, TypeError> {
+        let info = self
+            .structs
+            .get(name)
+            .expect("caller checked it is a struct");
         if !info.fieldwise_init {
             return Err(TypeError::NoConstructor(name.to_string()));
         }
@@ -1305,8 +1398,12 @@ impl Checker {
                 got: args.len(),
             });
         }
-        let arg_tys = args.iter().map(|a| self.infer(a)).collect::<Result<Vec<_>, _>>()?;
-        let (subst, tyargs) = self.resolve_use_params(name, &decls, param_args, &field_tys, &arg_tys)?;
+        let arg_tys = args
+            .iter()
+            .map(|a| self.infer(a))
+            .collect::<Result<Vec<_>, _>>()?;
+        let (subst, tyargs) =
+            self.resolve_use_params(name, &decls, param_args, &field_tys, &arg_tys)?;
         for (i, (aty, fty)) in arg_tys.iter().zip(&field_tys).enumerate() {
             let expected = substitute(fty, &subst);
             if !coerces(aty, &expected) {
@@ -1316,6 +1413,9 @@ impl Checker {
                     context: format!("field {} of '{}'", i + 1, name),
                 });
             }
+            // A constructor stores each argument in a field by value — a consuming
+            // position.
+            self.check_consuming(&args[i], aty, &format!("field {} of '{}'", i + 1, name))?;
         }
         Ok(Ty::Struct(name.to_string(), tyargs))
     }
@@ -1368,11 +1468,17 @@ impl Checker {
                         param: pname.clone(),
                     });
                 }
-                ParamDecl::Type { name: pname, bounds } => {
-                    let solved = subst.get(pname).ok_or_else(|| TypeError::CannotInferTypeParam {
-                        name: name.to_string(),
-                        param: pname.clone(),
-                    })?;
+                ParamDecl::Type {
+                    name: pname,
+                    bounds,
+                } => {
+                    let solved =
+                        subst
+                            .get(pname)
+                            .ok_or_else(|| TypeError::CannotInferTypeParam {
+                                name: name.to_string(),
+                                param: pname.clone(),
+                            })?;
                     for bound in bounds {
                         if !self.conforms_to(solved, bound) {
                             return Err(TypeError::TraitNotSatisfied {
@@ -1406,6 +1512,43 @@ impl Checker {
             Ty::Param { bounds, .. } => bounds.iter().any(|b| b == tr),
             _ => false,
         }
+    }
+
+    /// Whether a value of this type may be **copied** (implicitly duplicated). Mojo
+    /// is move-only by default: scalars and the built-in value types are Copyable,
+    /// (see the free [`is_place_expr`] used by [`Self::check_consuming`]).
+    /// but a `struct` is Copyable only if it declares `Copyable` conformance, and a
+    /// type parameter only if bounded by `Copyable`.
+    fn is_copyable(&self, ty: &Ty) -> bool {
+        match ty {
+            Ty::Struct(name, _) => self
+                .structs
+                .get(name)
+                .map(|s| s.conforms.iter().any(|c| c == "Copyable"))
+                .unwrap_or(true),
+            Ty::Param { bounds, .. } => bounds.iter().any(|b| b == "Copyable"),
+            // Scalars, `String`, `List`/`Tuple`/`Simd`/`Range`, `Error`, closures,
+            // and `Self` are treated as copyable (element-wise copyability of
+            // aggregates is not modeled).
+            _ => true,
+        }
+    }
+
+    /// At a **consuming** position (binding a value to a new place, passing it by
+    /// value, returning it, …): a non-Copyable value that is a *place* (names an
+    /// existing binding) is being copied — reject it unless it was transferred with
+    /// `^` (which is a move, not a place). `context` names the site for the error.
+    fn check_consuming(&self, expr: &Expr, ty: &Ty, context: &str) -> Result<(), TypeError> {
+        // A `^` transfer is `Expr::Transfer`, not a place, so it is naturally
+        // exempt. A fresh temporary (a call result, a literal, an operator) is not a
+        // place either — moving it is free.
+        if is_place_expr(expr) && !self.is_copyable(ty) {
+            return Err(TypeError::NonCopyable {
+                ty: ty.to_string(),
+                context: context.to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Bind `name` in the innermost scope, rejecting a same-scope redeclaration.
@@ -1456,48 +1599,57 @@ impl Checker {
     }
 
     fn infer(&self, expr: &Expr) -> Result<Ty, TypeError> {
-        match expr {
-            Expr::Int(_) => Ok(Ty::IntLiteral),
-            Expr::Float(_) => Ok(Ty::FloatLiteral),
-            Expr::Bool(_) => Ok(Ty::Bool),
-            Expr::Str(_) => Ok(Ty::String),
-            Expr::None => Ok(Ty::None),
-            Expr::Identifier(name) => self
+        match &expr.kind {
+            ExprKind::Int(_) => Ok(Ty::IntLiteral),
+            ExprKind::Float(_) => Ok(Ty::FloatLiteral),
+            ExprKind::Bool(_) => Ok(Ty::Bool),
+            ExprKind::Str(_) => Ok(Ty::String),
+            ExprKind::None => Ok(Ty::None),
+            ExprKind::Identifier(name) => self
                 .lookup(name)
                 .cloned()
                 .ok_or_else(|| TypeError::UndefinedVariable(name.clone())),
-            Expr::Prefix(op, operand) => self.infer_prefix(*op, operand),
-            Expr::Infix(op, left, right) => self.infer_infix(*op, left, right),
-            Expr::Call { name, param_args, args, kwargs } => {
-                self.infer_call(name, param_args, args, kwargs)
-            }
-            Expr::Member { object, field } => self.infer_member(object, field),
-            Expr::MethodCall { object, method, args, kwargs } => {
+            ExprKind::Prefix(op, operand) => self.infer_prefix(*op, operand),
+            ExprKind::Infix(op, left, right) => self.infer_infix(*op, left, right),
+            ExprKind::Call {
+                name,
+                param_args,
+                args,
+                kwargs,
+            } => self.infer_call(name, param_args, args, kwargs),
+            ExprKind::Member { object, field } => self.infer_member(object, field),
+            ExprKind::MethodCall {
+                object,
+                method,
+                args,
+                kwargs,
+            } => {
                 reject_kwargs(kwargs)?;
                 self.infer_method_call(object, method, args)
             }
-            Expr::Index { object, index } => self.infer_index(object, index),
+            ExprKind::Index { object, index } => self.infer_index(object, index),
             // Transfer is identity for typing (ownership move is not modeled).
-            Expr::Transfer(inner) => self.infer(inner),
-            Expr::ListLit(elems) => Ok(Ty::List(Box::new(self.infer_list_elem(elems)?))),
+            ExprKind::Transfer(inner) => self.infer(inner),
+            ExprKind::ListLit(elems) => Ok(Ty::List(Box::new(self.infer_list_elem(elems)?))),
             // A tuple literal keeps each element's own type (heterogeneous).
-            Expr::TupleLit(elems) => {
-                let tys = elems.iter().map(|e| self.infer(e)).collect::<Result<Vec<_>, _>>()?;
+            ExprKind::TupleLit(elems) => {
+                let tys = elems
+                    .iter()
+                    .map(|e| self.infer(e))
+                    .collect::<Result<Vec<_>, _>>()?;
                 Ok(Ty::Tuple(tys))
             }
             // Walrus `name := value` types as `value` (the evaluator flags it as
             // unsupported). The name is not bound here — `infer` is read-only — so
             // a program that *uses* the walrus-bound name later won't type-check.
-            Expr::Named { value, .. } => self.infer(value),
+            ExprKind::Named { value, .. } => self.infer(value),
             // Parsed, semantics deferred (syntax-first phase).
-            Expr::IfExpr { .. } => {
+            ExprKind::IfExpr { .. } => {
                 Err(TypeError::Unsupported("conditional expression".to_string()))
             }
-            Expr::Compare { .. } => {
-                Err(TypeError::Unsupported("chained comparison".to_string()))
-            }
-            Expr::Slice { .. } => Err(TypeError::Unsupported("slice subscript".to_string())),
-            Expr::TString { .. } => Err(TypeError::Unsupported("t-string".to_string())),
+            ExprKind::Compare { .. } => Err(TypeError::Unsupported("chained comparison".to_string())),
+            ExprKind::Slice { .. } => Err(TypeError::Unsupported("slice subscript".to_string())),
+            ExprKind::TString { .. } => Err(TypeError::Unsupported("t-string".to_string())),
         }
     }
 
@@ -1523,7 +1675,11 @@ impl Checker {
 
     /// Type a `List` construction: `List[T](args)` (explicit element type) or
     /// `List(args)` (element type inferred from the arguments — non-empty).
-    fn infer_list_construction(&self, param_args: &[crate::ast::ParamArg], args: &[Expr]) -> Result<Ty, TypeError> {
+    fn infer_list_construction(
+        &self,
+        param_args: &[crate::ast::ParamArg],
+        args: &[Expr],
+    ) -> Result<Ty, TypeError> {
         if !param_args.is_empty() {
             let Ty::List(elem) = self.list_type(param_args)? else {
                 unreachable!("list_type returns a List");
@@ -1556,8 +1712,8 @@ impl Checker {
     /// rooted at a mutable place (so `foo().x = e` or `self.x` in a read-only
     /// method are rejected). SIMD lane writes are not supported yet.
     fn check_place(&self, place: &Expr) -> Result<Ty, TypeError> {
-        match place {
-            Expr::Identifier(name) => {
+        match &place.kind {
+            ExprKind::Identifier(name) => {
                 if name == "self" && !self.self_mutable {
                     return Err(TypeError::ImmutableSelf);
                 }
@@ -1565,13 +1721,13 @@ impl Checker {
                     .cloned()
                     .ok_or_else(|| TypeError::UndefinedVariable(name.clone()))
             }
-            Expr::Member { object, field } => {
+            ExprKind::Member { object, field } => {
                 // The object must itself be a writable place (a struct value).
                 self.check_place(object)?;
                 // Reuse the field-typing logic (validates the field exists).
                 self.infer_member(object, field)
             }
-            Expr::Index { object, index } => {
+            ExprKind::Index { object, index } => {
                 let obj_ty = self.check_place(object)?;
                 let elem = match &obj_ty {
                     Ty::List(elem) => (**elem).clone(),
@@ -1636,7 +1792,7 @@ impl Checker {
     /// Int`).
     fn infer_member(&self, object: &Expr, field: &str) -> Result<Ty, TypeError> {
         // `Self.n` reads the enclosing struct's value parameter (an `Int`).
-        if let Expr::Identifier(s) = object
+        if let ExprKind::Identifier(s) = &object.kind
             && s == "Self"
         {
             return match self.self_decls.iter().find(|d| d.name() == field) {
@@ -1646,7 +1802,10 @@ impl Checker {
         }
         let obj_ty = self.infer(object)?;
         if let Ty::Struct(sname, targs) = &obj_ty {
-            let info = self.structs.get(sname).expect("struct types are registered");
+            let info = self
+                .structs
+                .get(sname)
+                .expect("struct types are registered");
             if let Some((_, fty)) = info.fields.iter().find(|(n, _)| n == field) {
                 let subst = struct_subst(&info.decls, targs);
                 return Ok(substitute(fty, &subst));
@@ -1663,7 +1822,12 @@ impl Checker {
     /// type arguments; on a bounded type parameter (`x: T` with `T: SomeTrait`)
     /// the method is resolved from the bound trait's requirement, with `Self`
     /// substituted to `T`.
-    fn infer_method_call(&self, object: &Expr, method: &str, args: &[Expr]) -> Result<Ty, TypeError> {
+    fn infer_method_call(
+        &self,
+        object: &Expr,
+        method: &str,
+        args: &[Expr],
+    ) -> Result<Ty, TypeError> {
         let obj_ty = self.infer(object)?;
         // Built-in `List` methods (mutating; require a plain variable receiver).
         if let Ty::List(elem) = &obj_ty {
@@ -1674,7 +1838,10 @@ impl Checker {
         // arguments (struct) or `Self` (a bounded type parameter's trait method).
         let resolved: Option<(Vec<Ty>, Ty, bool)> = match &obj_ty {
             Ty::Struct(sname, targs) => {
-                let info = self.structs.get(sname).expect("struct types are registered");
+                let info = self
+                    .structs
+                    .get(sname)
+                    .expect("struct types are registered");
                 info.methods.get(method).map(|sig| {
                     let subst = struct_subst(&info.decls, targs);
                     (
@@ -1686,7 +1853,10 @@ impl Checker {
             }
             Ty::Param { bounds, .. } => self.lookup_trait_method(bounds, method).map(|sig| {
                 (
-                    sig.params.iter().map(|t| substitute_self(t, &obj_ty)).collect(),
+                    sig.params
+                        .iter()
+                        .map(|t| substitute_self(t, &obj_ty))
+                        .collect(),
                     substitute_self(&sig.ret, &obj_ty),
                     sig.mut_self,
                 )
@@ -1728,7 +1898,13 @@ impl Checker {
     /// receiver (so they can mutate its binding in place); the **query** methods
     /// (`count`, `index`) work on any list. `remove`/`count`/`index` require an
     /// equatable element type.
-    fn infer_list_method(&self, object: &Expr, method: &str, elem: &Ty, args: &[Expr]) -> Result<Ty, TypeError> {
+    fn infer_list_method(
+        &self,
+        object: &Expr,
+        method: &str,
+        elem: &Ty,
+        args: &[Expr],
+    ) -> Result<Ty, TypeError> {
         let no_such = || TypeError::NoSuchMethod {
             object_type: Ty::List(Box::new(elem.clone())).to_string(),
             method: method.to_string(),
@@ -1789,7 +1965,11 @@ impl Checker {
             "pop" => {
                 // `pop()` (last) or `pop(i)` — an optional `Int` index.
                 if args.len() > 1 {
-                    return Err(TypeError::ArityMismatch { name: "pop".into(), expected: 1, got: args.len() });
+                    return Err(TypeError::ArityMismatch {
+                        name: "pop".into(),
+                        expected: 1,
+                        got: args.len(),
+                    });
                 }
                 if let Some(a) = args.first() {
                     let ity = self.infer(a)?;
@@ -1918,19 +2098,32 @@ impl Checker {
         };
         // Determine the common SIMD type, allowing a numeric literal on one side.
         let simd = match (lt, rt) {
-            (Ty::Simd { dtype: d1, width: w1 }, Ty::Simd { dtype: d2, width: w2 })
-                if d1 == d2 && w1 == w2 =>
-            {
-                Ty::Simd { dtype: *d1, width: *w1 }
-            }
+            (
+                Ty::Simd {
+                    dtype: d1,
+                    width: w1,
+                },
+                Ty::Simd {
+                    dtype: d2,
+                    width: w2,
+                },
+            ) if d1 == d2 && w1 == w2 => Ty::Simd {
+                dtype: *d1,
+                width: *w1,
+            },
             (Ty::Simd { dtype, width }, other) | (other, Ty::Simd { dtype, width })
                 if splats_to(other, *dtype) =>
             {
-                Ty::Simd { dtype: *dtype, width: *width }
+                Ty::Simd {
+                    dtype: *dtype,
+                    width: *width,
+                }
             }
             _ => return Err(bad()),
         };
-        let Ty::Simd { dtype, width } = simd else { unreachable!() };
+        let Ty::Simd { dtype, width } = simd else {
+            unreachable!()
+        };
         match op {
             // Elementwise arithmetic on numeric lanes preserves the type.
             Add | Sub | Mul if dtype != Dtype::Bool => Ok(simd_ty(dtype, width)),
@@ -1945,14 +2138,23 @@ impl Checker {
 
     /// Type `SIMD[DType.<dt>, width](args)`: `width` element arguments, or a
     /// single argument that splats across all lanes; each must fit the dtype.
-    fn infer_simd_construction(&self, param_args: &[crate::ast::ParamArg], args: &[Expr]) -> Result<Ty, TypeError> {
+    fn infer_simd_construction(
+        &self,
+        param_args: &[crate::ast::ParamArg],
+        args: &[Expr],
+    ) -> Result<Ty, TypeError> {
         let (dtype, width) = self.simd_dims(param_args)?;
         self.check_simd_args(dtype, width, args)?;
         Ok(simd_ty(dtype, width))
     }
 
     /// Type a scalar-alias construction `Int32(x)` = `SIMD[DType.int32, 1](x)`.
-    fn infer_simd_alias_construction(&self, dtype: Dtype, param_args: &[crate::ast::ParamArg], args: &[Expr]) -> Result<Ty, TypeError> {
+    fn infer_simd_alias_construction(
+        &self,
+        dtype: Dtype,
+        param_args: &[crate::ast::ParamArg],
+        args: &[Expr],
+    ) -> Result<Ty, TypeError> {
         if !param_args.is_empty() {
             return Err(TypeError::WrongTypeArgCount {
                 name: dtype.scalar_alias().unwrap_or("SIMD").to_string(),
@@ -1968,7 +2170,10 @@ impl Checker {
     /// (one per lane) or exactly one (splatted), each fitting `dtype`.
     fn check_simd_args(&self, dtype: Dtype, width: i64, args: &[Expr]) -> Result<(), TypeError> {
         if args.len() != width as usize && args.len() != 1 {
-            return Err(TypeError::SimdArity { width, got: args.len() });
+            return Err(TypeError::SimdArity {
+                width,
+                got: args.len(),
+            });
         }
         for arg in args {
             let aty = self.infer(arg)?;
@@ -2046,9 +2251,16 @@ impl Checker {
                 }
             }
         };
-        let (params, names, ret, required, variadic) = match ty {
+        let (params, names, ret, required, variadic, conventions) = match ty {
             // A non-generic function takes no compile-time parameters.
-            Ty::Func { params, names, ret, required, variadic } => {
+            Ty::Func {
+                params,
+                names,
+                ret,
+                required,
+                variadic,
+                conventions,
+            } => {
                 if !param_args.is_empty() {
                     return Err(TypeError::WrongTypeArgCount {
                         name: name.to_string(),
@@ -2056,7 +2268,7 @@ impl Checker {
                         got: param_args.len(),
                     });
                 }
-                (params, names, ret, required, variadic)
+                (params, names, ret, required, variadic, conventions)
             }
             // A generic function infers or is supplied its parameters. Keyword
             // arguments to a generic function are deferred.
@@ -2081,9 +2293,15 @@ impl Checker {
         // each supplied argument coerces to its parameter's type (an unfilled slot
         // uses the default, already type-checked at the definition site).
         let kw_names: Vec<&str> = kwargs.iter().map(|k| k.name.as_str()).collect();
-        let (slots, overflow) =
-            match_call_slots(&names, params.len(), required, args.len(), &kw_names, variadic.is_some())
-                .map_err(|e| e.into_type_error(name))?;
+        let (slots, overflow) = match_call_slots(
+            &names,
+            params.len(),
+            required,
+            args.len(),
+            &kw_names,
+            variadic.is_some(),
+        )
+        .map_err(|e| e.into_type_error(name))?;
         for (i, slot) in slots.iter().enumerate() {
             let arg = match slot {
                 ArgSlot::Positional(p) => &args[*p],
@@ -2097,6 +2315,15 @@ impl Checker {
                     found: arg_ty.to_string(),
                     context: format!("argument '{}' to '{}'", names[i], name),
                 });
+            }
+            // Only an `owned`/`deinit` parameter *consumes* its argument (moving the
+            // value in). `read` (the default), `mut`, and `ref` all **borrow** — no
+            // copy — so passing a non-Copyable value to them is fine.
+            if matches!(
+                conventions.get(i),
+                Some(Some(ArgConvention::Owned | ArgConvention::Deinit))
+            ) {
+                self.check_consuming(arg, &arg_ty, &format!("argument '{}' to '{}'", names[i], name))?;
             }
         }
         // Each overflow argument must coerce to the `*args` element type.
@@ -2113,9 +2340,13 @@ impl Checker {
             }
         }
 
+        // Borrow check (mutable-XOR-shared), root-sensitive: within one call a
+        // variable borrowed exclusively (`mut`/`ref`) or moved (`^`) may not be
+        // borrowed again — mutably, shared, or moved.
+        check_call_aliasing(&slots, &conventions, args, kwargs)?;
+
         Ok(*ret)
     }
-
 
     /// Type a call to a generic function: solve its type parameters from the
     /// argument types, then check each argument coerces to the substituted
@@ -2136,8 +2367,12 @@ impl Checker {
                 got: args.len(),
             });
         }
-        let arg_tys = args.iter().map(|a| self.infer(a)).collect::<Result<Vec<_>, _>>()?;
-        let (subst, _tyargs) = self.resolve_use_params(name, decls, param_args, params, &arg_tys)?;
+        let arg_tys = args
+            .iter()
+            .map(|a| self.infer(a))
+            .collect::<Result<Vec<_>, _>>()?;
+        let (subst, _tyargs) =
+            self.resolve_use_params(name, decls, param_args, params, &arg_tys)?;
         for (i, (aty, pty)) in arg_tys.iter().zip(params).enumerate() {
             let expected = substitute(pty, &subst);
             if !coerces(aty, &expected) {
@@ -2329,6 +2564,118 @@ const BUILTIN_TRAITS: &[&str] = &[
 /// `FloatLiteral → Float64`) so the solution matches the value the type-erased
 /// evaluator produces — this deliberately forbids widening one literal to match
 /// another across arguments (e.g. `Pair(1.0, 2)` is a conflict, not `Pair[Float64]`).
+/// Whether an expression is a **place** — it names an existing binding (a variable
+/// or a field/index chain rooted at one) rather than producing a fresh value. A
+/// `^` transfer, a call result, a literal, or an operator is *not* a place.
+fn is_place_expr(e: &Expr) -> bool {
+    matches!(
+        e.kind,
+        ExprKind::Identifier(_) | ExprKind::Member { .. } | ExprKind::Index { .. }
+    )
+}
+
+/// The root variable of a place expression (`p` for `p`, `p.a.b`, `p.items[i]`),
+/// or `None` if the expression isn't rooted at a variable. A `mut`/shared borrow of
+/// a place borrows its root, so the borrow checker keys on this.
+/// Mojo's borrow rule (mutable-XOR-shared), checked per call and **place-sensitive**
+/// (field-aware). An argument accesses its place either **exclusively** (a
+/// `mut`/`ref` borrow, or a `^` move) or **shared** (a plain `read`/default borrow).
+/// Any number of shared accesses to overlapping places is fine, but an exclusive
+/// access requires no *overlapping* place elsewhere in the call — so `f(mut a, a)`,
+/// `f(mut a, mut a)`, `f(a, a^)`, and `f(mut p, p.a)` are rejected, while
+/// `f(mut p.a, mut p.b)` (disjoint fields) is allowed. mojo-lite's borrows are
+/// call-scoped (no references persist in variables), so this per-call check is
+/// complete — no cross-block loan dataflow is needed.
+fn check_call_aliasing(
+    slots: &[ArgSlot],
+    conventions: &[Option<ArgConvention>],
+    args: &[Expr],
+    kwargs: &[crate::ast::KwArg],
+) -> Result<(), TypeError> {
+    // Each place argument's access: its full place (root + projection path) and
+    // whether it is *exclusive* (a `mut`/`ref` borrow, or a `^` move).
+    let mut accesses: Vec<(&str, Vec<PlaceSeg>, bool)> = Vec::new();
+    for (i, slot) in slots.iter().enumerate() {
+        let arg = match slot {
+            ArgSlot::Positional(p) => &args[*p],
+            ArgSlot::Keyword(k) => &kwargs[*k].value,
+            ArgSlot::Default => continue,
+        };
+        let (place, exclusive) = match &arg.kind {
+            ExprKind::Transfer(inner) => (place_path(inner), true),
+            _ => (
+                place_path(arg),
+                matches!(
+                    conventions.get(i),
+                    Some(Some(ArgConvention::Mut | ArgConvention::Ref))
+                ),
+            ),
+        };
+        if let Some((root, path)) = place {
+            accesses.push((root, path, exclusive));
+        }
+    }
+    // Mutable-XOR-shared, **place-sensitive**: two accesses to the *same variable*
+    // conflict only if their places overlap (a prefix relationship) and at least one
+    // is exclusive. So `f(mut p.a, mut p.b)` is fine (disjoint fields), while
+    // `f(mut p.a, p.a)` and `f(mut p, p.a)` are rejected.
+    for i in 0..accesses.len() {
+        for j in (i + 1)..accesses.len() {
+            let (ra, pa, ea) = &accesses[i];
+            let (rb, pb, eb) = &accesses[j];
+            if ra == rb && (*ea || *eb) && places_overlap(pa, pb) {
+                return Err(TypeError::AliasingViolation { var: ra.to_string() });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One step of a place's projection path (used by the place-sensitive borrow
+/// check). A dynamic `Index` is treated conservatively — it may alias any index.
+enum PlaceSeg {
+    Field(String),
+    Index,
+}
+
+/// A place expression's root variable and projection path (root → leaf), or `None`
+/// if it isn't rooted at a variable.
+fn place_path(e: &Expr) -> Option<(&str, Vec<PlaceSeg>)> {
+    fn go<'a>(e: &'a Expr, path: &mut Vec<PlaceSeg>) -> Option<&'a str> {
+        match &e.kind {
+            ExprKind::Identifier(n) => Some(n),
+            ExprKind::Member { object, field } => {
+                let r = go(object, path)?;
+                path.push(PlaceSeg::Field(field.clone()));
+                Some(r)
+            }
+            ExprKind::Index { object, .. } => {
+                let r = go(object, path)?;
+                path.push(PlaceSeg::Index);
+                Some(r)
+            }
+            _ => None,
+        }
+    }
+    let mut path = Vec::new();
+    let root = go(e, &mut path)?;
+    Some((root, path))
+}
+
+/// Whether two projection paths (of the same root) may refer to overlapping
+/// memory: they overlap unless a `Field` step names distinct fields. A dynamic
+/// `Index` conservatively may alias, so it never proves disjointness.
+fn places_overlap(a: &[PlaceSeg], b: &[PlaceSeg]) -> bool {
+    for (x, y) in a.iter().zip(b) {
+        if let (PlaceSeg::Field(fa), PlaceSeg::Field(fb)) = (x, y)
+            && fa != fb
+        {
+            return false; // distinct fields are disjoint
+        }
+    }
+    true // one path is a prefix of the other (or they diverge only at an index)
+}
+
 fn unify(pattern: &Ty, actual: &Ty, subst: &mut HashMap<String, Ty>) -> Result<(), TypeError> {
     match pattern {
         Ty::Param { name, .. } => {
@@ -2376,13 +2723,23 @@ fn unify(pattern: &Ty, actual: &Ty, subst: &mut HashMap<String, Ty>) -> Result<(
 fn substitute(ty: &Ty, subst: &HashMap<String, Ty>) -> Ty {
     match ty {
         Ty::Param { name, .. } => subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
-        Ty::Struct(name, args) => Ty::Struct(name.clone(), map_tyargs(args, |t| substitute(t, subst))),
-        Ty::Func { params, names, ret, required, variadic } => Ty::Func {
+        Ty::Struct(name, args) => {
+            Ty::Struct(name.clone(), map_tyargs(args, |t| substitute(t, subst)))
+        }
+        Ty::Func {
+            params,
+            names,
+            ret,
+            required,
+            variadic,
+            conventions,
+        } => Ty::Func {
             params: params.iter().map(|p| substitute(p, subst)).collect(),
             names: names.clone(),
             ret: Box::new(substitute(ret, subst)),
             required: *required,
             variadic: variadic.as_ref().map(|v| Box::new(substitute(v, subst))),
+            conventions: conventions.clone(),
         },
         _ => ty.clone(),
     }
@@ -2393,13 +2750,29 @@ fn substitute(ty: &Ty, subst: &HashMap<String, Ty>) -> Ty {
 fn substitute_self(ty: &Ty, replacement: &Ty) -> Ty {
     match ty {
         Ty::SelfType => replacement.clone(),
-        Ty::Struct(name, args) => Ty::Struct(name.clone(), map_tyargs(args, |t| substitute_self(t, replacement))),
-        Ty::Func { params, names, ret, required, variadic } => Ty::Func {
-            params: params.iter().map(|p| substitute_self(p, replacement)).collect(),
+        Ty::Struct(name, args) => Ty::Struct(
+            name.clone(),
+            map_tyargs(args, |t| substitute_self(t, replacement)),
+        ),
+        Ty::Func {
+            params,
+            names,
+            ret,
+            required,
+            variadic,
+            conventions,
+        } => Ty::Func {
+            params: params
+                .iter()
+                .map(|p| substitute_self(p, replacement))
+                .collect(),
             names: names.clone(),
             ret: Box::new(substitute_self(ret, replacement)),
             required: *required,
-            variadic: variadic.as_ref().map(|v| Box::new(substitute_self(v, replacement))),
+            variadic: variadic
+                .as_ref()
+                .map(|v| Box::new(substitute_self(v, replacement))),
+            conventions: conventions.clone(),
         },
         _ => ty.clone(),
     }
@@ -2427,11 +2800,33 @@ fn definitely_returns(body: &[Stmt]) -> bool {
 }
 
 fn stmt_returns(stmt: &Stmt) -> bool {
-    match stmt {
-        Stmt::Return(_) => true,
-        Stmt::If { branches, orelse } => {
+    match &stmt.kind {
+        StmtKind::Return(_) => true,
+        // A `raise` diverges (it never falls through to the end), so for
+        // reachability it behaves like a `return`.
+        StmtKind::Raise(_) => true,
+        StmtKind::If { branches, orelse } => {
             orelse.as_ref().is_some_and(|e| definitely_returns(e))
                 && branches.iter().all(|(_, b)| definitely_returns(b))
+        }
+        // A `try` definitely diverges when: a `finally` does (it overrides every
+        // path); or the **normal-completion** path diverges (the body — or, if the
+        // body may complete, the `else`) *and* the **exceptional** path does (every
+        // `except` handler diverges; with no handler, an uncaught raise itself
+        // exits, so only the normal path can fall through).
+        StmtKind::Try { body, except, orelse, finalbody } => {
+            if finalbody.as_ref().is_some_and(|fb| definitely_returns(fb)) {
+                return true;
+            }
+            let normal = match orelse {
+                Some(else_) => definitely_returns(body) || definitely_returns(else_),
+                None => definitely_returns(body),
+            };
+            let exceptional = match except {
+                Some((_, handler)) => definitely_returns(handler),
+                None => true,
+            };
+            normal && exceptional
         }
         _ => false,
     }
@@ -2439,15 +2834,15 @@ fn stmt_returns(stmt: &Stmt) -> bool {
 
 /// Extract a dtype from a `SIMD` first argument, which must be `DType.<name>`.
 fn dtype_from_arg(arg: &crate::ast::ParamArg) -> Result<Dtype, TypeError> {
-    if let crate::ast::ParamArg::Value(Expr::Member { object, field }) = arg
-        && let Expr::Identifier(ns) = object.as_ref()
+    if let crate::ast::ParamArg::Value(Expr { kind: ExprKind::Member { object, field }, .. }) = arg
+        && let ExprKind::Identifier(ns) = &object.kind
         && ns == "DType"
         && let Some(dtype) = Dtype::from_name(field)
     {
         return Ok(dtype);
     }
     Err(TypeError::BadDtype(match arg {
-        crate::ast::ParamArg::Value(Expr::Member { field, .. }) => format!("DType.{}", field),
+        crate::ast::ParamArg::Value(Expr { kind: ExprKind::Member { field, .. }, .. }) => format!("DType.{}", field),
         _ => "a non-DType argument".to_string(),
     }))
 }
@@ -2509,7 +2904,10 @@ fn type_scope(decls: &[ParamDecl]) -> HashMap<String, Vec<String>> {
 /// parameter as a symbolic `CtVal::Param`.
 fn param_as_arg(decl: &ParamDecl) -> TyArg {
     match decl {
-        ParamDecl::Type { name, bounds } => TyArg::Ty(Ty::Param { name: name.clone(), bounds: bounds.clone() }),
+        ParamDecl::Type { name, bounds } => TyArg::Ty(Ty::Param {
+            name: name.clone(),
+            bounds: bounds.clone(),
+        }),
         ParamDecl::Value { name } => TyArg::Val(CtVal::Param(name.clone())),
     }
 }
@@ -2583,9 +2981,10 @@ impl MatchError {
                 expected,
                 got,
             },
-            MatchError::UnknownKeyword(k) => {
-                RuntimeError::TypeError(format!("'{}' got an unexpected keyword argument '{}'", func, k))
-            }
+            MatchError::UnknownKeyword(k) => RuntimeError::TypeError(format!(
+                "'{}' got an unexpected keyword argument '{}'",
+                func, k
+            )),
             MatchError::Duplicate(k) => {
                 RuntimeError::TypeError(format!("'{}' got argument '{}' more than once", func, k))
             }

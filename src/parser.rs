@@ -1,12 +1,12 @@
 use std::iter::Peekable;
 
 use crate::ast::{
-    ArgConvention, Decorator, Expr, FnParam, InfixOp, KwArg, Method, Param, ParamKind, PrefixOp,
-    Stmt, TStringPart, Type, WithItem,
+    ArgConvention, Decorator, Expr, ExprKind, FnParam, InfixOp, KwArg, Method, Param, ParamKind,
+    PrefixOp, Stmt, StmtKind, TStringPart, Type, WithItem,
 };
 use crate::error::{LexError, ParseError};
 use crate::lexer::Lexer;
-use crate::token::{TStringChunk, Token};
+use crate::token::{Span, TStringChunk, Token};
 
 /// A parsed parameter list: the parameters plus the positions of the `/`
 /// (positional-only) and bare `*` (keyword-only) markers, if present.
@@ -29,43 +29,84 @@ enum Precedence {
     Conditional, // a if c else b  (ternary; looser than `or`, tighter than walrus)
     Or,          // or
     And,         // and
-    Not,        // not x  (prefix)
-    Comparison, // == != < > <= >=
-    Sum,        // + -
-    Product,    // * / // %
-    Unary,      // -x  (prefix)
-    Power,      // **  (right-associative, binds tighter than unary -)
-    Call,       // f(...)  .field  .method(...)
+    Not,         // not x  (prefix)
+    Comparison,  // == != < > <= >=
+    Sum,         // + -
+    Product,     // * / // %
+    Unary,       // -x  (prefix)
+    Power,       // **  (right-associative, binds tighter than unary -)
+    Call,        // f(...)  .field  .method(...)
 }
 
 // --- Recursive Descent + Pratt Parser ---
 
-pub struct Parser<I: Iterator<Item = Result<Token, LexError>>> {
+pub struct Parser<I: Iterator<Item = Result<(Token, Span), LexError>>> {
     tokens: Peekable<I>,
+    /// Span of the most recently consumed token. Together with a `start` mark
+    /// captured before a node begins, this yields each AST node's span (a node
+    /// spans from its first token's start to its last token's end — see `node`).
+    last_span: Span,
+    /// End offset of the last *significant* token — i.e. excluding the layout
+    /// tokens (`Newline`/`Indent`/`Dedent`/`Eof`). Used for statement spans, so a
+    /// statement doesn't swallow the trailing newline `expect_stmt_end` consumes.
+    last_significant_end: usize,
 }
 
-impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
+impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
     pub fn new(tokens: I) -> Self {
         Self {
             tokens: tokens.peekable(),
+            last_span: (0, 0),
+            last_significant_end: 0,
         }
     }
 
-    /// Helper to get the next token, propagating errors
+    /// Helper to get the next token, propagating errors. Records the consumed
+    /// token's span in `self.last_span` (and its end in `last_significant_end`
+    /// unless it is a layout token).
     fn next_token(&mut self) -> Result<Token, ParseError> {
         match self.tokens.next() {
-            Some(Ok(token)) => Ok(token),
+            Some(Ok((token, span))) => {
+                self.last_span = span;
+                if !matches!(
+                    token,
+                    Token::Newline | Token::Indent | Token::Dedent | Token::Eof
+                ) {
+                    self.last_significant_end = span.1;
+                }
+                Ok(token)
+            }
             Some(Err(err)) => Err(ParseError::LexerError(err)),
-            None => Err(ParseError::UnexpectedEof("Expected a token, found EOF".into())),
+            None => Err(ParseError::UnexpectedEof(
+                "Expected a token, found EOF".into(),
+            )),
         }
     }
 
     /// Helper to peek at the next token without consuming it
     fn peek_token(&mut self) -> Result<Option<&Token>, ParseError> {
         match self.tokens.peek() {
-            Some(Ok(token)) => Ok(Some(token)),
+            Some(Ok((token, _))) => Ok(Some(token)),
             Some(Err(err)) => Err(ParseError::LexerError(err.clone())),
             None => Ok(None),
+        }
+    }
+
+    /// The start byte offset of the next (unconsumed) token, or the end of the
+    /// last consumed token at end of input. Used as a node's span start.
+    fn peek_start(&mut self) -> usize {
+        match self.tokens.peek() {
+            Some(Ok((_, span))) => span.0,
+            _ => self.last_span.1,
+        }
+    }
+
+    /// Build a spanned expression: `kind` spanning from `start` (its first token's
+    /// start offset) to the end of the most recently consumed token.
+    fn node(&self, kind: ExprKind, start: usize) -> Expr {
+        Expr {
+            kind,
+            span: (start, self.last_span.1),
         }
     }
 
@@ -110,50 +151,58 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
 
     /// Parses a single statement.
     fn parse_statement(&mut self) -> Result<Stmt, ParseError> {
-        match self.peek_token()? {
-            Some(Token::Var) => self.parse_var_decl(),
-            Some(Token::Def) => self.parse_def(Vec::new()),
-            Some(Token::Struct) => self.parse_struct(Vec::new()),
+        // A statement spans from its first token to the last token consumed. Each
+        // sub-parser returns a bare `StmtKind`; the span is stamped once, here.
+        let start = self.peek_start();
+        let kind = match self.peek_token()? {
+            Some(Token::Var) => self.parse_var_decl()?,
+            Some(Token::Def) => self.parse_def(Vec::new())?,
+            Some(Token::Struct) => self.parse_struct(Vec::new())?,
             // A decorator list precedes a `def` or `struct`.
             Some(Token::At) => {
                 let decorators = self.parse_decorators()?;
                 match self.peek_token()? {
-                    Some(Token::Def) => self.parse_def(decorators),
-                    Some(Token::Struct) => self.parse_struct(decorators),
-                    other => Err(ParseError::UnexpectedToken(
-                        other.cloned().unwrap_or(Token::Eof),
-                        "a decorator must precede a 'def' or 'struct'".into(),
-                    )),
+                    Some(Token::Def) => self.parse_def(decorators)?,
+                    Some(Token::Struct) => self.parse_struct(decorators)?,
+                    other => {
+                        return Err(ParseError::UnexpectedToken(
+                            other.cloned().unwrap_or(Token::Eof),
+                            "a decorator must precede a 'def' or 'struct'".into(),
+                        ));
+                    }
                 }
             }
-            Some(Token::Trait) => self.parse_trait(),
-            Some(Token::Comptime) => self.parse_comptime(),
-            Some(Token::If) => self.parse_if(),
-            Some(Token::While) => self.parse_while(),
-            Some(Token::For) => self.parse_for(),
-            Some(Token::With) => self.parse_with(),
-            Some(Token::Try) => self.parse_try(),
-            Some(Token::Return) => self.parse_return(),
-            Some(Token::Raise) => self.parse_raise(),
-            Some(Token::Import) => self.parse_import(),
-            Some(Token::From) => self.parse_from_import(),
+            Some(Token::Trait) => self.parse_trait()?,
+            Some(Token::Comptime) => self.parse_comptime()?,
+            Some(Token::If) => self.parse_if()?,
+            Some(Token::While) => self.parse_while()?,
+            Some(Token::For) => self.parse_for()?,
+            Some(Token::With) => self.parse_with()?,
+            Some(Token::Try) => self.parse_try()?,
+            Some(Token::Return) => self.parse_return()?,
+            Some(Token::Raise) => self.parse_raise()?,
+            Some(Token::Import) => self.parse_import()?,
+            Some(Token::From) => self.parse_from_import()?,
             Some(Token::Pass) => {
                 self.next_token()?;
                 self.expect_stmt_end()?;
-                Ok(Stmt::Pass)
+                StmtKind::Pass
             }
             Some(Token::Break) => {
                 self.next_token()?;
                 self.expect_stmt_end()?;
-                Ok(Stmt::Break)
+                StmtKind::Break
             }
             Some(Token::Continue) => {
                 self.next_token()?;
                 self.expect_stmt_end()?;
-                Ok(Stmt::Continue)
+                StmtKind::Continue
             }
-            _ => self.parse_expr_or_assign(),
-        }
+            _ => self.parse_expr_or_assign()?,
+        };
+        // End at the last significant token so the trailing newline (consumed by
+        // `expect_stmt_end`) isn't included in the statement's span.
+        Ok(Stmt::new(kind, (start, self.last_significant_end)))
     }
 
     /// A bare expression statement, or an assignment `target = value`. The two
@@ -162,7 +211,7 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
     /// rooted at a variable (`p.x = e`, `xs[i] = e`, `p.items[i].x = e`). A
     /// top-level comma after the first target starts a **tuple unpacking**
     /// (`a, b = t`).
-    fn parse_expr_or_assign(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_expr_or_assign(&mut self) -> Result<StmtKind, ParseError> {
         let expr = self.parse_expression(Precedence::Lowest)?;
 
         // Tuple-unpacking target list: `a, b, … = value`. A top-level comma
@@ -180,37 +229,41 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
             }
             for target in &targets {
                 if !matches!(
-                    target,
-                    Expr::Identifier(_) | Expr::Member { .. } | Expr::Index { .. }
+                    target.kind,
+                    ExprKind::Identifier(_) | ExprKind::Member { .. } | ExprKind::Index { .. }
                 ) {
                     return Err(ParseError::UnexpectedToken(
                         Token::Comma,
-                        format!("invalid unpacking target: {:?}", target),
+                        format!("invalid unpacking target: {:?}", target.kind),
                     ));
                 }
             }
-            self.expect(Token::Assign, "Expected '=' after the unpacking target list")?;
+            self.expect(
+                Token::Assign,
+                "Expected '=' after the unpacking target list",
+            )?;
             let value = self.parse_expression(Precedence::Lowest)?;
             self.expect_stmt_end()?;
-            return Ok(Stmt::Unpack { targets, value });
+            return Ok(StmtKind::Unpack { targets, value });
         }
 
         if matches!(self.peek_token()?, Some(Token::Assign)) {
             self.next_token()?; // consume '='
             let value = self.parse_expression(Precedence::Lowest)?;
-            let stmt = match expr {
-                Expr::Identifier(name) => Stmt::Assign { name, value },
+            let stmt = if matches!(expr.kind, ExprKind::Identifier(_)) {
+                let ExprKind::Identifier(name) = expr.kind else {
+                    unreachable!()
+                };
+                StmtKind::Assign { name, value }
+            } else if matches!(expr.kind, ExprKind::Member { .. } | ExprKind::Index { .. }) {
                 // A field/index chain — the checker verifies its root is a
                 // mutable variable (or `mut self`) and that the write is valid.
-                place @ (Expr::Member { .. } | Expr::Index { .. }) => {
-                    Stmt::SetPlace { place, value }
-                }
-                other => {
-                    return Err(ParseError::UnexpectedToken(
-                        Token::Assign,
-                        format!("invalid assignment target: {:?}", other),
-                    ));
-                }
+                StmtKind::SetPlace { place: expr, value }
+            } else {
+                return Err(ParseError::UnexpectedToken(
+                    Token::Assign,
+                    format!("invalid assignment target: {:?}", expr.kind),
+                ));
             };
             self.expect_stmt_end()?;
             return Ok(stmt);
@@ -219,23 +272,30 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
         // Augmented assignment `target OP= value` (target is a NAME or place).
         if let Some(op) = self.peek_token()?.and_then(aug_assign_op) {
             self.next_token()?; // consume the `OP=` token
-            if !matches!(expr, Expr::Identifier(_) | Expr::Member { .. } | Expr::Index { .. }) {
+            if !matches!(
+                expr.kind,
+                ExprKind::Identifier(_) | ExprKind::Member { .. } | ExprKind::Index { .. }
+            ) {
                 return Err(ParseError::UnexpectedToken(
                     Token::Assign,
-                    format!("invalid augmented-assignment target: {:?}", expr),
+                    format!("invalid augmented-assignment target: {:?}", expr.kind),
                 ));
             }
             let value = self.parse_expression(Precedence::Lowest)?;
             self.expect_stmt_end()?;
-            return Ok(Stmt::AugAssign { place: expr, op, value });
+            return Ok(StmtKind::AugAssign {
+                place: expr,
+                op,
+                value,
+            });
         }
 
         self.expect_stmt_end()?;
-        Ok(Stmt::Expr(expr))
+        Ok(StmtKind::Expr(expr))
     }
 
     /// `var name[: Type] = value` — the annotation is optional (inferred `var`).
-    fn parse_var_decl(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_var_decl(&mut self) -> Result<StmtKind, ParseError> {
         self.expect(Token::Var, "Statements must begin with a keyword")?;
         let name = self.expect_identifier("Expected identifier after 'var'")?;
         // An optional `: Type`; omitting it infers the type from `value`.
@@ -245,10 +305,13 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
         } else {
             None
         };
-        self.expect(Token::Assign, "Expected '=' after the variable name (or its ': Type')")?;
+        self.expect(
+            Token::Assign,
+            "Expected '=' after the variable name (or its ': Type')",
+        )?;
         let value = self.parse_expression(Precedence::Lowest)?;
         self.expect_stmt_end()?;
-        Ok(Stmt::VarDecl { name, ty, value })
+        Ok(StmtKind::VarDecl { name, ty, value })
     }
 
     /// `comptime NAME = value` — a compile-time constant.
@@ -256,24 +319,27 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
     /// `comptime NAME = expr`, a compile-time conditional `comptime if …`, or a
     /// compile-time (unrolled) loop `comptime for …` (Mojo's modern spellings —
     /// the older `@parameter if`/`@parameter for` are deprecated).
-    fn parse_comptime(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_comptime(&mut self) -> Result<StmtKind, ParseError> {
         self.expect(Token::Comptime, "Expected 'comptime'")?;
         match self.peek_token()? {
             Some(Token::If) => {
                 let (branches, orelse) = self.parse_if_rest()?;
-                Ok(Stmt::ComptimeIf { branches, orelse })
+                Ok(StmtKind::ComptimeIf { branches, orelse })
             }
             Some(Token::For) => {
                 let (var, iter, body) = self.parse_for_rest()?;
-                Ok(Stmt::ComptimeFor { var, iter, body })
+                Ok(StmtKind::ComptimeFor { var, iter, body })
             }
             _ => {
                 let name =
                     self.expect_identifier("Expected a name, 'if', or 'for' after 'comptime'")?;
-                self.expect(Token::Assign, "Expected '=' after the comptime constant name")?;
+                self.expect(
+                    Token::Assign,
+                    "Expected '=' after the comptime constant name",
+                )?;
                 let value = self.parse_expression(Precedence::Lowest)?;
                 self.expect_stmt_end()?;
-                Ok(Stmt::Comptime { name, value })
+                Ok(StmtKind::Comptime { name, value })
             }
         }
     }
@@ -305,13 +371,17 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
         Ok(decorators)
     }
 
-    fn parse_def(&mut self, decorators: Vec<Decorator>) -> Result<Stmt, ParseError> {
+    fn parse_def(&mut self, decorators: Vec<Decorator>) -> Result<StmtKind, ParseError> {
         self.expect(Token::Def, "Expected 'def'")?;
         let name = self.expect_identifier("Expected function name after 'def'")?;
         let type_params = self.parse_type_params()?;
 
         self.expect(Token::LParen, "Expected '(' after function name")?;
-        let ParamList { params, positional_only, keyword_only } = self.parse_params()?;
+        let ParamList {
+            params,
+            positional_only,
+            keyword_only,
+        } = self.parse_params()?;
         self.expect(Token::RParen, "Expected ')' after parameters")?;
 
         let raises = self.parse_raises_effect()?;
@@ -326,7 +396,7 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
         self.expect_stmt_end()?;
         let body = self.parse_block()?;
 
-        Ok(Stmt::Def {
+        Ok(StmtKind::Def {
             name,
             decorators,
             type_params,
@@ -356,24 +426,24 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
     }
 
     /// `raise expr`
-    fn parse_raise(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_raise(&mut self) -> Result<StmtKind, ParseError> {
         self.expect(Token::Raise, "Expected 'raise'")?;
         let value = self.parse_expression(Precedence::Lowest)?;
         self.expect_stmt_end()?;
-        Ok(Stmt::Raise(value))
+        Ok(StmtKind::Raise(value))
     }
 
     /// `import a.b.c [as alias]`
-    fn parse_import(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_import(&mut self) -> Result<StmtKind, ParseError> {
         self.expect(Token::Import, "Expected 'import'")?;
         let path = self.parse_dotted_name()?;
         let alias = self.parse_import_alias()?;
         self.expect_stmt_end()?;
-        Ok(Stmt::Import { path, alias })
+        Ok(StmtKind::Import { path, alias })
     }
 
     /// `from [.]*module import <targets>`
-    fn parse_from_import(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_from_import(&mut self) -> Result<StmtKind, ParseError> {
         self.expect(Token::From, "Expected 'from'")?;
         // Leading dots make the import relative. The lexer tokenizes `...` as one
         // ellipsis, which here counts as three dots.
@@ -423,7 +493,7 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
             crate::ast::ImportNames::Names(targets)
         };
         self.expect_stmt_end()?;
-        Ok(Stmt::FromImport { level, path, names })
+        Ok(StmtKind::FromImport { level, path, names })
     }
 
     /// Parses a dotted module name `NAME ('.' NAME)*` into its segments.
@@ -440,7 +510,9 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
     fn parse_import_alias(&mut self) -> Result<Option<String>, ParseError> {
         if matches!(self.peek_token()?, Some(Token::As)) {
             self.next_token()?; // consume 'as'
-            Ok(Some(self.expect_identifier("Expected an alias name after 'as'")?))
+            Ok(Some(
+                self.expect_identifier("Expected an alias name after 'as'")?,
+            ))
         } else {
             Ok(None)
         }
@@ -451,7 +523,7 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
     /// `expression ['as' NAME]`. Multiple comma-separated managers are allowed;
     /// the `as` binding is optional. The parenthesized / tuple-target forms aren't
     /// in the Mojo docs, so they aren't parsed (strict-subset).
-    fn parse_with(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_with(&mut self) -> Result<StmtKind, ParseError> {
         self.expect(Token::With, "Expected 'with'")?;
         let mut items = Vec::new();
         loop {
@@ -472,10 +544,10 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
         self.expect(Token::Colon, "Expected ':' after the 'with' items")?;
         self.expect_stmt_end()?;
         let body = self.parse_block()?;
-        Ok(Stmt::With { items, body })
+        Ok(StmtKind::With { items, body })
     }
 
-    fn parse_try(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_try(&mut self) -> Result<StmtKind, ParseError> {
         self.expect(Token::Try, "Expected 'try'")?;
         self.expect(Token::Colon, "Expected ':' after 'try'")?;
         self.expect_stmt_end()?;
@@ -520,7 +592,12 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
                 "a 'try' needs at least one of 'except' or 'finally'".into(),
             ));
         }
-        Ok(Stmt::Try { body, except, orelse, finalbody })
+        Ok(StmtKind::Try {
+            body,
+            except,
+            orelse,
+            finalbody,
+        })
     }
 
     /// Parses a (possibly empty) comma-separated parameter list. The opening
@@ -535,7 +612,11 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
         let mut positional_only = None;
         let mut keyword_only = None;
         if matches!(self.peek_token()?, Some(Token::RParen)) {
-            return Ok(ParamList { params, positional_only, keyword_only });
+            return Ok(ParamList {
+                params,
+                positional_only,
+                keyword_only,
+            });
         }
         loop {
             match self.peek_token()? {
@@ -576,7 +657,11 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
                 break;
             }
         }
-        Ok(ParamList { params, positional_only, keyword_only })
+        Ok(ParamList {
+            params,
+            positional_only,
+            keyword_only,
+        })
     }
 
     /// The optional argument convention (`read`/`mut`/`owned`/`out`) prefixing a
@@ -640,11 +725,17 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
         } else {
             None
         };
-        Ok(FnParam { name, ty, default, kind, convention })
+        Ok(FnParam {
+            name,
+            ty,
+            default,
+            kind,
+            convention,
+        })
     }
 
     /// `[@fieldwise_init] struct Name: <fields and methods>`
-    fn parse_struct(&mut self, decorators: Vec<Decorator>) -> Result<Stmt, ParseError> {
+    fn parse_struct(&mut self, decorators: Vec<Decorator>) -> Result<StmtKind, ParseError> {
         // `@fieldwise_init` (the one modeled decorator) generates the constructor.
         let fieldwise_init = decorators
             .iter()
@@ -699,7 +790,15 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
             }
         }
 
-        Ok(Stmt::Struct { name, decorators, type_params, conforms, fields, methods, fieldwise_init })
+        Ok(StmtKind::Struct {
+            name,
+            decorators,
+            type_params,
+            conforms,
+            fields,
+            methods,
+            fieldwise_init,
+        })
     }
 
     /// Parses an optional trait-conformance list `'(' NAME (',' NAME)* ')'`
@@ -728,7 +827,7 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
     /// The body holds `def` method requirements (`...`) or default methods (a real
     /// body), and `comptime NAME: Type` member requirements. (Generic traits
     /// `trait T[U]:` are not valid current Mojo, so no `[type_params]` is parsed.)
-    fn parse_trait(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_trait(&mut self) -> Result<StmtKind, ParseError> {
         self.expect(Token::Trait, "Expected 'trait'")?;
         let name = self.expect_identifier("Expected a trait name after 'trait'")?;
         let refines = self.parse_conformance()?;
@@ -757,7 +856,12 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
                 }
             }
         }
-        Ok(Stmt::Trait { name, refines, methods, comptime_members })
+        Ok(StmtKind::Trait {
+            name,
+            refines,
+            methods,
+            comptime_members,
+        })
     }
 
     /// `comptime NAME: Type` — a compile-time member requirement inside a trait.
@@ -785,13 +889,20 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
                 "a method's first parameter must be 'self'".into(),
             ));
         }
-        let ParamList { params, positional_only, keyword_only } =
-            if matches!(self.peek_token()?, Some(Token::Comma)) {
-                self.next_token()?; // consume ','
-                self.parse_params()?
-            } else {
-                ParamList { params: Vec::new(), positional_only: None, keyword_only: None }
-            };
+        let ParamList {
+            params,
+            positional_only,
+            keyword_only,
+        } = if matches!(self.peek_token()?, Some(Token::Comma)) {
+            self.next_token()?; // consume ','
+            self.parse_params()?
+        } else {
+            ParamList {
+                params: Vec::new(),
+                positional_only: None,
+                keyword_only: None,
+            }
+        };
         self.expect(Token::RParen, "Expected ')' after the parameters")?;
 
         let ret = if matches!(self.peek_token()?, Some(Token::Arrow)) {
@@ -809,13 +920,23 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
         let default_body = if matches!(self.peek_token()?, Some(Token::Ellipsis)) {
             self.next_token()?; // consume '...'
             self.expect_stmt_end()?;
-            self.expect(Token::Dedent, "Expected the trait-method body to end after '...'")?;
+            self.expect(
+                Token::Dedent,
+                "Expected the trait-method body to end after '...'",
+            )?;
             None
         } else {
             Some(self.parse_block_body()?)
         };
 
-        Ok(crate::ast::TraitMethod { name, params, positional_only, keyword_only, ret, default_body })
+        Ok(crate::ast::TraitMethod {
+            name,
+            params,
+            positional_only,
+            keyword_only,
+            ret,
+            default_body,
+        })
     }
 
     /// `def name([convention] self [, params]) -> ret: <block>` inside a struct.
@@ -832,8 +953,7 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
         // parameter carries a convention is not distinguished — a rare case.)
         let first_is_self =
             matches!(self.peek_token()?, Some(Token::Identifier(id)) if id == "self");
-        let first_is_convention =
-            matches!(self.peek_token()?, Some(Token::Identifier(id)) if convention_word(id).is_some());
+        let first_is_convention = matches!(self.peek_token()?, Some(Token::Identifier(id)) if convention_word(id).is_some());
         let (has_self, self_convention) = if first_is_self {
             self.next_token()?; // consume 'self'
             (true, None)
@@ -847,7 +967,8 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
             if conv == Some(ArgConvention::Ref) {
                 self.parse_optional_origin_specifier()?;
             }
-            let self_name = self.expect_identifier("Expected 'self' after the receiver convention")?;
+            let self_name =
+                self.expect_identifier("Expected 'self' after the receiver convention")?;
             if self_name != "self" {
                 return Err(ParseError::UnexpectedToken(
                     Token::Identifier(self_name),
@@ -861,12 +982,20 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
         };
         // Parameters: for an instance method they follow an optional comma after
         // `self`; for a static method they are the whole list.
-        let ParamList { params, positional_only, keyword_only } = if has_self {
+        let ParamList {
+            params,
+            positional_only,
+            keyword_only,
+        } = if has_self {
             if matches!(self.peek_token()?, Some(Token::Comma)) {
                 self.next_token()?; // consume ','
                 self.parse_params()?
             } else {
-                ParamList { params: Vec::new(), positional_only: None, keyword_only: None }
+                ParamList {
+                    params: Vec::new(),
+                    positional_only: None,
+                    keyword_only: None,
+                }
             }
         } else {
             self.parse_params()?
@@ -910,9 +1039,9 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
     }
 
     /// `if cond: <block> (elif cond: <block>)* (else: <block>)?`
-    fn parse_if(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_if(&mut self) -> Result<StmtKind, ParseError> {
         let (branches, orelse) = self.parse_if_rest()?;
-        Ok(Stmt::If { branches, orelse })
+        Ok(StmtKind::If { branches, orelse })
     }
 
     /// Parses an `if`/`elif`/`else` chain — the current token must be `if`. Shared
@@ -940,16 +1069,16 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
     }
 
     /// `while cond: <block>`
-    fn parse_while(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_while(&mut self) -> Result<StmtKind, ParseError> {
         self.expect(Token::While, "Expected 'while'")?;
         let (cond, body) = self.parse_condition_block("Expected ':' after the while condition")?;
-        Ok(Stmt::While { cond, body })
+        Ok(StmtKind::While { cond, body })
     }
 
     /// `for var in iter: <block>`
-    fn parse_for(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_for(&mut self) -> Result<StmtKind, ParseError> {
         let (var, iter, body) = self.parse_for_rest()?;
-        Ok(Stmt::For { var, iter, body })
+        Ok(StmtKind::For { var, iter, body })
     }
 
     /// Parses a `for var in iter: <block>` — the current token must be `for`.
@@ -966,14 +1095,14 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
     }
 
     /// `return` or `return expr`
-    fn parse_return(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_return(&mut self) -> Result<StmtKind, ParseError> {
         self.expect(Token::Return, "Expected 'return'")?;
         let value = match self.peek_token()? {
             Some(Token::Newline) | Some(Token::Eof) | None => None,
             _ => Some(self.parse_expression(Precedence::Lowest)?),
         };
         self.expect_stmt_end()?;
-        Ok(Stmt::Return(value))
+        Ok(StmtKind::Return(value))
     }
 
     /// Parses an indented block: `INDENT statement+ DEDENT`.
@@ -1019,17 +1148,19 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
                 // parameters; bare `Self` is the enclosing struct/trait type.
                 "Self" if matches!(self.peek_token()?, Some(Token::Dot)) => {
                     self.next_token()?; // consume '.'
-                    let param = self.expect_identifier("Expected a type parameter name after 'Self.'")?;
+                    let param =
+                        self.expect_identifier("Expected a type parameter name after 'Self.'")?;
                     Ok(Type::SelfParam(param))
                 }
                 "Self" => Ok(Type::SelfType),
                 // `ref [origin] T` — a reference type (parametric mutability). The
                 // origin specifier is parsed and discarded; the referent follows.
                 // (`ref` is contextual — a following `[` or type token, not `.`/end.)
-                "ref" if matches!(
-                    self.peek_token()?,
-                    Some(Token::LBracket | Token::Identifier(_) | Token::Def | Token::None)
-                ) =>
+                "ref"
+                    if matches!(
+                        self.peek_token()?,
+                        Some(Token::LBracket | Token::Identifier(_) | Token::Def | Token::None)
+                    ) =>
                 {
                     self.parse_optional_origin_specifier()?;
                     Ok(Type::Ref(Box::new(self.parse_type()?)))
@@ -1045,7 +1176,10 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
                     Ok(Type::Named(id, args))
                 }
             },
-            token => Err(ParseError::UnexpectedToken(token, "Expected a type name".into())),
+            token => Err(ParseError::UnexpectedToken(
+                token,
+                "Expected a type name".into(),
+            )),
         }
     }
 
@@ -1095,7 +1229,12 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
 
         self.expect(Token::Arrow, "Expected '->' in a function type")?;
         let ret = self.parse_type()?;
-        Ok(Type::Func { params, ret: Box::new(ret), thin, raises })
+        Ok(Type::Func {
+            params,
+            ret: Box::new(ret),
+            thin,
+            raises,
+        })
     }
 
     /// Parses a parameter-argument list `'[' param_arg (',' param_arg)* ']'`. The
@@ -1128,12 +1267,14 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
         }
         if let Some(Token::Identifier(_)) = self.peek_token()? {
             let id = self.expect_identifier("unreachable: peeked identifier")?;
+            let id_span = self.last_span;
             if matches!(self.peek_token()?, Some(Token::LBracket)) {
                 let args = self.parse_param_args()?;
                 return Ok(ParamArg::Type(Type::Named(id, args)));
             }
             // A value expression whose first atom is this identifier.
-            let expr = self.parse_expression_from(Expr::Identifier(id), Precedence::Lowest)?;
+            let atom = Expr::new(ExprKind::Identifier(id), id_span);
+            let expr = self.parse_expression_from(atom, Precedence::Lowest)?;
             return Ok(ParamArg::Value(expr));
         }
         Ok(ParamArg::Value(self.parse_expression(Precedence::Lowest)?))
@@ -1145,7 +1286,10 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
         Ok(match self.peek_token()? {
             Some(Token::None) => true,
             Some(Token::Identifier(id)) => {
-                matches!(id.as_str(), "Int" | "UInt" | "Bool" | "String" | "Float64" | "Self")
+                matches!(
+                    id.as_str(),
+                    "Int" | "UInt" | "Bool" | "String" | "Float64" | "Self"
+                )
             }
             _ => false,
         })
@@ -1163,8 +1307,12 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
         let mut params = Vec::new();
         loop {
             let name = self.expect_identifier("Expected a type-parameter name")?;
-            self.expect(Token::Colon, "A type parameter requires a ': bound' (e.g. 'T: Copyable')")?;
-            let mut bounds = vec![self.expect_identifier("Expected a trait name in the type-parameter bound")?];
+            self.expect(
+                Token::Colon,
+                "A type parameter requires a ': bound' (e.g. 'T: Copyable')",
+            )?;
+            let mut bounds =
+                vec![self.expect_identifier("Expected a trait name in the type-parameter bound")?];
             while matches!(self.peek_token()?, Some(Token::Amp)) {
                 self.next_token()?; // consume '&'
                 bounds.push(self.expect_identifier("Expected a trait name after '&'")?);
@@ -1192,18 +1340,26 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
     /// Continues precedence climbing from an already-parsed `left` operand. Used
     /// when a leading atom has been consumed elsewhere (parameter-argument
     /// disambiguation).
-    fn parse_expression_from(&mut self, mut left: Expr, min_precedence: Precedence) -> Result<Expr, ParseError> {
+    fn parse_expression_from(
+        &mut self,
+        mut left: Expr,
+        min_precedence: Precedence,
+    ) -> Result<Expr, ParseError> {
         while min_precedence < self.peek_precedence()? {
             left = self.parse_infix(left)?;
         }
         Ok(left)
     }
 
-    /// Parses a prefix position: a literal, identifier, grouping, or a unary
-    /// operator applied to a tighter sub-expression.
-    /// Builds an `Expr::TString` from a lexed t-string, parsing each interpolation
-    /// chunk's raw source into a real sub-expression.
-    fn build_tstring(&self, chunks: Vec<TStringChunk>, raw: bool) -> Result<Expr, ParseError> {
+    /// Builds an `ExprKind::TString` from a lexed t-string, parsing each
+    /// interpolation chunk's raw source into a real sub-expression. `start` is the
+    /// t-string token's start offset (its end is the last-consumed token).
+    fn build_tstring(
+        &self,
+        chunks: Vec<TStringChunk>,
+        raw: bool,
+        start: usize,
+    ) -> Result<Expr, ParseError> {
         let mut parts = Vec::with_capacity(chunks.len());
         for chunk in chunks {
             match chunk {
@@ -1213,32 +1369,33 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
                 }
             }
         }
-        Ok(Expr::TString { parts, raw })
+        Ok(self.node(ExprKind::TString { parts, raw }, start))
     }
 
     fn parse_prefix(&mut self) -> Result<Expr, ParseError> {
+        let start = self.peek_start();
         let token = self.next_token()?;
         match token {
-            Token::IntLiteral(val) => Ok(Expr::Int(val)),
-            Token::FloatLiteral(val) => Ok(Expr::Float(val)),
-            Token::BoolLiteral(val) => Ok(Expr::Bool(val)),
-            Token::StringLiteral(val) => Ok(Expr::Str(val)),
-            Token::TString { chunks, raw } => self.build_tstring(chunks, raw),
-            Token::None => Ok(Expr::None),
-            Token::Identifier(id) => Ok(Expr::Identifier(id)),
+            Token::IntLiteral(val) => Ok(self.node(ExprKind::Int(val), start)),
+            Token::FloatLiteral(val) => Ok(self.node(ExprKind::Float(val), start)),
+            Token::BoolLiteral(val) => Ok(self.node(ExprKind::Bool(val), start)),
+            Token::StringLiteral(val) => Ok(self.node(ExprKind::Str(val), start)),
+            Token::TString { chunks, raw } => self.build_tstring(chunks, raw, start),
+            Token::None => Ok(self.node(ExprKind::None, start)),
+            Token::Identifier(id) => Ok(self.node(ExprKind::Identifier(id), start)),
             Token::Minus => {
                 let operand = self.parse_expression(Precedence::Unary)?;
-                Ok(Expr::Prefix(PrefixOp::Neg, Box::new(operand)))
+                Ok(self.node(ExprKind::Prefix(PrefixOp::Neg, Box::new(operand)), start))
             }
             Token::Not => {
                 let operand = self.parse_expression(Precedence::Not)?;
-                Ok(Expr::Prefix(PrefixOp::Not, Box::new(operand)))
+                Ok(self.node(ExprKind::Prefix(PrefixOp::Not, Box::new(operand)), start))
             }
             Token::LParen => {
                 // `()` — the empty tuple.
                 if matches!(self.peek_token()?, Some(Token::RParen)) {
                     self.next_token()?; // consume ')'
-                    return Ok(Expr::TupleLit(Vec::new()));
+                    return Ok(self.node(ExprKind::TupleLit(Vec::new()), start));
                 }
                 let first = self.parse_expression(Precedence::Lowest)?;
                 // A comma makes it a tuple: `(a,)`, `(a, b)`, `(a, b,)`. Without a
@@ -1253,7 +1410,7 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
                         elems.push(self.parse_expression(Precedence::Lowest)?);
                     }
                     self.expect(Token::RParen, "Expected ')' after tuple elements")?;
-                    Ok(Expr::TupleLit(elems))
+                    Ok(self.node(ExprKind::TupleLit(elems), start))
                 } else {
                     self.expect(Token::RParen, "Expected closing ')' after expression")?;
                     Ok(first)
@@ -1271,19 +1428,24 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
                 }
                 let elems = self.parse_args()?;
                 self.expect(Token::RBracket, "Expected ']' after list elements")?;
-                Ok(Expr::ListLit(elems))
+                Ok(self.node(ExprKind::ListLit(elems), start))
             }
-            token => Err(ParseError::UnexpectedToken(token, "Expected an expression".into())),
+            token => Err(ParseError::UnexpectedToken(
+                token,
+                "Expected an expression".into(),
+            )),
         }
     }
 
     /// Parses an infix/postfix continuation of `left`: either a binary operator
     /// or a call `(...)`. Only invoked when the next token is such an operator.
     fn parse_infix(&mut self, left: Expr) -> Result<Expr, ParseError> {
+        // Every node built here spans from `left`'s start to the last token consumed.
+        let start = left.span.0;
         // Postfix transfer sigil `expr '^'`.
         if matches!(self.peek_token()?, Some(Token::Caret)) {
             self.next_token()?; // consume '^'
-            return Ok(Expr::Transfer(Box::new(left)));
+            return Ok(self.node(ExprKind::Transfer(Box::new(left)), start));
         }
         // Postfix member access `expr '.' NAME` or method call `expr '.' NAME (args)`.
         if matches!(self.peek_token()?, Some(Token::Dot)) {
@@ -1293,9 +1455,23 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
                 self.next_token()?; // consume '('
                 let (args, kwargs) = self.parse_call_args()?;
                 self.expect(Token::RParen, "Expected ')' after arguments")?;
-                return Ok(Expr::MethodCall { object: Box::new(left), method: field, args, kwargs });
+                return Ok(self.node(
+                    ExprKind::MethodCall {
+                        object: Box::new(left),
+                        method: field,
+                        args,
+                        kwargs,
+                    },
+                    start,
+                ));
             }
-            return Ok(Expr::Member { object: Box::new(left), field });
+            return Ok(self.node(
+                ExprKind::Member {
+                    object: Box::new(left),
+                    field,
+                },
+                start,
+            ));
         }
 
         // Postfix `[`: a **slice** (`obj[lower:upper:step]`, any bound optional),
@@ -1336,7 +1512,15 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
                 self.next_token()?; // consume '('
                 let (args, kwargs) = self.parse_call_args()?;
                 self.expect(Token::RParen, "Expected ')' after arguments")?;
-                return Ok(Expr::Call { name, param_args, args, kwargs });
+                return Ok(self.node(
+                    ExprKind::Call {
+                        name,
+                        param_args,
+                        args,
+                        kwargs,
+                    },
+                    start,
+                ));
             }
             let index = match <[_; 1]>::try_from(param_args) {
                 Ok([crate::ast::ParamArg::Value(expr)]) => expr,
@@ -1347,7 +1531,13 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
                     ));
                 }
             };
-            return Ok(Expr::Index { object: Box::new(left), index: Box::new(index) });
+            return Ok(self.node(
+                ExprKind::Index {
+                    object: Box::new(left),
+                    index: Box::new(index),
+                },
+                start,
+            ));
         }
 
         // Postfix call without explicit parameters: `IDENT '(' args ')'`.
@@ -1356,21 +1546,35 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
             self.next_token()?; // consume '('
             let (args, kwargs) = self.parse_call_args()?;
             self.expect(Token::RParen, "Expected ')' after arguments")?;
-            return Ok(Expr::Call { name, param_args: Vec::new(), args, kwargs });
+            return Ok(self.node(
+                ExprKind::Call {
+                    name,
+                    param_args: Vec::new(),
+                    args,
+                    kwargs,
+                },
+                start,
+            ));
         }
 
         // Walrus / named expression: `name := value`. The target must be a bare
         // name. (Parsed for completeness; the evaluator flags it as unsupported.)
         if matches!(self.peek_token()?, Some(Token::ColonEq)) {
             self.next_token()?; // consume ':='
-            let Expr::Identifier(name) = left else {
+            let ExprKind::Identifier(name) = left.kind else {
                 return Err(ParseError::UnexpectedToken(
                     Token::ColonEq,
-                    format!("the walrus ':=' target must be a name, got {:?}", left),
+                    format!("the walrus ':=' target must be a name, got {:?}", left.kind),
                 ));
             };
             let value = self.parse_expression(Precedence::Lowest)?;
-            return Ok(Expr::Named { name, value: Box::new(value) });
+            return Ok(self.node(
+                ExprKind::Named {
+                    name,
+                    value: Box::new(value),
+                },
+                start,
+            ));
         }
 
         // Conditional expression (ternary): `then_branch if cond else else_branch`.
@@ -1381,11 +1585,14 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
             let cond = self.parse_expression(Precedence::Conditional)?;
             self.expect(Token::Else, "Expected 'else' in a conditional expression")?;
             let else_branch = self.parse_expression(Precedence::Lowest)?;
-            return Ok(Expr::IfExpr {
-                cond: Box::new(cond),
-                then_branch: Box::new(left),
-                else_branch: Box::new(else_branch),
-            });
+            return Ok(self.node(
+                ExprKind::IfExpr {
+                    cond: Box::new(cond),
+                    then_branch: Box::new(left),
+                    else_branch: Box::new(else_branch),
+                },
+                start,
+            ));
         }
 
         // Comparison, possibly chained: `a < b`, `a in b`, `a not in b`, and chains
@@ -1405,9 +1612,15 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
             }
             if rest.len() == 1 {
                 let (op, right) = rest.into_iter().next().unwrap();
-                return Ok(Expr::Infix(op, Box::new(left), Box::new(right)));
+                return Ok(self.node(ExprKind::Infix(op, Box::new(left), Box::new(right)), start));
             }
-            return Ok(Expr::Compare { first: Box::new(left), rest });
+            return Ok(self.node(
+                ExprKind::Compare {
+                    first: Box::new(left),
+                    rest,
+                },
+                start,
+            ));
         }
 
         let op_token = self.next_token()?;
@@ -1423,19 +1636,25 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
             // chained-comparison path above, never here.
             Token::And => InfixOp::And,
             Token::Or => InfixOp::Or,
-            token => return Err(ParseError::UnexpectedToken(token, "Expected a binary operator".into())),
+            token => {
+                return Err(ParseError::UnexpectedToken(
+                    token,
+                    "Expected a binary operator".into(),
+                ));
+            }
         };
 
         // Left-associative: parse the right operand at the operator's own
         // precedence so equal-precedence operators don't get reabsorbed.
         let right = self.parse_expression(infix_precedence(op))?;
-        Ok(Expr::Infix(op, Box::new(left), Box::new(right)))
+        Ok(self.node(ExprKind::Infix(op, Box::new(left), Box::new(right)), start))
     }
 
     /// Finishes a slice subscript once a `:` has been seen (the parser is
     /// positioned at that first `:`), with `lower` already parsed. Grammar:
     /// `':' [upper] [':' [step]] ']'`.
     fn parse_slice_rest(&mut self, object: Expr, lower: Option<Expr>) -> Result<Expr, ParseError> {
+        let start = object.span.0;
         self.expect(Token::Colon, "Expected ':' in a slice")?;
         // Optional upper bound — absent if the next token is `:` or `]`.
         let upper = if matches!(self.peek_token()?, Some(Token::Colon | Token::RBracket)) {
@@ -1455,12 +1674,15 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
             None
         };
         self.expect(Token::RBracket, "Expected ']' after a slice")?;
-        Ok(Expr::Slice {
-            object: Box::new(object),
-            lower: lower.map(Box::new),
-            upper: upper.map(Box::new),
-            step: step.map(Box::new),
-        })
+        Ok(self.node(
+            ExprKind::Slice {
+                object: Box::new(object),
+                lower: lower.map(Box::new),
+                upper: upper.map(Box::new),
+                step: step.map(Box::new),
+            },
+            start,
+        ))
     }
 
     /// Whether the next token begins a comparison operator (`== != < > <= >=`,
@@ -1563,8 +1785,12 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
         }
         loop {
             let expr = self.parse_expression(Precedence::Lowest)?;
-            if matches!(expr, Expr::Identifier(_)) && matches!(self.peek_token()?, Some(Token::Assign)) {
-                let Expr::Identifier(name) = expr else { unreachable!() };
+            if matches!(expr.kind, ExprKind::Identifier(_))
+                && matches!(self.peek_token()?, Some(Token::Assign))
+            {
+                let ExprKind::Identifier(name) = expr.kind else {
+                    unreachable!()
+                };
                 self.next_token()?; // consume '='
                 let value = self.parse_expression(Precedence::Lowest)?;
                 kwargs.push(KwArg { name, value });
@@ -1594,7 +1820,10 @@ impl<I: Iterator<Item = Result<Token, LexError>>> Parser<I> {
         let token = self.next_token()?;
         match token {
             Token::Newline | Token::Eof => Ok(()),
-            _ => Err(ParseError::UnexpectedToken(token, "Expected newline or EOF at the end of statement".into())),
+            _ => Err(ParseError::UnexpectedToken(
+                token,
+                "Expected newline or EOF at the end of statement".into(),
+            )),
         }
     }
 }
@@ -1618,6 +1847,7 @@ fn convention_word(word: &str) -> Option<ArgConvention> {
         "owned" => Some(ArgConvention::Owned),
         "out" => Some(ArgConvention::Out),
         "ref" => Some(ArgConvention::Ref),
+        "deinit" => Some(ArgConvention::Deinit),
         _ => None,
     }
 }
@@ -1625,8 +1855,8 @@ fn convention_word(word: &str) -> Option<ArgConvention> {
 /// The callee name of a call: the callee must be a bare identifier (closures
 /// can't escape to become arbitrary callee expressions).
 fn call_name(callee: Expr) -> Result<String, ParseError> {
-    match callee {
-        Expr::Identifier(name) => Ok(name),
+    match callee.kind {
+        ExprKind::Identifier(name) => Ok(name),
         other => Err(ParseError::UnexpectedToken(
             Token::LParen,
             format!("only named functions can be called, found {:?}", other),
@@ -1654,8 +1884,14 @@ fn infix_precedence(op: InfixOp) -> Precedence {
     match op {
         InfixOp::Or => Precedence::Or,
         InfixOp::And => Precedence::And,
-        InfixOp::Eq | InfixOp::Ne | InfixOp::Lt | InfixOp::Gt | InfixOp::Le | InfixOp::Ge
-        | InfixOp::In | InfixOp::NotIn => Precedence::Comparison,
+        InfixOp::Eq
+        | InfixOp::Ne
+        | InfixOp::Lt
+        | InfixOp::Gt
+        | InfixOp::Le
+        | InfixOp::Ge
+        | InfixOp::In
+        | InfixOp::NotIn => Precedence::Comparison,
         InfixOp::Add | InfixOp::Sub => Precedence::Sum,
         InfixOp::Mul | InfixOp::Div | InfixOp::FloorDiv | InfixOp::Mod => Precedence::Product,
         // Right-associative: parse the right operand one level below `**` so that

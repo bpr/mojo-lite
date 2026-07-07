@@ -60,6 +60,13 @@ the **Mojo-only** ones (`var struct trait comptime raises`). `Token::keyword` is
 lookup table. Soft/contextual words such as `mut` (in `mut self`) are **not** reserved — they
 lex as identifiers, so they stay usable as ordinary names, matching Mojo.
 
+**Line joining.** A logical line may span several physical lines two ways. *Implicit*:
+inside `( … )` / `[ … ]` newlines and indentation are suppressed (the brackets carry the
+continuation). *Explicit*: a **backslash immediately before a newline** (`\` then `LF` or
+`CRLF`) joins the two physical lines — no `NEWLINE` is emitted and the continued line's
+indentation is not significant (matching Mojo's `line_continuation` lexer token). A
+backslash *not* immediately followed by a newline is a lex error.
+
 ## Statements
 
 ```
@@ -194,7 +201,7 @@ param_item:
     | '*' NAME ':' type                    # *args (positional variadic)
     | '**' NAME ':' type                   # **kwargs (keyword variadic)
     | [convention] NAME ':' type ['=' expression]   # regular, optional default
-convention: 'read' | 'mut' | 'owned' | 'out' | 'ref' [origin_spec]
+convention: 'read' | 'mut' | 'owned' | 'out' | 'ref' [origin_spec] | 'deinit'
 origin_spec: '[' ','.expression+ ']'   # a ref origin (parsed & discarded); an expression, a named origin, or '_'
 ```
 

@@ -1,10 +1,10 @@
-use mojo_lite::token::Token;
 use mojo_lite::Lexer;
+use mojo_lite::token::Token;
 
 /// Collect all tokens, panicking if the lexer reports an error.
 fn lex_all(source: &str) -> Vec<Token> {
     Lexer::new(source)
-        .map(|r| r.expect("lexer error"))
+        .map(|r| r.expect("lexer error").0)
         .collect()
 }
 
@@ -186,6 +186,36 @@ fn newlines_suppressed_inside_parens() {
             Token::Eof,
         ]
     );
+}
+
+#[test]
+fn backslash_newline_is_a_line_continuation() {
+    // `\` immediately before a newline joins the two physical lines: no Newline
+    // token appears at the join, and the continued line's indentation is ignored.
+    let tokens = lex_all("var x: Int = 1 + \\\n    2");
+    assert_eq!(
+        tokens,
+        vec![
+            Token::Var,
+            Token::Identifier("x".into()),
+            Token::Colon,
+            Token::Identifier("Int".into()),
+            Token::Assign,
+            Token::IntLiteral(1),
+            Token::Plus,
+            Token::IntLiteral(2),
+            Token::Newline,
+            Token::Eof,
+        ]
+    );
+    // CRLF works too.
+    assert_eq!(lex_all("1 + \\\r\n2"), lex_all("1 + 2"));
+}
+
+#[test]
+fn backslash_not_before_newline_is_an_error() {
+    // A backslash must be immediately followed by a newline to continue a line.
+    assert!(Lexer::new("1 \\ 2").any(|r| r.is_err()));
 }
 
 #[test]
@@ -375,7 +405,10 @@ fn lexes_digit_separators() {
 #[test]
 fn lexes_single_and_triple_quoted_strings() {
     assert_eq!(lex_literal("'hello'"), Token::StringLiteral("hello".into()));
-    assert_eq!(lex_literal("\"plain\""), Token::StringLiteral("plain".into()));
+    assert_eq!(
+        lex_literal("\"plain\""),
+        Token::StringLiteral("plain".into())
+    );
     assert_eq!(
         lex_all("var x = \"\"\"multi\nline\"\"\"")[3],
         Token::StringLiteral("multi\nline".into())

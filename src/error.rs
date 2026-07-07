@@ -28,9 +28,30 @@ pub enum ParseError {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeError {
     UndefinedVariable(String),
+    /// A non-`Copyable` value is used where it would be copied (bound to a new
+    /// variable, passed by value, returned, …). Mojo move-only semantics: transfer
+    /// it with `^`, or make the type `Copyable`. `ty` is the type; `context` is the
+    /// site (e.g. `variable 'b'`).
+    NonCopyable {
+        ty: String,
+        context: String,
+    },
+    /// Aliasing violation: a variable is borrowed mutably (`mut`/`ref`) and also
+    /// borrowed (mutably or shared) at the same call — Mojo's borrow rule is
+    /// mutable-XOR-shared. E.g. `f(mut a, mut a)` or `f(mut a, a)`.
+    AliasingViolation {
+        var: String,
+    },
     /// A name used in call position is not function-typed.
-    NotCallable { name: String, ty: String },
-    ArityMismatch { name: String, expected: usize, got: usize },
+    NotCallable {
+        name: String,
+        ty: String,
+    },
+    ArityMismatch {
+        name: String,
+        expected: usize,
+        got: usize,
+    },
     /// Re-declaring a name already bound in the same scope. Mojo rejects this;
     /// the evaluator used to silently overwrite the binding.
     Redeclaration(String),
@@ -45,15 +66,28 @@ pub enum TypeError {
     ContinueOutsideLoop,
     /// An inferred type did not match the one required by its context (a
     /// variable annotation, a declared return type, or a parameter type).
-    TypeMismatch { expected: String, found: String, context: String },
+    TypeMismatch {
+        expected: String,
+        found: String,
+        context: String,
+    },
     /// An operator applied to operand type(s) it is not defined for.
-    BadOperator { op: String, operands: String },
+    BadOperator {
+        op: String,
+        operands: String,
+    },
     /// A type annotation named an identifier that is not a known type/struct.
     UnknownType(String),
     /// Field access on a value whose type has no such field.
-    NoSuchField { object_type: String, field: String },
+    NoSuchField {
+        object_type: String,
+        field: String,
+    },
     /// Method call on a value whose type has no such method.
-    NoSuchMethod { object_type: String, method: String },
+    NoSuchMethod {
+        object_type: String,
+        method: String,
+    },
     /// Constructing a struct that has no constructor (no `@fieldwise_init`).
     NoConstructor(String),
     /// A type-parameter bound named a trait that is not a recognized built-in
@@ -62,23 +96,45 @@ pub enum TypeError {
     /// A parameterized type was applied to the wrong number of type arguments
     /// (e.g. `Pair[Int, Int]` for a one-parameter `Pair`, or type arguments on a
     /// non-generic type).
-    WrongTypeArgCount { name: String, expected: usize, got: usize },
+    WrongTypeArgCount {
+        name: String,
+        expected: usize,
+        got: usize,
+    },
     /// `Self.T` used where `T` is not a type parameter of the enclosing struct
     /// (or outside any struct).
     UnknownSelfParam(String),
     /// A generic call/construction could not solve a type parameter from the
     /// argument types (no explicit type-argument syntax exists to supply it).
-    CannotInferTypeParam { name: String, param: String },
+    CannotInferTypeParam {
+        name: String,
+        param: String,
+    },
     /// A solved type argument does not conform to a type parameter's declared
     /// trait bound (`f[T: Quackable](...)` called with a non-`Quackable` type).
-    TraitNotSatisfied { param: String, ty: String, trait_name: String },
+    TraitNotSatisfied {
+        param: String,
+        ty: String,
+        trait_name: String,
+    },
     /// A struct declares conformance to a trait but is missing a required method.
-    MissingTraitMethod { struct_name: String, trait_name: String, method: String },
+    MissingTraitMethod {
+        struct_name: String,
+        trait_name: String,
+        method: String,
+    },
     /// A struct's method exists but does not match the trait's required signature.
-    TraitMethodMismatch { struct_name: String, trait_name: String, method: String },
+    TraitMethodMismatch {
+        struct_name: String,
+        trait_name: String,
+        method: String,
+    },
     /// A value parameter was declared with a type other than `Int` (the only
     /// value-parameter type supported).
-    BadValueParamType { name: String, ty: String },
+    BadValueParamType {
+        name: String,
+        ty: String,
+    },
     /// An expression used in a compile-time position (`comptime NAME = …`, or a
     /// value-parameter argument) is not a constant `Int` expression.
     NotComptime(String),
@@ -88,7 +144,10 @@ pub enum TypeError {
     BadSimdWidth(String),
     /// A SIMD construction had the wrong number of element arguments (must be the
     /// width, or exactly one to splat).
-    SimdArity { width: i64, got: usize },
+    SimdArity {
+        width: i64,
+        got: usize,
+    },
     /// A subscript `v[i]` was applied to a non-SIMD value.
     NotIndexable(String),
     /// A function with a non-`None` return type can fall off the end without
@@ -115,7 +174,10 @@ pub enum TypeError {
     /// alone doesn't capture: an unknown keyword name, a parameter bound twice
     /// (positionally and by keyword, or a duplicate keyword), or a required
     /// parameter left unbound. `reason` describes the specific problem.
-    BadCall { func: String, reason: String },
+    BadCall {
+        func: String,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -123,7 +185,11 @@ pub enum RuntimeError {
     UndefinedVariable(String),
     TypeError(String),
     NotCallable(String),
-    ArityMismatch { name: String, expected: usize, got: usize },
+    ArityMismatch {
+        name: String,
+        expected: usize,
+        got: usize,
+    },
     /// A closure value tried to escape its defining scope (e.g. by being
     /// returned). Mojo does not support escaping closures — downward funargs
     /// only. See the strict-subset design notes.
@@ -143,12 +209,24 @@ impl fmt::Display for LexError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LexError::IndentationError(pos) => write!(f, "Indentation error at byte {}", pos),
-            LexError::UnmatchedParenthesis(pos) => write!(f, "Unmatched closing parenthesis at byte {}", pos    ),
-            LexError::UnexpectedCharacter(c, pos) => write!(f, "Unexpected character '{}' at byte {}", c, pos),
-            LexError::InvalidInteger(pos) => write!(f, "Invalid integer literal starting at byte {}", pos),
-            LexError::InvalidFloat(pos) => write!(f, "Invalid float literal starting at byte {}", pos),
-            LexError::UnterminatedString(pos) => write!(f, "Unterminated string literal starting at byte {}", pos),
-            LexError::InvalidEscape(c, pos) => write!(f, "Invalid string escape '\\{}' at byte {}", c, pos),
+            LexError::UnmatchedParenthesis(pos) => {
+                write!(f, "Unmatched closing parenthesis at byte {}", pos)
+            }
+            LexError::UnexpectedCharacter(c, pos) => {
+                write!(f, "Unexpected character '{}' at byte {}", c, pos)
+            }
+            LexError::InvalidInteger(pos) => {
+                write!(f, "Invalid integer literal starting at byte {}", pos)
+            }
+            LexError::InvalidFloat(pos) => {
+                write!(f, "Invalid float literal starting at byte {}", pos)
+            }
+            LexError::UnterminatedString(pos) => {
+                write!(f, "Unterminated string literal starting at byte {}", pos)
+            }
+            LexError::InvalidEscape(c, pos) => {
+                write!(f, "Invalid string escape '\\{}' at byte {}", c, pos)
+            }
         }
     }
 }
@@ -157,7 +235,9 @@ impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ParseError::LexerError(err) => write!(f, "Lexer error: {}", err),
-            ParseError::UnexpectedToken(token, msg) => write!(f, "Unexpected token {:?}: {}", token, msg),
+            ParseError::UnexpectedToken(token, msg) => {
+                write!(f, "Unexpected token {:?}: {}", token, msg)
+            }
             ParseError::UnexpectedEof(msg) => write!(f, "Unexpected EOF: {}", msg),
             ParseError::UnknownType(name) => write!(f, "Unknown type '{}'", name),
         }
@@ -168,10 +248,24 @@ impl fmt::Display for TypeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TypeError::UndefinedVariable(name) => write!(f, "Undefined variable '{}'", name),
+            TypeError::NonCopyable { ty, context } => write!(
+                f,
+                "cannot copy non-Copyable type '{ty}' ({context}); transfer it with '^' \
+                 or make '{ty}' Copyable"
+            ),
+            TypeError::AliasingViolation { var } => write!(
+                f,
+                "'{var}' is borrowed mutably and also used at the same call \
+                 (a mutable borrow must be exclusive)"
+            ),
             TypeError::NotCallable { name, ty } => {
                 write!(f, "'{}' has type {} and is not callable", name, ty)
             }
-            TypeError::ArityMismatch { name, expected, got } => write!(
+            TypeError::ArityMismatch {
+                name,
+                expected,
+                got,
+            } => write!(
                 f,
                 "'{}' expects {} argument(s), got {}",
                 name, expected, got
@@ -186,7 +280,11 @@ impl fmt::Display for TypeError {
             TypeError::ReturnOutsideFunction => write!(f, "'return' outside of a function"),
             TypeError::BreakOutsideLoop => write!(f, "'break' outside of a loop"),
             TypeError::ContinueOutsideLoop => write!(f, "'continue' outside of a loop"),
-            TypeError::TypeMismatch { expected, found, context } => write!(
+            TypeError::TypeMismatch {
+                expected,
+                found,
+                context,
+            } => write!(
                 f,
                 "type mismatch for {}: expected {}, found {}",
                 context, expected, found
@@ -198,39 +296,66 @@ impl fmt::Display for TypeError {
             TypeError::NoSuchField { object_type, field } => {
                 write!(f, "type '{}' has no field '{}'", object_type, field)
             }
-            TypeError::NoSuchMethod { object_type, method } => {
+            TypeError::NoSuchMethod {
+                object_type,
+                method,
+            } => {
                 write!(f, "type '{}' has no method '{}'", object_type, method)
             }
             TypeError::NoConstructor(name) => {
-                write!(f, "struct '{}' has no constructor (add @fieldwise_init)", name)
+                write!(
+                    f,
+                    "struct '{}' has no constructor (add @fieldwise_init)",
+                    name
+                )
             }
             TypeError::UnknownTrait(name) => {
                 write!(f, "unknown trait '{}' in a type-parameter bound", name)
             }
-            TypeError::WrongTypeArgCount { name, expected, got } => write!(
+            TypeError::WrongTypeArgCount {
+                name,
+                expected,
+                got,
+            } => write!(
                 f,
                 "type '{}' expects {} type argument(s), got {}",
                 name, expected, got
             ),
             TypeError::UnknownSelfParam(name) => {
-                write!(f, "'Self.{}' is not a type parameter of the enclosing struct", name)
+                write!(
+                    f,
+                    "'Self.{}' is not a type parameter of the enclosing struct",
+                    name
+                )
             }
             TypeError::CannotInferTypeParam { name, param } => write!(
                 f,
                 "cannot infer type parameter '{}' of '{}' from the arguments",
                 param, name
             ),
-            TypeError::TraitNotSatisfied { param, ty, trait_name } => write!(
+            TypeError::TraitNotSatisfied {
+                param,
+                ty,
+                trait_name,
+            } => write!(
                 f,
                 "type '{}' for parameter '{}' does not conform to trait '{}'",
                 ty, param, trait_name
             ),
-            TypeError::MissingTraitMethod { struct_name, trait_name, method } => write!(
+            TypeError::MissingTraitMethod {
+                struct_name,
+                trait_name,
+                method,
+            } => write!(
                 f,
                 "struct '{}' declares conformance to trait '{}' but is missing method '{}'",
                 struct_name, trait_name, method
             ),
-            TypeError::TraitMethodMismatch { struct_name, trait_name, method } => write!(
+            TypeError::TraitMethodMismatch {
+                struct_name,
+                trait_name,
+                method,
+            } => write!(
                 f,
                 "struct '{}' method '{}' does not match the signature required by trait '{}'",
                 struct_name, method, trait_name
@@ -284,7 +409,11 @@ impl fmt::Display for RuntimeError {
             RuntimeError::UndefinedVariable(name) => write!(f, "Undefined variable '{}'", name),
             RuntimeError::TypeError(msg) => write!(f, "Type error: {}", msg),
             RuntimeError::NotCallable(name) => write!(f, "'{}' is not callable", name),
-            RuntimeError::ArityMismatch { name, expected, got } => write!(
+            RuntimeError::ArityMismatch {
+                name,
+                expected,
+                got,
+            } => write!(
                 f,
                 "'{}' expects {} argument(s), got {}",
                 name, expected, got
@@ -299,7 +428,46 @@ impl fmt::Display for RuntimeError {
     }
 }
 
+/// Errors from the ownership analysis (`analysis`), a compiler pass over the MIR
+/// that runs after type-checking. These model Mojo's move semantics — a value
+/// transferred with `^` is left uninitialized, so using it again is an error.
+/// Each carries the source `Span` (byte range) of the offending use, recovered
+/// from the MIR `SpanTable`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OwnershipError {
+    /// A variable is used after it was transferred (`x^`) on every path to here.
+    UseAfterMove { var: String, span: (usize, usize) },
+    /// A variable is used after being transferred on *some* (not all) paths — a
+    /// move inside one branch of an `if`, then a use after the merge.
+    ConditionallyMoved { var: String, span: (usize, usize) },
+}
+
+impl fmt::Display for OwnershipError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OwnershipError::UseAfterMove { var, .. } => {
+                write!(f, "use of '{var}' after it was transferred (moved) with '^'")
+            }
+            OwnershipError::ConditionallyMoved { var, .. } => write!(
+                f,
+                "'{var}' is used here but may have been transferred (moved) on some paths"
+            ),
+        }
+    }
+}
+
+impl OwnershipError {
+    /// The source span (byte range) of the offending use.
+    pub fn span(&self) -> (usize, usize) {
+        match self {
+            OwnershipError::UseAfterMove { span, .. }
+            | OwnershipError::ConditionallyMoved { span, .. } => *span,
+        }
+    }
+}
+
 impl std::error::Error for LexError {}
 impl std::error::Error for ParseError {}
 impl std::error::Error for TypeError {}
 impl std::error::Error for RuntimeError {}
+impl std::error::Error for OwnershipError {}

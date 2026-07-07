@@ -2,15 +2,16 @@
 //! the whole pipeline and asserted to land at the outcome its folder names. Drop a
 //! real Mojo file into the matching folder to add coverage — no code changes.
 //!
-//! Categories: `ok` (lex+parse+check+eval all succeed), `parse_error` (rejected at
-//! lex/parse), `type_error` (checker rejects), `runtime_error` (fails at eval,
-//! including the `Unsupported` "parse now, run later" gaps).
+//! Categories: `ok` (lex+parse+check+**ownership**+eval all succeed), `parse_error`
+//! (rejected at lex/parse), `type_error` (checker rejects), `ownership_error` (the
+//! Phase-4 move analysis rejects — use-after-move / conditional move), and
+//! `runtime_error` (fails at eval, including the `Unsupported` gaps).
 //!
 //! A file may optionally pin the exact message with a top comment
 //! `# expect: <substring>` (valid Mojo, skipped by the lexer): the reported error
 //! must then contain `<substring>`.
 
-use mojo_lite::{check, parse, Evaluator};
+use mojo_lite::{BackendKind, check, check_ownership, parse};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -20,6 +21,7 @@ enum Outcome {
     Ok,
     ParseError,
     TypeError,
+    OwnershipError,
     RuntimeError,
 }
 
@@ -29,6 +31,7 @@ impl Outcome {
             Outcome::Ok => "ok",
             Outcome::ParseError => "parse_error",
             Outcome::TypeError => "type_error",
+            Outcome::OwnershipError => "ownership_error",
             Outcome::RuntimeError => "runtime_error",
         }
     }
@@ -43,8 +46,11 @@ fn classify(source: &str) -> (Outcome, String) {
     if let Err(e) = check(&program) {
         return (Outcome::TypeError, e.to_string());
     }
-    let mut evaluator = Evaluator::new();
-    match evaluator.eval_program(&program) {
+    if let Err(e) = check_ownership(&program) {
+        return (Outcome::OwnershipError, e.to_string());
+    }
+    let mut backend = BackendKind::Vm.make();
+    match backend.run(&program) {
         Ok(()) => (Outcome::Ok, String::new()),
         Err(e) => (Outcome::RuntimeError, e.to_string()),
     }
@@ -63,7 +69,9 @@ fn expected_substring(source: &str) -> Option<String> {
 
 /// The `.mojo` files in `assets/<category>/`, sorted (empty if the dir is absent).
 fn fixtures(category: &str) -> Vec<PathBuf> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets").join(category);
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join(category);
     let mut files: Vec<PathBuf> = match fs::read_dir(&dir) {
         Ok(rd) => rd
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -83,7 +91,11 @@ fn check_category(category: &str, expected: Outcome) {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let source = fs::read_to_string(&path).expect("read fixture");
         let (got, message) = classify(&source);
-        let shown = if message.is_empty() { "no error" } else { message.as_str() };
+        let shown = if message.is_empty() {
+            "no error"
+        } else {
+            message.as_str()
+        };
         if got != expected {
             failures.push(format!(
                 "  {name}: expected {}, got {} ({shown})",
@@ -93,7 +105,9 @@ fn check_category(category: &str, expected: Outcome) {
         } else if let Some(sub) = expected_substring(&source)
             && !message.contains(&sub)
         {
-            failures.push(format!("  {name}: error did not contain '{sub}' (got: {shown})"));
+            failures.push(format!(
+                "  {name}: error did not contain '{sub}' (got: {shown})"
+            ));
         }
     }
     assert!(
@@ -117,6 +131,11 @@ fn assets_parse_error() {
 #[test]
 fn assets_type_error() {
     check_category("type_error", Outcome::TypeError);
+}
+
+#[test]
+fn assets_ownership_error() {
+    check_category("ownership_error", Outcome::OwnershipError);
 }
 
 #[test]

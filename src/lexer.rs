@@ -1,19 +1,25 @@
 use crate::error::LexError;
-use crate::token::{TStringChunk, Token};
+use crate::token::{Span, TStringChunk, Token};
 use std::collections::VecDeque;
 
 pub struct Lexer<'a> {
     input: &'a str,
     pos: usize,
-    
+
+    // Byte offset at which the token currently being scanned began. Refreshed to
+    // `self.pos` once per scan iteration (after the pending queue is drained), so
+    // any token produced during that iteration spans `(token_start, self.pos)`.
+    token_start: usize,
+
     // Offside rule and scoping state
     indent_stack: Vec<usize>,
     paren_count: usize,
     at_line_start: bool,
     eof_emitted: bool,
-    
-    // Queue for when a single character (or EOF) produces multiple tokens
-    pending_tokens: VecDeque<Token>,
+
+    // Queue for when a single character (or EOF) produces multiple tokens. Each
+    // entry carries the token's source span (see `emit`).
+    pending_tokens: VecDeque<(Token, Span)>,
 }
 
 impl<'a> Lexer<'a> {
@@ -21,6 +27,7 @@ impl<'a> Lexer<'a> {
         Self {
             input,
             pos: 0,
+            token_start: 0,
             indent_stack: vec![0],
             paren_count: 0,
             at_line_start: true,
@@ -47,7 +54,12 @@ impl<'a> Lexer<'a> {
 
     /// Advance past a run of ASCII digits.
     fn consume_digits(&mut self) {
-        while self.remainder().chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        while self
+            .remainder()
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_digit())
+        {
             self.pos += 1;
         }
     }
@@ -78,7 +90,11 @@ impl<'a> Lexer<'a> {
             Some('+') | Some('-') => 1,
             _ => 0,
         };
-        if after_e[sign_len..].chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        if after_e[sign_len..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_digit())
+        {
             self.pos += 1 + sign_len; // consume 'e' and the optional sign
             self.consume_digits();
             true
@@ -280,17 +296,31 @@ impl<'a> Lexer<'a> {
             }
         }
     }
+
+    /// Enqueue a scanned token, stamping it with the span `(token_start, pos)` —
+    /// the source range consumed since this scan iteration began. Synthetic layout
+    /// tokens (Indent/Dedent/Newline/Eof) get whatever narrow range is current,
+    /// which is fine since they carry no source text.
+    fn emit(&mut self, token: Token) {
+        self.pending_tokens
+            .push_back((token, (self.token_start, self.pos)));
+    }
 }
 
 impl<'a> Iterator for Lexer<'a> {
-    type Item = Result<Token, LexError>;
+    type Item = Result<(Token, Span), LexError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             // 1. Drain any pending tokens first (e.g., multiple Dedents)
-            if let Some(token) = self.pending_tokens.pop_front() {
-                return Some(Ok(token));
+            if let Some(spanned) = self.pending_tokens.pop_front() {
+                return Some(Ok(spanned));
             }
+
+            // Refresh the token-start mark: any token scanned this iteration spans
+            // from here to wherever `self.pos` lands. Re-running per iteration means
+            // leading whitespace (which advances `pos` and loops) is excluded.
+            self.token_start = self.pos;
 
             // 2. Stop completely if we've already emitted the EOF token
             if self.eof_emitted {
@@ -301,16 +331,16 @@ impl<'a> Iterator for Lexer<'a> {
             if self.pos >= self.input.len() {
                 // If the file didn't end with a newline but had tokens, emit one
                 if !self.at_line_start {
-                    self.pending_tokens.push_back(Token::Newline);
+                    self.emit(Token::Newline);
                 }
-                
+
                 // Unwind the indentation stack
                 while self.indent_stack.len() > 1 {
                     self.indent_stack.pop();
-                    self.pending_tokens.push_back(Token::Dedent);
+                    self.emit(Token::Dedent);
                 }
-                
-                self.pending_tokens.push_back(Token::Eof);
+
+                self.emit(Token::Eof);
                 self.eof_emitted = true;
                 continue; // Loop around to pop the tokens we just enqueued
             }
@@ -354,16 +384,16 @@ impl<'a> Iterator for Lexer<'a> {
                 // Only evaluate indentation if we are NOT inside parentheses
                 if self.paren_count == 0 {
                     let current_indent = *self.indent_stack.last().unwrap();
-                    
+
                     if spaces > current_indent {
                         self.indent_stack.push(spaces);
-                        self.pending_tokens.push_back(Token::Indent);
+                        self.emit(Token::Indent);
                         continue;
                     } else if spaces < current_indent {
                         while let Some(&top) = self.indent_stack.last() {
                             if top > spaces {
                                 self.indent_stack.pop();
-                                self.pending_tokens.push_back(Token::Dedent);
+                                self.emit(Token::Dedent);
                             } else if top == spaces {
                                 break;
                             } else {
@@ -395,14 +425,29 @@ impl<'a> Iterator for Lexer<'a> {
                     self.pos += 1;
                     if self.paren_count == 0 {
                         self.at_line_start = true;
-                        self.pending_tokens.push_back(Token::Newline);
+                        self.emit(Token::Newline);
                         continue;
+                    }
+                }
+                '\\' => {
+                    // Explicit line continuation: a backslash *immediately* followed
+                    // by a newline (LF or CRLF) joins the two physical lines into one
+                    // logical line — the newline is suppressed and the continued
+                    // line's indentation is not significant (`at_line_start` stays
+                    // false). A backslash not followed by a newline is an error.
+                    let after = self.pos + 1; // byte offset just past the '\'
+                    if self.input[after..].starts_with("\r\n") {
+                        self.pos = after + 2;
+                    } else if self.input[after..].starts_with('\n') {
+                        self.pos = after + 1;
+                    } else {
+                        return Some(Err(LexError::UnexpectedCharacter('\\', self.pos)));
                     }
                 }
                 '(' => {
                     self.pos += 1;
                     self.paren_count += 1;
-                    self.pending_tokens.push_back(Token::LParen);
+                    self.emit(Token::LParen);
                     continue;
                 }
                 ')' => {
@@ -412,7 +457,7 @@ impl<'a> Iterator for Lexer<'a> {
                     } else {
                         return Some(Err(LexError::UnmatchedParenthesis(self.pos)));
                     }
-                    self.pending_tokens.push_back(Token::RParen);
+                    self.emit(Token::RParen);
                     continue;
                 }
                 '[' => {
@@ -420,7 +465,7 @@ impl<'a> Iterator for Lexer<'a> {
                     // type-parameter / type-argument list may span lines.
                     self.pos += 1;
                     self.paren_count += 1;
-                    self.pending_tokens.push_back(Token::LBracket);
+                    self.emit(Token::LBracket);
                     continue;
                 }
                 ']' => {
@@ -430,33 +475,33 @@ impl<'a> Iterator for Lexer<'a> {
                     } else {
                         return Some(Err(LexError::UnmatchedParenthesis(self.pos)));
                     }
-                    self.pending_tokens.push_back(Token::RBracket);
+                    self.emit(Token::RBracket);
                     continue;
                 }
                 '&' => {
                     self.pos += 1;
-                    self.pending_tokens.push_back(Token::Amp);
+                    self.emit(Token::Amp);
                     continue;
                 }
                 '^' => {
                     self.pos += 1;
-                    self.pending_tokens.push_back(Token::Caret);
+                    self.emit(Token::Caret);
                     continue;
                 }
                 ':' => {
                     // `:=` (walrus) vs `:` (annotation / block header)
                     if self.remainder().starts_with(":=") {
                         self.pos += 2;
-                        self.pending_tokens.push_back(Token::ColonEq);
+                        self.emit(Token::ColonEq);
                     } else {
                         self.pos += 1;
-                        self.pending_tokens.push_back(Token::Colon);
+                        self.emit(Token::Colon);
                     }
                     continue;
                 }
                 ',' => {
                     self.pos += 1;
-                    self.pending_tokens.push_back(Token::Comma);
+                    self.emit(Token::Comma);
                     continue;
                 }
                 '.' => {
@@ -465,26 +510,26 @@ impl<'a> Iterator for Lexer<'a> {
                     // otherwise standalone `.` is member access.
                     if self.remainder().starts_with("...") {
                         self.pos += 3;
-                        self.pending_tokens.push_back(Token::Ellipsis);
+                        self.emit(Token::Ellipsis);
                     } else {
                         self.pos += 1;
-                        self.pending_tokens.push_back(Token::Dot);
+                        self.emit(Token::Dot);
                     }
                     continue;
                 }
                 '@' => {
                     self.pos += 1;
-                    self.pending_tokens.push_back(Token::At);
+                    self.emit(Token::At);
                     continue;
                 }
                 '=' => {
                     // `==` (equality) vs `=` (assignment)
                     if self.remainder().starts_with("==") {
                         self.pos += 2;
-                        self.pending_tokens.push_back(Token::EqEq);
+                        self.emit(Token::EqEq);
                     } else {
                         self.pos += 1;
-                        self.pending_tokens.push_back(Token::Assign);
+                        self.emit(Token::Assign);
                     }
                     continue;
                 }
@@ -492,23 +537,23 @@ impl<'a> Iterator for Lexer<'a> {
                     // `->` (return arrow), `-=` (augmented) vs `-` (sub / negation)
                     if self.remainder().starts_with("->") {
                         self.pos += 2;
-                        self.pending_tokens.push_back(Token::Arrow);
+                        self.emit(Token::Arrow);
                     } else if self.remainder().starts_with("-=") {
                         self.pos += 2;
-                        self.pending_tokens.push_back(Token::MinusEq);
+                        self.emit(Token::MinusEq);
                     } else {
                         self.pos += 1;
-                        self.pending_tokens.push_back(Token::Minus);
+                        self.emit(Token::Minus);
                     }
                     continue;
                 }
                 '+' => {
                     if self.remainder().starts_with("+=") {
                         self.pos += 2;
-                        self.pending_tokens.push_back(Token::PlusEq);
+                        self.emit(Token::PlusEq);
                     } else {
                         self.pos += 1;
-                        self.pending_tokens.push_back(Token::Plus);
+                        self.emit(Token::Plus);
                     }
                     continue;
                 }
@@ -516,16 +561,16 @@ impl<'a> Iterator for Lexer<'a> {
                     // Longest match first: `**=`, then `**`, then `*=`, then `*`.
                     if self.remainder().starts_with("**=") {
                         self.pos += 3;
-                        self.pending_tokens.push_back(Token::DoubleStarEq);
+                        self.emit(Token::DoubleStarEq);
                     } else if self.remainder().starts_with("**") {
                         self.pos += 2;
-                        self.pending_tokens.push_back(Token::DoubleStar);
+                        self.emit(Token::DoubleStar);
                     } else if self.remainder().starts_with("*=") {
                         self.pos += 2;
-                        self.pending_tokens.push_back(Token::StarEq);
+                        self.emit(Token::StarEq);
                     } else {
                         self.pos += 1;
-                        self.pending_tokens.push_back(Token::Star);
+                        self.emit(Token::Star);
                     }
                     continue;
                 }
@@ -533,46 +578,46 @@ impl<'a> Iterator for Lexer<'a> {
                     // Longest match first: `//=`, then `//`, then `/=`, then `/`.
                     if self.remainder().starts_with("//=") {
                         self.pos += 3;
-                        self.pending_tokens.push_back(Token::DoubleSlashEq);
+                        self.emit(Token::DoubleSlashEq);
                     } else if self.remainder().starts_with("//") {
                         self.pos += 2;
-                        self.pending_tokens.push_back(Token::DoubleSlash);
+                        self.emit(Token::DoubleSlash);
                     } else if self.remainder().starts_with("/=") {
                         self.pos += 2;
-                        self.pending_tokens.push_back(Token::SlashEq);
+                        self.emit(Token::SlashEq);
                     } else {
                         self.pos += 1;
-                        self.pending_tokens.push_back(Token::Slash);
+                        self.emit(Token::Slash);
                     }
                     continue;
                 }
                 '%' => {
                     if self.remainder().starts_with("%=") {
                         self.pos += 2;
-                        self.pending_tokens.push_back(Token::PercentEq);
+                        self.emit(Token::PercentEq);
                     } else {
                         self.pos += 1;
-                        self.pending_tokens.push_back(Token::Percent);
+                        self.emit(Token::Percent);
                     }
                     continue;
                 }
                 '<' => {
                     if self.remainder().starts_with("<=") {
                         self.pos += 2;
-                        self.pending_tokens.push_back(Token::Le);
+                        self.emit(Token::Le);
                     } else {
                         self.pos += 1;
-                        self.pending_tokens.push_back(Token::Lt);
+                        self.emit(Token::Lt);
                     }
                     continue;
                 }
                 '>' => {
                     if self.remainder().starts_with(">=") {
                         self.pos += 2;
-                        self.pending_tokens.push_back(Token::Ge);
+                        self.emit(Token::Ge);
                     } else {
                         self.pos += 1;
-                        self.pending_tokens.push_back(Token::Gt);
+                        self.emit(Token::Gt);
                     }
                     continue;
                 }
@@ -580,7 +625,7 @@ impl<'a> Iterator for Lexer<'a> {
                     // `!` only appears as part of `!=` in this subset.
                     if self.remainder().starts_with("!=") {
                         self.pos += 2;
-                        self.pending_tokens.push_back(Token::NotEq);
+                        self.emit(Token::NotEq);
                         continue;
                     }
                     return Some(Err(LexError::UnexpectedCharacter(c, self.pos)));
@@ -590,7 +635,7 @@ impl<'a> Iterator for Lexer<'a> {
                     let triple = self.remainder().starts_with(&c.to_string().repeat(3));
                     match self.lex_string(c, triple) {
                         Ok(token) => {
-                            self.pending_tokens.push_back(token);
+                            self.emit(token);
                             continue;
                         }
                         Err(err) => return Some(Err(err)),
@@ -606,7 +651,7 @@ impl<'a> Iterator for Lexer<'a> {
                             break;
                         }
                     }
-                    
+
                     let text = self.input[start..self.pos].to_string();
                     // A `t"…"` / `rt"…"` string prefix: the word is exactly `t`/`rt`
                     // and is immediately followed by a quote (no space).
@@ -616,20 +661,23 @@ impl<'a> Iterator for Lexer<'a> {
                         _ => None,
                     };
                     if let Some(raw) = tprefix
-                        && let Some(quote) =
-                            self.remainder().chars().next().filter(|&q| q == '"' || q == '\'')
+                        && let Some(quote) = self
+                            .remainder()
+                            .chars()
+                            .next()
+                            .filter(|&q| q == '"' || q == '\'')
                     {
                         let triple = self.remainder().starts_with(&quote.to_string().repeat(3));
                         match self.lex_tstring(quote, triple, raw) {
                             Ok(token) => {
-                                self.pending_tokens.push_back(token);
+                                self.emit(token);
                                 continue;
                             }
                             Err(err) => return Some(Err(err)),
                         }
                     }
                     let token = Token::keyword(&text).unwrap_or(Token::Identifier(text));
-                    self.pending_tokens.push_back(token);
+                    self.emit(token);
                     continue;
                 }
                 _ if c.is_ascii_digit() => {
@@ -651,10 +699,12 @@ impl<'a> Iterator for Lexer<'a> {
                         self.pos += 2; // consume the `0x` / `0o` / `0b` prefix
                         let digits_start = self.pos;
                         self.consume_digit_run(radix);
-                        let cleaned: String =
-                            self.input[digits_start..self.pos].chars().filter(|&c| c != '_').collect();
+                        let cleaned: String = self.input[digits_start..self.pos]
+                            .chars()
+                            .filter(|&c| c != '_')
+                            .collect();
                         match i64::from_str_radix(&cleaned, radix) {
-                            Ok(num) => self.pending_tokens.push_back(Token::IntLiteral(num)),
+                            Ok(num) => self.emit(Token::IntLiteral(num)),
                             Err(_) => return Some(Err(LexError::InvalidInteger(start))),
                         }
                         continue;
@@ -679,15 +729,17 @@ impl<'a> Iterator for Lexer<'a> {
                     }
 
                     // Strip `_` separators before parsing (Rust's parsers reject them).
-                    let cleaned: String =
-                        self.input[start..self.pos].chars().filter(|&c| c != '_').collect();
+                    let cleaned: String = self.input[start..self.pos]
+                        .chars()
+                        .filter(|&c| c != '_')
+                        .collect();
                     if is_float {
                         match cleaned.parse::<f64>() {
-                            Ok(num) => self.pending_tokens.push_back(Token::FloatLiteral(num)),
+                            Ok(num) => self.emit(Token::FloatLiteral(num)),
                             Err(_) => return Some(Err(LexError::InvalidFloat(start))),
                         }
                     } else if let Ok(num) = cleaned.parse::<i64>() {
-                        self.pending_tokens.push_back(Token::IntLiteral(num));
+                        self.emit(Token::IntLiteral(num));
                     } else {
                         return Some(Err(LexError::InvalidInteger(start)));
                     }

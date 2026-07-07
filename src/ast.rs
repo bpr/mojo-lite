@@ -2,6 +2,13 @@
 //!
 //! Kept separate from the parser so the tree can be consumed (by the evaluator,
 //! tests, future type checker) without depending on parsing details.
+//!
+//! **Spans.** Every [`Expr`] carries a source [`Span`] (`token::Span`), stamped by
+//! the parser, so later stages (the MIR's `SpanTable`) can point diagnostics back
+//! at source. The span is *metadata*: [`Expr`]'s `PartialEq` compares only the
+//! `kind`, so AST-literal assertions in the tests stay span-agnostic.
+
+use crate::token::Span;
 
 /// A type annotation. Covers the scalar types plus nominal (`struct`) types,
 /// which may carry type arguments (`Pair[Int]`), and references to a type
@@ -32,7 +39,12 @@ pub enum Type {
     /// non-capturing function pointer (default is capturing). Parsed; the checker
     /// flags a function-typed binding as unsupported (semantics deferred). Any
     /// `abi("…")` effect is parsed and discarded.
-    Func { params: Vec<Type>, ret: Box<Type>, thin: bool, raises: bool },
+    Func {
+        params: Vec<Type>,
+        ret: Box<Type>,
+        thin: bool,
+        raises: bool,
+    },
     /// A **reference type** `ref [origin] T` (Mojo's parametric-mutability
     /// reference — used in a `ref[origin]` return type). The origin specifier is
     /// parsed but **discarded** (origins are not modeled); `ty` is the referent
@@ -141,8 +153,14 @@ impl Dtype {
     /// The dtype a scalar alias names (`"Int32"` → `Int32`), or `None`.
     pub fn from_scalar_alias(name: &str) -> Option<Dtype> {
         [
-            Dtype::Int8, Dtype::Int16, Dtype::Int32, Dtype::Int64,
-            Dtype::UInt8, Dtype::UInt16, Dtype::UInt32, Dtype::UInt64,
+            Dtype::Int8,
+            Dtype::Int16,
+            Dtype::Int32,
+            Dtype::Int64,
+            Dtype::UInt8,
+            Dtype::UInt16,
+            Dtype::UInt32,
+            Dtype::UInt64,
             Dtype::Float32,
         ]
         .into_iter()
@@ -199,6 +217,10 @@ pub enum ArgConvention {
     Owned,
     Out,
     Ref,
+    /// `deinit` — the destructor/consuming-move convention: grants exclusive
+    /// ownership and marks the value destroyed at function end. Current Mojo's
+    /// `def __del__(deinit self)` (superseding the older `owned self`).
+    Deinit,
 }
 
 /// A keyword argument at a call site: `name=value`. Parsed, not modeled.
@@ -303,12 +325,47 @@ pub struct WithItem {
     pub var: Option<String>,
 }
 
+/// A statement node: its [`StmtKind`] plus the source [`Span`] it was parsed from.
+/// Like [`Expr`], equality ignores the span (it is metadata), so AST-literal
+/// assertions stay span-agnostic.
+#[derive(Debug, Clone)]
+pub struct Stmt {
+    pub kind: StmtKind,
+    pub span: Span,
+}
+
+impl Stmt {
+    /// Construct a spanned statement.
+    pub fn new(kind: StmtKind, span: Span) -> Self {
+        Stmt { kind, span }
+    }
+}
+
+/// Span-agnostic structural equality: two statements are equal iff their kinds are.
+impl PartialEq for Stmt {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+    }
+}
+
+/// Wrap a bare [`StmtKind`] into a [`Stmt`] with a dummy span. Convenient for
+/// building AST literals in tests (where the span is irrelevant).
+impl From<StmtKind> for Stmt {
+    fn from(kind: StmtKind) -> Self {
+        Stmt::new(kind, crate::token::DUMMY_SPAN)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
-pub enum Stmt {
+pub enum StmtKind {
     /// `var name[: Type] = value` — declares (and initializes) a new variable.
     /// The annotation is optional: `ty: None` is an **inferred** `var` (the type
     /// comes from `value`, materializing a literal to its default kind).
-    VarDecl { name: String, ty: Option<Type>, value: Expr },
+    VarDecl {
+        name: String,
+        ty: Option<Type>,
+        value: Expr,
+    },
     /// `name = value` — re-assigns an already-declared variable (every `var` is
     /// mutable). Distinct from `VarDecl`; the value must keep the declared type.
     Assign { name: String, value: Expr },
@@ -316,7 +373,11 @@ pub enum Stmt {
     /// **place** (`Expr::Identifier`/`Member`/`Index`). Means `target = target OP
     /// value`, but the target (and any index within it) is evaluated once. `op` is
     /// one of `+ - * / // % **`.
-    AugAssign { place: Expr, op: InfixOp, value: Expr },
+    AugAssign {
+        place: Expr,
+        op: InfixOp,
+        value: Expr,
+    },
     /// `a, b, … = value` — **tuple-unpacking assignment** (bare form, no `var`;
     /// the `var a, b = …` form is an open Mojo feature request, not valid yet).
     /// `targets` is the comma-separated target list (each a `NAME` or place); the
@@ -390,12 +451,19 @@ pub enum Stmt {
     /// deprecated). Same shape as `If`, but the branch is meant to be selected at
     /// compile time. Parsed and grammar-documented, but the checker flags it as
     /// unsupported (comptime branch selection is deferred — "parse now, run later").
-    ComptimeIf { branches: Vec<(Expr, Vec<Stmt>)>, orelse: Option<Vec<Stmt>> },
+    ComptimeIf {
+        branches: Vec<(Expr, Vec<Stmt>)>,
+        orelse: Option<Vec<Stmt>>,
+    },
     /// `comptime for var in iter: <body>` — a **compile-time (unrolled) loop**
     /// (Mojo's modern spelling; the older `@parameter for` is deprecated). Same
     /// shape as `For`. Parsed and grammar-documented, but the checker flags it as
     /// unsupported (comptime unrolling is deferred).
-    ComptimeFor { var: String, iter: Expr, body: Vec<Stmt> },
+    ComptimeFor {
+        var: String,
+        iter: Expr,
+        body: Vec<Stmt>,
+    },
     /// `if cond: ... (elif cond: ...)* (else: ...)?`
     ///
     /// `branches` holds the `if` plus each `elif` as a `(condition, body)` pair,
@@ -407,22 +475,36 @@ pub enum Stmt {
     /// `while cond: <body>`
     While { cond: Expr, body: Vec<Stmt> },
     /// `for var in iter: <body>` — `iter` must evaluate to a `range(...)`.
-    For { var: String, iter: Expr, body: Vec<Stmt> },
+    For {
+        var: String,
+        iter: Expr,
+        body: Vec<Stmt>,
+    },
     /// `return` or `return expr`
     Return(Option<Expr>),
     /// `raise expr` — raise an error (an `Error` value, or a `String` shorthand).
     Raise(Expr),
     /// `import a.b.c [as alias]`. Parsed but not resolved (no module system yet).
-    Import { path: Vec<String>, alias: Option<String> },
+    Import {
+        path: Vec<String>,
+        alias: Option<String>,
+    },
     /// `from [.]*module import <targets>`. `level` is the number of leading dots
     /// (0 = absolute; relative imports raise it); `path` is the dotted module
     /// name (possibly empty for `from . import x`). Parsed but not resolved.
-    FromImport { level: usize, path: Vec<String>, names: ImportNames },
+    FromImport {
+        level: usize,
+        path: Vec<String>,
+        names: ImportNames,
+    },
     /// `with item (',' item)*: <body>` — a context-manager block, where each
     /// `item` is a `WithItem` (a context expression + optional `as NAME`). Parsed
     /// and grammar-documented, but the checker flags it as unsupported (the
     /// `__enter__`/`__exit__` protocol is deferred — "parse now, run later").
-    With { items: Vec<WithItem>, body: Vec<Stmt> },
+    With {
+        items: Vec<WithItem>,
+        body: Vec<Stmt>,
+    },
     /// `try: <body> [except [e]: ...] [else: ...] [finally: ...]`. At least one of
     /// `except`/`finally` is present. `except` optionally binds the error name.
     Try {
@@ -441,8 +523,41 @@ pub enum Stmt {
     Expr(Expr),
 }
 
+/// An expression node: its [`ExprKind`] plus the source [`Span`] it was parsed
+/// from. Equality ignores the span (see the module note), so `a == b` iff their
+/// kinds are structurally equal.
+#[derive(Debug, Clone)]
+pub struct Expr {
+    pub kind: ExprKind,
+    pub span: Span,
+}
+
+impl Expr {
+    /// Construct a spanned expression.
+    pub fn new(kind: ExprKind, span: Span) -> Self {
+        Expr { kind, span }
+    }
+}
+
+/// Wrap a bare [`ExprKind`] into an [`Expr`] with a dummy span. Convenient for
+/// synthesizing expressions and for building AST literals in tests (where the
+/// span is irrelevant — [`Expr`]'s equality ignores it).
+impl From<ExprKind> for Expr {
+    fn from(kind: ExprKind) -> Self {
+        Expr::new(kind, crate::token::DUMMY_SPAN)
+    }
+}
+
+/// Span-agnostic structural equality: two expressions are equal iff their kinds
+/// are equal, regardless of where in the source each was parsed.
+impl PartialEq for Expr {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
-pub enum Expr {
+pub enum ExprKind {
     Int(i64),
     Float(f64),
     Bool(bool),
@@ -460,9 +575,17 @@ pub enum Expr {
     /// which case the checker infers the type parameters from `args`.
     /// `kwargs` are keyword arguments (`name=value`) — parsed, not modeled (a call
     /// using them is flagged unsupported by the checker).
-    Call { name: String, param_args: Vec<ParamArg>, args: Vec<Expr>, kwargs: Vec<KwArg> },
+    Call {
+        name: String,
+        param_args: Vec<ParamArg>,
+        args: Vec<Expr>,
+        kwargs: Vec<KwArg>,
+    },
     /// Field access on a struct value: `object.field`.
-    Member { object: Box<Expr>, field: String },
+    Member {
+        object: Box<Expr>,
+        field: String,
+    },
     /// A method call on a struct value: `object.method(args)`.
     MethodCall {
         object: Box<Expr>,
@@ -471,7 +594,10 @@ pub enum Expr {
         kwargs: Vec<KwArg>,
     },
     /// A subscript `object[index]` — a SIMD lane read (the only subscript form).
-    Index { object: Box<Expr>, index: Box<Expr> },
+    Index {
+        object: Box<Expr>,
+        index: Box<Expr>,
+    },
     /// The transfer sigil `expr^` (ownership move). Parsed for completeness but
     /// not modeled — evaluates to its operand (value semantics unchanged).
     Transfer(Box<Expr>),
@@ -484,15 +610,25 @@ pub enum Expr {
     /// A named expression (walrus) `name := value` — assigns `value` to `name`
     /// and evaluates to it. Parsed and type-checked (as `value`'s type), but the
     /// evaluator reports it as unsupported ("parse now, run later").
-    Named { name: String, value: Box<Expr> },
+    Named {
+        name: String,
+        value: Box<Expr>,
+    },
     /// A conditional expression (ternary) `then_branch if cond else else_branch`.
     /// Parsed; semantics deferred (the checker flags it unsupported).
-    IfExpr { cond: Box<Expr>, then_branch: Box<Expr>, else_branch: Box<Expr> },
+    IfExpr {
+        cond: Box<Expr>,
+        then_branch: Box<Expr>,
+        else_branch: Box<Expr>,
+    },
     /// A chained comparison `a < b < c …` (Python semantics: `a < b and b < c`,
     /// each operand evaluated once). `rest` is the `(op, operand)` sequence after
     /// `first`. A single comparison stays an `Infix`; this node is only built for a
     /// chain of length ≥ 2. Parsed; semantics deferred.
-    Compare { first: Box<Expr>, rest: Vec<(InfixOp, Expr)> },
+    Compare {
+        first: Box<Expr>,
+        rest: Vec<(InfixOp, Expr)>,
+    },
     /// A slice subscript `object[lower:upper:step]`, each bound optional
     /// (`a[1:2]`, `a[:j]`, `a[::2]`). Parsed; semantics deferred.
     Slice {
@@ -504,7 +640,10 @@ pub enum Expr {
     /// A t-string `t"…{expr}…"` (or raw `rt"…"`, `raw = true`): alternating
     /// literal text and interpolated expressions. Each `{…}` is a fully parsed
     /// sub-expression. Parsed; semantics deferred (checker flags it).
-    TString { parts: Vec<TStringPart>, raw: bool },
+    TString {
+        parts: Vec<TStringPart>,
+        raw: bool,
+    },
 }
 
 /// One piece of a t-string: literal text or an interpolated expression.

@@ -1,34 +1,37 @@
-use mojo_lite::{Evaluator, Lexer, Parser, RuntimeError, Value};
+use mojo_lite::{BackendKind, RuntimeError, Value, parse};
 
-/// Run a program, requiring it to succeed, and return the evaluator so its
-/// global bindings can be inspected.
-fn run(source: &str) -> Evaluator {
-    let program = Parser::new(Lexer::new(source))
-        .parse_program()
-        .expect("parse error");
-    let mut evaluator = Evaluator::new();
-    evaluator.eval_program(&program).expect("runtime error");
-    evaluator
+/// Run a program on the VM backend (the sole executor), returning its global
+/// (top-level) bindings for value inspection. No type-checking — these tests
+/// exercise evaluation semantics directly (static errors are `checker_test`'s job).
+fn run(source: &str) -> Vec<(String, Value)> {
+    let program = parse(source).expect("parse error");
+    let mut backend = BackendKind::Vm.make();
+    backend.run(&program).expect("runtime error");
+    backend.bindings()
 }
 
 /// Run a program that is expected to fail at runtime, returning the error.
 fn run_err(source: &str) -> RuntimeError {
-    let program = Parser::new(Lexer::new(source))
-        .parse_program()
-        .expect("parse error");
-    let mut evaluator = Evaluator::new();
-    evaluator
-        .eval_program(&program)
-        .expect_err("expected a runtime error")
+    let program = parse(source).expect("parse error");
+    let mut backend = BackendKind::Vm.make();
+    backend.run(&program).expect_err("expected a runtime error")
 }
 
-fn binding(evaluator: &Evaluator, name: &str) -> Value {
-    evaluator
-        .global_bindings()
-        .into_iter()
+/// Run a program and return its captured `print` output.
+fn output(source: &str) -> String {
+    let program = parse(source).expect("parse error");
+    let mut backend = BackendKind::Vm.make();
+    backend.run(&program).expect("runtime error");
+    backend.output()
+}
+
+fn binding(bindings: &[(String, Value)], name: &str) -> Value {
+    bindings
+        .iter()
         .find(|(n, _)| n == name)
         .unwrap_or_else(|| panic!("no binding named '{}'", name))
         .1
+        .clone()
 }
 
 #[test]
@@ -72,28 +75,24 @@ fn functions_and_nested_calls() {
 
 #[test]
 fn inner_scope_shadows_outer() {
-    let e = run("var x: Int = 1\ndef f() -> Int:\n    var x: Int = 99\n    return x\n\nvar outer: Int = x\nvar inner: Int = f()\n");
+    let e = run(
+        "var x: Int = 1\ndef f() -> Int:\n    var x: Int = 99\n    return x\n\nvar outer: Int = x\nvar inner: Int = f()\n",
+    );
     assert_eq!(binding(&e, "outer"), Value::Int(1));
     assert_eq!(binding(&e, "inner"), Value::Int(99));
 }
 
 #[test]
 fn closure_captures_enclosing_local_downward() {
-    let e = run("def adder(n: Int) -> Int:\n    def add_n(x: Int) -> Int:\n        return x + n\n    return add_n(100)\n\nvar c: Int = adder(42)\n");
+    let e = run(
+        "def adder(n: Int) -> Int:\n    def add_n(x: Int) -> Int:\n        return x + n\n    return add_n(100)\n\nvar c: Int = adder(42)\n",
+    );
     assert_eq!(binding(&e, "c"), Value::Int(142));
 }
 
-#[test]
-fn returning_a_closure_is_rejected() {
-    let err = run_err("def make() -> Int:\n    def helper() -> Int:\n        return 1\n    return helper\n\nvar bad: Int = make()\n");
-    assert_eq!(err, RuntimeError::ClosureEscape);
-}
-
-#[test]
-fn undefined_variable_is_an_error() {
-    let err = run_err("var a: Int = missing\n");
-    assert_eq!(err, RuntimeError::UndefinedVariable("missing".into()));
-}
+// Note: closure-escape (`return helper` / `f = g`), undefined-variable, and
+// argument type-mismatch are now caught statically by the checker (see
+// `checker_test`), not at VM runtime, so those cases moved there.
 
 #[test]
 fn arity_mismatch_is_an_error() {
@@ -101,11 +100,18 @@ fn arity_mismatch_is_an_error() {
     let err = run_err("def f(x: Int) -> Int:\n    return x\n\nvar a: Int = f(1, 2)\n");
     assert_eq!(
         err,
-        RuntimeError::ArityMismatch { name: "f".into(), expected: 1, got: 2 }
+        RuntimeError::ArityMismatch {
+            name: "f".into(),
+            expected: 1,
+            got: 2
+        }
     );
     // A missing required argument names the parameter.
     let err = run_err("def f(x: Int) -> Int:\n    return x\n\nvar a: Int = f()\n");
-    assert_eq!(err, RuntimeError::TypeError("'f' missing required argument 'x'".into()));
+    assert_eq!(
+        err,
+        RuntimeError::TypeError("'f' missing required argument 'x'".into())
+    );
 }
 
 #[test]
@@ -120,14 +126,18 @@ const POINT: &str = "@fieldwise_init\nstruct Point:\n    var x: Int\n    var y: 
 
 #[test]
 fn constructs_and_reads_fields() {
-    let e = run(&format!("{POINT}var p: Point = Point(3, 4)\nvar a: Int = p.x\nvar b: Int = p.y\n"));
+    let e = run(&format!(
+        "{POINT}var p: Point = Point(3, 4)\nvar a: Int = p.x\nvar b: Int = p.y\n"
+    ));
     assert_eq!(binding(&e, "a"), Value::Int(3));
     assert_eq!(binding(&e, "b"), Value::Int(4));
 }
 
 #[test]
 fn method_reads_self_and_calls_sibling_method() {
-    let e = run(&format!("{POINT}var p: Point = Point(3, 4)\nvar s: Int = p.sum()\nvar sc: Int = p.scaled(10)\n"));
+    let e = run(&format!(
+        "{POINT}var p: Point = Point(3, 4)\nvar s: Int = p.sum()\nvar sc: Int = p.scaled(10)\n"
+    ));
     assert_eq!(binding(&e, "s"), Value::Int(7));
     assert_eq!(binding(&e, "sc"), Value::Int(70)); // (3+4) * 10
 }
@@ -144,7 +154,9 @@ fn nested_struct_fields_and_chained_access() {
 #[test]
 fn struct_passed_to_a_function_is_copied() {
     // The function receives the struct by value and reads a field.
-    let e = run(&format!("{POINT}def first(q: Point) -> Int:\n    return q.x\n\nvar p: Point = Point(8, 9)\nvar r: Int = first(p)\n"));
+    let e = run(&format!(
+        "{POINT}def first(q: Point) -> Int:\n    return q.x\n\nvar p: Point = Point(8, 9)\nvar r: Int = first(p)\n"
+    ));
     assert_eq!(binding(&e, "r"), Value::Int(8));
 }
 
@@ -152,7 +164,9 @@ fn struct_passed_to_a_function_is_copied() {
 
 #[test]
 fn floor_division_and_modulo_floor_toward_negative_infinity() {
-    let e = run("var a: Int = -7 // 2\nvar b: Int = -7 % 2\nvar c: Int = 7 // -2\nvar d: Int = 7 % -2\n");
+    let e = run(
+        "var a: Int = -7 // 2\nvar b: Int = -7 % 2\nvar c: Int = 7 // -2\nvar d: Int = 7 % -2\n",
+    );
     assert_eq!(binding(&e, "a"), Value::Int(-4)); // floor(-3.5)
     assert_eq!(binding(&e, "b"), Value::Int(1)); // remainder takes the divisor's sign
     assert_eq!(binding(&e, "c"), Value::Int(-4));
@@ -169,14 +183,22 @@ fn power_and_true_division() {
 
 #[test]
 fn integer_division_by_zero_is_a_runtime_error() {
-    assert!(matches!(run_err("var x: Int = 1 // 0\n"), RuntimeError::TypeError(_)));
-    assert!(matches!(run_err("var x: Int = 1 % 0\n"), RuntimeError::TypeError(_)));
+    assert!(matches!(
+        run_err("var x: Int = 1 // 0\n"),
+        RuntimeError::TypeError(_)
+    ));
+    assert!(matches!(
+        run_err("var x: Int = 1 % 0\n"),
+        RuntimeError::TypeError(_)
+    ));
 }
 
 #[test]
 fn literals_coerce_at_runtime() {
     // 0 materializes to UInt; `u + 1` keeps u a UInt; 3 becomes Float64; 1/2 is 0.5.
-    let e = run("var u: UInt = 0\nu = u + 1\nu = u + 1\nvar f: Float64 = 3\nvar half: Float64 = 1 / 2\n");
+    let e = run(
+        "var u: UInt = 0\nu = u + 1\nu = u + 1\nvar f: Float64 = 3\nvar half: Float64 = 1 / 2\n",
+    );
     assert_eq!(binding(&e, "u"), Value::UInt(2));
     assert_eq!(binding(&e, "f"), Value::Float64(3.0));
     assert_eq!(binding(&e, "half"), Value::Float64(0.5));
@@ -190,7 +212,8 @@ fn uint_accumulates_with_literals_in_a_loop() {
 
 #[test]
 fn float_arithmetic_and_division() {
-    let e = run("var a: Float64 = 1.5 + 2.0 * 3.0\nvar b: Float64 = 10.0 / 4.0\nvar c: Float64 = -b\n");
+    let e =
+        run("var a: Float64 = 1.5 + 2.0 * 3.0\nvar b: Float64 = 10.0 / 4.0\nvar c: Float64 = -b\n");
     assert_eq!(binding(&e, "a"), Value::Float64(7.5));
     assert_eq!(binding(&e, "b"), Value::Float64(2.5));
     assert_eq!(binding(&e, "c"), Value::Float64(-2.5));
@@ -216,9 +239,7 @@ fn numeric_conversions_follow_mojo() {
 
 #[test]
 fn float_accumulation_in_a_loop() {
-    let e = run(
-        "var total: Float64 = 0.0\nfor i in range(4):\n    total = total + 1.5\n",
-    );
+    let e = run("var total: Float64 = 0.0\nfor i in range(4):\n    total = total + 1.5\n");
     assert_eq!(binding(&e, "total"), Value::Float64(6.0));
 }
 
@@ -258,16 +279,12 @@ fn assignment_in_a_branch_updates_the_enclosing_variable() {
 }
 
 #[test]
-fn var_less_introduction_is_unsupported_at_runtime() {
-    // `x = 1` on an undeclared name (implicit declaration) is parsed and checked
-    // but flagged as an unsupported feature by the evaluator.
-    assert!(matches!(run_err("x = 1\n"), RuntimeError::Unsupported(_)));
-}
-
-#[test]
-fn assigning_a_closure_is_rejected() {
-    let err = run_err("def f() -> Int:\n    return 1\n\ndef g() -> Int:\n    return 2\n\nf = g\n");
-    assert_eq!(err, RuntimeError::ClosureEscape);
+fn var_less_introduction_binds_the_variable() {
+    // `x = 1` on an undeclared name (implicit declaration) works on the VM: it
+    // lowers to the same binding as `var x = 1` (the tree-walker deferred this as
+    // "parse now, run later"; the compiler backend simply runs it).
+    let e = run("x = 1\nx = x + 4\n");
+    assert_eq!(binding(&e, "x"), Value::Int(5));
 }
 
 // --- Control flow ---
@@ -336,23 +353,25 @@ fn break_only_exits_the_innermost_loop() {
 #[test]
 fn while_loop_runs_until_break() {
     // Without `break` this would loop forever; reaching 42 proves it terminated.
-    let e = run("def f() -> Int:\n    while True:\n        break\n    return 42\n\nvar r: Int = f()\n");
+    let e =
+        run("def f() -> Int:\n    while True:\n        break\n    return 42\n\nvar r: Int = f()\n");
     assert_eq!(binding(&e, "r"), Value::Int(42));
 }
 
 #[test]
 fn empty_range_runs_the_body_zero_times() {
-    let e = run("def f() -> Int:\n    for i in range(0):\n        return 1\n    return 0\n\nvar r: Int = f()\n");
+    let e = run(
+        "def f() -> Int:\n    for i in range(0):\n        return 1\n    return 0\n\nvar r: Int = f()\n",
+    );
     assert_eq!(binding(&e, "r"), Value::Int(0));
 }
 
 #[test]
-fn loop_variable_does_not_leak_into_enclosing_scope() {
-    let e = run("for i in range(3):\n    pass\n");
-    assert!(
-        e.global_bindings().iter().all(|(n, _)| n != "i"),
-        "loop variable 'i' leaked into the global scope"
-    );
+fn loop_runs_the_body_each_iteration() {
+    // A `for` accumulates across iterations (loop-var scoping is enforced by the
+    // checker; the VM's flat frame is an internal detail, not observed here).
+    let e = run("var total: Int = 0\nfor i in range(4):\n    total = total + i\n");
+    assert_eq!(binding(&e, "total"), Value::Int(6));
 }
 
 #[test]
@@ -367,7 +386,9 @@ const PAIR: &str = "@fieldwise_init\nstruct Pair[T: Copyable & Movable]:\n    va
 
 #[test]
 fn generic_struct_constructs_and_reads_members() {
-    let e = run(&format!("{PAIR}var p: Pair[Int] = Pair(3, 4)\nvar a: Int = p.left\nvar b: Int = p.right\n"));
+    let e = run(&format!(
+        "{PAIR}var p: Pair[Int] = Pair(3, 4)\nvar a: Int = p.left\nvar b: Int = p.right\n"
+    ));
     assert_eq!(binding(&e, "a"), Value::Int(3));
     assert_eq!(binding(&e, "b"), Value::Int(4));
 }
@@ -375,13 +396,17 @@ fn generic_struct_constructs_and_reads_members() {
 #[test]
 fn generic_struct_preserves_element_runtime_type() {
     // A `Pair[Float64]` keeps Float64 fields (the float literals materialize).
-    let e = run(&format!("{PAIR}var p: Pair[Float64] = Pair(1.5, 2.5)\nvar a: Float64 = p.left\n"));
+    let e = run(&format!(
+        "{PAIR}var p: Pair[Float64] = Pair(1.5, 2.5)\nvar a: Float64 = p.left\n"
+    ));
     assert_eq!(binding(&e, "a"), Value::Float64(1.5));
 }
 
 #[test]
 fn generic_function_identity_runs_type_erased() {
-    let e = run("def id[T: Copyable & Movable](x: T) -> T:\n    return x\n\nvar n: Int = id(5)\nvar s: String = id(\"hi\")\n");
+    let e = run(
+        "def id[T: Copyable & Movable](x: T) -> T:\n    return x\n\nvar n: Int = id(5)\nvar s: String = id(\"hi\")\n",
+    );
     assert_eq!(binding(&e, "n"), Value::Int(5));
     assert_eq!(binding(&e, "s"), Value::Str("hi".into()));
 }
@@ -396,7 +421,9 @@ fn generic_function_over_generic_struct() {
 
 #[test]
 fn generic_struct_method_dispatches() {
-    let e = run("@fieldwise_init\nstruct Box[T: Copyable & Movable]:\n    var val: Self.T\n\n    def get(self) -> Self.T:\n        return self.val\n\nvar b: Box[Int] = Box(7)\nvar g: Int = b.get()\n");
+    let e = run(
+        "@fieldwise_init\nstruct Box[T: Copyable & Movable]:\n    var val: Self.T\n\n    def get(self) -> Self.T:\n        return self.val\n\nvar b: Box[Int] = Box(7)\nvar g: Int = b.get()\n",
+    );
     assert_eq!(binding(&e, "g"), Value::Int(7));
 }
 
@@ -406,7 +433,9 @@ const QUACK: &str = "trait Quackable:\n    def quack(self) -> String:\n        .
 
 #[test]
 fn bounded_generic_dispatches_to_conforming_struct_method() {
-    let e = run(&format!("{QUACK}var s: String = make_it_quack(Duck(\"Donald\"))\n"));
+    let e = run(&format!(
+        "{QUACK}var s: String = make_it_quack(Duck(\"Donald\"))\n"
+    ));
     assert_eq!(binding(&e, "s"), Value::Str("Quack".into()));
 }
 
@@ -415,14 +444,16 @@ fn trait_declaration_produces_no_binding() {
     // A trait is a pure compile-time construct — nothing at runtime.
     let e = run("trait Q:\n    def m(self) -> Int:\n        ...\n");
     assert!(
-        e.global_bindings().iter().all(|(n, _)| n != "Q"),
+        e.iter().all(|(n, _)| n != "Q"),
         "trait leaked a runtime binding"
     );
 }
 
 #[test]
 fn self_typed_trait_method_runs() {
-    let e = run("trait Eq2:\n    def same(self, other: Self) -> Bool:\n        ...\n\n@fieldwise_init\nstruct P(Eq2):\n    var x: Int\n\n    def same(self, other: Self) -> Bool:\n        return self.x == other.x\n\nvar r: Bool = P(1).same(P(1))\nvar q: Bool = P(1).same(P(2))\n");
+    let e = run(
+        "trait Eq2:\n    def same(self, other: Self) -> Bool:\n        ...\n\n@fieldwise_init\nstruct P(Eq2):\n    var x: Int\n\n    def same(self, other: Self) -> Bool:\n        return self.x == other.x\n\nvar r: Bool = P(1).same(P(1))\nvar q: Bool = P(1).same(P(2))\n",
+    );
     assert_eq!(binding(&e, "r"), Value::Bool(true));
     assert_eq!(binding(&e, "q"), Value::Bool(false));
 }
@@ -433,13 +464,17 @@ const FIXEDBUF: &str = "@fieldwise_init\nstruct FixedBuffer[size: Int]:\n    var
 
 #[test]
 fn value_parameter_is_reified_and_read_via_self() {
-    let e = run(&format!("{FIXEDBUF}var b: FixedBuffer[8] = FixedBuffer[8](3)\nvar c: Int = b.capacity()\n"));
+    let e = run(&format!(
+        "{FIXEDBUF}var b: FixedBuffer[8] = FixedBuffer[8](3)\nvar c: Int = b.capacity()\n"
+    ));
     assert_eq!(binding(&e, "c"), Value::Int(8));
 }
 
 #[test]
 fn comptime_arithmetic_argument_evaluates() {
-    let e = run(&format!("{FIXEDBUF}var b: FixedBuffer[2 + 3] = FixedBuffer[2 + 3](0)\nvar c: Int = b.capacity()\n"));
+    let e = run(&format!(
+        "{FIXEDBUF}var b: FixedBuffer[2 + 3] = FixedBuffer[2 + 3](0)\nvar c: Int = b.capacity()\n"
+    ));
     assert_eq!(binding(&e, "c"), Value::Int(5));
 }
 
@@ -459,52 +494,68 @@ fn comptime_constant_is_a_runtime_int() {
 
 #[test]
 fn simd_construction_add_and_index() {
-    let e = run("var v: SIMD[DType.int32, 4] = SIMD[DType.int32, 4](1, 2, 3, 4)\nvar w: SIMD[DType.int32, 4] = v + v\nvar lane: Int32 = w[2]\n");
+    let e = run(
+        "var v: SIMD[DType.int32, 4] = SIMD[DType.int32, 4](1, 2, 3, 4)\nvar w: SIMD[DType.int32, 4] = v + v\nvar lane: Int32 = w[2]\n",
+    );
     assert_eq!(binding(&e, "w").to_string(), "[2, 4, 6, 8]");
     assert_eq!(binding(&e, "lane").to_string(), "6");
 }
 
 #[test]
 fn simd_splat_and_multiply() {
-    let e = run("var v: SIMD[DType.int32, 4] = SIMD[DType.int32, 4](5)\nvar w: SIMD[DType.int32, 4] = v * v\nvar lane: Int32 = w[0]\n");
+    let e = run(
+        "var v: SIMD[DType.int32, 4] = SIMD[DType.int32, 4](5)\nvar w: SIMD[DType.int32, 4] = v * v\nvar lane: Int32 = w[0]\n",
+    );
     assert_eq!(binding(&e, "lane").to_string(), "25");
 }
 
 #[test]
 fn int8_arithmetic_wraps_bit_accurately() {
     // 100 + 100 = 200, which wraps to -56 in signed int8.
-    let e = run("var v: SIMD[DType.int8, 2] = SIMD[DType.int8, 2](100)\nvar w: SIMD[DType.int8, 2] = v + v\nvar lane: Int8 = w[0]\n");
+    let e = run(
+        "var v: SIMD[DType.int8, 2] = SIMD[DType.int8, 2](100)\nvar w: SIMD[DType.int8, 2] = v + v\nvar lane: Int8 = w[0]\n",
+    );
     assert_eq!(binding(&e, "lane").to_string(), "-56");
 }
 
 #[test]
 fn uint8_arithmetic_wraps_bit_accurately() {
     // 255 + 1 = 0 in uint8.
-    let e = run("var v: SIMD[DType.uint8, 2] = SIMD[DType.uint8, 2](255)\nvar w: SIMD[DType.uint8, 2] = v + SIMD[DType.uint8, 2](1)\nvar lane: UInt8 = w[0]\n");
+    let e = run(
+        "var v: SIMD[DType.uint8, 2] = SIMD[DType.uint8, 2](255)\nvar w: SIMD[DType.uint8, 2] = v + SIMD[DType.uint8, 2](1)\nvar lane: UInt8 = w[0]\n",
+    );
     assert_eq!(binding(&e, "lane").to_string(), "0");
 }
 
 #[test]
 fn simd_comparison_yields_bool_mask() {
-    let e = run("var v: SIMD[DType.int32, 4] = SIMD[DType.int32, 4](1, 2, 3, 4)\nvar w: SIMD[DType.int32, 4] = SIMD[DType.int32, 4](4, 3, 2, 1)\nvar m: SIMD[DType.bool, 4] = v < w\n");
+    let e = run(
+        "var v: SIMD[DType.int32, 4] = SIMD[DType.int32, 4](1, 2, 3, 4)\nvar w: SIMD[DType.int32, 4] = SIMD[DType.int32, 4](4, 3, 2, 1)\nvar m: SIMD[DType.bool, 4] = v < w\n",
+    );
     assert_eq!(binding(&e, "m").to_string(), "[true, true, false, false]");
 }
 
 #[test]
 fn float32_division() {
-    let e = run("var v: SIMD[DType.float32, 2] = SIMD[DType.float32, 2](3.0, 1.0)\nvar w: SIMD[DType.float32, 2] = v / SIMD[DType.float32, 2](2.0)\n");
+    let e = run(
+        "var v: SIMD[DType.float32, 2] = SIMD[DType.float32, 2](3.0, 1.0)\nvar w: SIMD[DType.float32, 2] = v / SIMD[DType.float32, 2](2.0)\n",
+    );
     assert_eq!(binding(&e, "w").to_string(), "[1.5, 0.5]");
 }
 
 #[test]
 fn literal_splats_into_simd_operator() {
-    let e = run("var v: SIMD[DType.int32, 4] = SIMD[DType.int32, 4](1, 2, 3, 4)\nvar w: SIMD[DType.int32, 4] = v + 100\n");
+    let e = run(
+        "var v: SIMD[DType.int32, 4] = SIMD[DType.int32, 4](1, 2, 3, 4)\nvar w: SIMD[DType.int32, 4] = v + 100\n",
+    );
     assert_eq!(binding(&e, "w").to_string(), "[101, 102, 103, 104]");
 }
 
 #[test]
 fn simd_lane_index_out_of_range_is_runtime_error() {
-    let err = run_err("var v: SIMD[DType.int32, 2] = SIMD[DType.int32, 2](1, 2)\nvar bad: Int32 = v[5]\n");
+    let err = run_err(
+        "var v: SIMD[DType.int32, 2] = SIMD[DType.int32, 2](1, 2)\nvar bad: Int32 = v[5]\n",
+    );
     assert!(matches!(err, RuntimeError::TypeError(_)), "got {:?}", err);
 }
 
@@ -512,27 +563,37 @@ fn simd_lane_index_out_of_range_is_runtime_error() {
 
 #[test]
 fn try_catches_a_raised_error() {
-    let e = run("var out: String = \"none\"\ntry:\n    raise Error(\"boom\")\nexcept e:\n    out = \"caught\"\n");
+    let e = run(
+        "var out: String = \"none\"\ntry:\n    raise Error(\"boom\")\nexcept e:\n    out = \"caught\"\n",
+    );
     assert_eq!(binding(&e, "out"), Value::Str("caught".into()));
 }
 
 #[test]
 fn else_runs_only_without_error_and_finally_always() {
-    let ok = run("var log: String = \"\"\ntry:\n    log = log + \"T\"\nexcept e:\n    log = log + \"C\"\nelse:\n    log = log + \"E\"\nfinally:\n    log = log + \"F\"\n");
+    let ok = run(
+        "var log: String = \"\"\ntry:\n    log = log + \"T\"\nexcept e:\n    log = log + \"C\"\nelse:\n    log = log + \"E\"\nfinally:\n    log = log + \"F\"\n",
+    );
     assert_eq!(binding(&ok, "log"), Value::Str("TEF".into())); // try, else, finally
-    let caught = run("var log: String = \"\"\ntry:\n    raise \"x\"\nexcept e:\n    log = log + \"C\"\nelse:\n    log = log + \"E\"\nfinally:\n    log = log + \"F\"\n");
+    let caught = run(
+        "var log: String = \"\"\ntry:\n    raise \"x\"\nexcept e:\n    log = log + \"C\"\nelse:\n    log = log + \"E\"\nfinally:\n    log = log + \"F\"\n",
+    );
     assert_eq!(binding(&caught, "log"), Value::Str("CF".into())); // except, finally (no else)
 }
 
 #[test]
 fn raise_propagates_across_a_function_call() {
-    let e = run("def boom() raises -> Int:\n    raise \"deep\"\n    return 0\n\nvar out: String = \"none\"\ntry:\n    var y: Int = boom()\nexcept e:\n    out = \"propagated\"\n");
+    let e = run(
+        "def boom() raises -> Int:\n    raise \"deep\"\n    return 0\n\nvar out: String = \"none\"\ntry:\n    var y: Int = boom()\nexcept e:\n    out = \"propagated\"\n",
+    );
     assert_eq!(binding(&e, "out"), Value::Str("propagated".into()));
 }
 
 #[test]
 fn reraise_with_transfer_sigil() {
-    let e = run("var out: String = \"none\"\ntry:\n    try:\n        raise \"inner\"\n    except e:\n        raise e^\nexcept e2:\n    out = \"reraised\"\n");
+    let e = run(
+        "var out: String = \"none\"\ntry:\n    try:\n        raise \"inner\"\n    except e:\n        raise e^\nexcept e2:\n    out = \"reraised\"\n",
+    );
     assert_eq!(binding(&e, "out"), Value::Str("reraised".into()));
 }
 
@@ -544,7 +605,8 @@ fn uncaught_raise_is_a_runtime_error() {
 
 #[test]
 fn uncaught_raise_propagates_across_a_call() {
-    let err = run_err("def f() raises -> Int:\n    raise \"from f\"\n    return 0\n\nvar z: Int = f()\n");
+    let err =
+        run_err("def f() raises -> Int:\n    raise \"from f\"\n    return 0\n\nvar z: Int = f()\n");
     assert_eq!(err, RuntimeError::Raised("from f".into()));
 }
 
@@ -552,32 +614,34 @@ fn uncaught_raise_propagates_across_a_call() {
 
 #[test]
 fn print_writes_to_the_output_buffer() {
-    let e = run("print(\"Hello, mojo-lite!\")\n");
-    assert_eq!(e.output(), "Hello, mojo-lite!\n");
+    let e = output("print(\"Hello, mojo-lite!\")\n");
+    assert_eq!(e, "Hello, mojo-lite!\n");
 }
 
 #[test]
 fn print_joins_multiple_args_with_spaces() {
-    let e = run("var a: Int = 2\nprint(a, \"+\", 3, \"=\", a + 3)\n");
-    assert_eq!(e.output(), "2 + 3 = 5\n");
+    let e = output("var a: Int = 2\nprint(a, \"+\", 3, \"=\", a + 3)\n");
+    assert_eq!(e, "2 + 3 = 5\n");
 }
 
 #[test]
 fn print_accumulates_across_calls_and_loops() {
-    let e = run("for i in range(3):\n    print(\"i =\", i)\n");
-    assert_eq!(e.output(), "i = 0\ni = 1\ni = 2\n");
+    let e = output("for i in range(3):\n    print(\"i =\", i)\n");
+    assert_eq!(e, "i = 0\ni = 1\ni = 2\n");
 }
 
 #[test]
 fn empty_print_writes_a_blank_line() {
-    let e = run("print()\nprint(\"x\")\n");
-    assert_eq!(e.output(), "\nx\n");
+    let e = output("print()\nprint(\"x\")\n");
+    assert_eq!(e, "\nx\n");
 }
 
 #[test]
 fn print_displays_structs_and_simd() {
-    let e = run("@fieldwise_init\nstruct P:\n    var x: Int\n    var y: Int\n\nprint(P(1, 2))\nprint(SIMD[DType.int32, 4](1, 2, 3, 4))\n");
-    assert_eq!(e.output(), "P(x=1, y=2)\n[1, 2, 3, 4]\n");
+    let e = output(
+        "@fieldwise_init\nstruct P:\n    var x: Int\n    var y: Int\n\nprint(P(1, 2))\nprint(SIMD[DType.int32, 4](1, 2, 3, 4))\n",
+    );
+    assert_eq!(e, "P(x=1, y=2)\n[1, 2, 3, 4]\n");
 }
 
 // --- Builtins: String / abs / min / max / round / len ---
@@ -607,7 +671,9 @@ fn min_max_promote_and_compare() {
 
 #[test]
 fn round_rounds_to_nearest() {
-    let e = run("var a: Float64 = round(3.7)\nvar b: Float64 = round(2.4)\nvar c: Float64 = round(1 / 2)\n");
+    let e = run(
+        "var a: Float64 = round(3.7)\nvar b: Float64 = round(2.4)\nvar c: Float64 = round(1 / 2)\n",
+    );
     assert_eq!(binding(&e, "a"), Value::Float64(4.0));
     assert_eq!(binding(&e, "b"), Value::Float64(2.0));
     assert_eq!(binding(&e, "c"), Value::Float64(1.0)); // 0.5 rounds half away from zero
@@ -624,7 +690,9 @@ fn len_of_string() {
 
 #[test]
 fn list_len_and_index() {
-    let e = run("var xs: List[Int] = [10, 20, 30]\nvar n: Int = len(xs)\nvar a: Int = xs[0]\nvar b: Int = xs[2]\n");
+    let e = run(
+        "var xs: List[Int] = [10, 20, 30]\nvar n: Int = len(xs)\nvar a: Int = xs[0]\nvar b: Int = xs[2]\n",
+    );
     assert_eq!(binding(&e, "n"), Value::Int(3));
     assert_eq!(binding(&e, "a"), Value::Int(10));
     assert_eq!(binding(&e, "b"), Value::Int(30));
@@ -632,14 +700,23 @@ fn list_len_and_index() {
 
 #[test]
 fn list_iteration_accumulates() {
-    let e = run("var xs: List[Int] = [1, 2, 3, 4]\nvar sum: Int = 0\nfor x in xs:\n    sum = sum + x\n");
+    let e = run(
+        "var xs: List[Int] = [1, 2, 3, 4]\nvar sum: Int = 0\nfor x in xs:\n    sum = sum + x\n",
+    );
     assert_eq!(binding(&e, "sum"), Value::Int(10));
 }
 
 #[test]
 fn inferred_list_promotes_numeric_elements() {
     let e = run("var xs: List[Float64] = [1, 2.0, 3]\n");
-    assert_eq!(binding(&e, "xs"), Value::List(vec![Value::Float64(1.0), Value::Float64(2.0), Value::Float64(3.0)]));
+    assert_eq!(
+        binding(&e, "xs"),
+        Value::List(vec![
+            Value::Float64(1.0),
+            Value::Float64(2.0),
+            Value::Float64(3.0)
+        ])
+    );
 }
 
 #[test]
@@ -659,30 +736,58 @@ fn list_index_out_of_range_is_a_runtime_error() {
 
 #[test]
 fn append_builds_a_list_in_a_loop() {
-    let e = run("var xs: List[Int] = List[Int]()\nfor i in range(5):\n    xs.append(i * i)\nvar total: Int = 0\nfor x in xs:\n    total = total + x\n");
-    assert_eq!(binding(&e, "xs"), Value::List(vec![Value::Int(0), Value::Int(1), Value::Int(4), Value::Int(9), Value::Int(16)]));
+    let e = run(
+        "var xs: List[Int] = List[Int]()\nfor i in range(5):\n    xs.append(i * i)\nvar total: Int = 0\nfor x in xs:\n    total = total + x\n",
+    );
+    assert_eq!(
+        binding(&e, "xs"),
+        Value::List(vec![
+            Value::Int(0),
+            Value::Int(1),
+            Value::Int(4),
+            Value::Int(9),
+            Value::Int(16)
+        ])
+    );
     assert_eq!(binding(&e, "total"), Value::Int(30));
 }
 
 #[test]
 fn index_assignment_mutates_in_place() {
     let e = run("var xs: List[Int] = [10, 20, 30]\nxs[1] = 99\n");
-    assert_eq!(binding(&e, "xs"), Value::List(vec![Value::Int(10), Value::Int(99), Value::Int(30)]));
+    assert_eq!(
+        binding(&e, "xs"),
+        Value::List(vec![Value::Int(10), Value::Int(99), Value::Int(30)])
+    );
 }
 
 #[test]
 fn pop_returns_and_shrinks() {
     let e = run("var xs: List[Int] = [1, 2, 3]\nvar last: Int = xs.pop()\n");
     assert_eq!(binding(&e, "last"), Value::Int(3));
-    assert_eq!(binding(&e, "xs"), Value::List(vec![Value::Int(1), Value::Int(2)]));
+    assert_eq!(
+        binding(&e, "xs"),
+        Value::List(vec![Value::Int(1), Value::Int(2)])
+    );
 }
 
 #[test]
 fn list_copy_is_independent_under_mutation() {
     // The crux of value semantics: mutating the copy must not touch the original.
     let e = run("var a: List[Int] = [1, 2, 3]\nvar b: List[Int] = a\nb.append(4)\n");
-    assert_eq!(binding(&e, "a"), Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]));
-    assert_eq!(binding(&e, "b"), Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)]));
+    assert_eq!(
+        binding(&e, "a"),
+        Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+    );
+    assert_eq!(
+        binding(&e, "b"),
+        Value::List(vec![
+            Value::Int(1),
+            Value::Int(2),
+            Value::Int(3),
+            Value::Int(4)
+        ])
+    );
 }
 
 #[test]
@@ -695,14 +800,21 @@ fn pop_from_empty_list_is_a_runtime_error() {
 
 #[test]
 fn insert_and_remove_and_pop_index() {
-    let e = run("var xs: List[Int] = [1, 2, 3]\nxs.insert(1, 99)\nvar mid: Int = xs.pop(2)\nxs.remove(99)\n");
+    let e = run(
+        "var xs: List[Int] = [1, 2, 3]\nxs.insert(1, 99)\nvar mid: Int = xs.pop(2)\nxs.remove(99)\n",
+    );
     assert_eq!(binding(&e, "mid"), Value::Int(2)); // [1,99,2,3], pop(2) -> 2
-    assert_eq!(binding(&e, "xs"), Value::List(vec![Value::Int(1), Value::Int(3)]));
+    assert_eq!(
+        binding(&e, "xs"),
+        Value::List(vec![Value::Int(1), Value::Int(3)])
+    );
 }
 
 #[test]
 fn reverse_clear_extend() {
-    let e = run("var a: List[Int] = [1, 2, 3]\na.reverse()\nvar b: List[Int] = [4, 5]\na.extend(b)\nvar n: Int = len(a)\nvar last: Int = a.pop()\na.clear()\nvar empty: Int = len(a)\n");
+    let e = run(
+        "var a: List[Int] = [1, 2, 3]\na.reverse()\nvar b: List[Int] = [4, 5]\na.extend(b)\nvar n: Int = len(a)\nvar last: Int = a.pop()\na.clear()\nvar empty: Int = len(a)\n",
+    );
     assert_eq!(binding(&e, "n"), Value::Int(5)); // [3,2,1,4,5]
     assert_eq!(binding(&e, "last"), Value::Int(5));
     assert_eq!(binding(&e, "empty"), Value::Int(0));
@@ -710,7 +822,9 @@ fn reverse_clear_extend() {
 
 #[test]
 fn count_and_index() {
-    let e = run("var xs: List[Int] = [5, 7, 5, 9, 5]\nvar c: Int = xs.count(5)\nvar i: Int = xs.index(9)\n");
+    let e = run(
+        "var xs: List[Int] = [5, 7, 5, 9, 5]\nvar c: Int = xs.count(5)\nvar i: Int = xs.index(9)\n",
+    );
     assert_eq!(binding(&e, "c"), Value::Int(3));
     assert_eq!(binding(&e, "i"), Value::Int(3));
 }
@@ -719,7 +833,10 @@ fn count_and_index() {
 fn remove_coerces_the_search_value() {
     // remove(2) on a Float64 list matches 2.0.
     let e = run("var xs: List[Float64] = [1.0, 2.0, 3.0]\nxs.remove(2)\n");
-    assert_eq!(binding(&e, "xs"), Value::List(vec![Value::Float64(1.0), Value::Float64(3.0)]));
+    assert_eq!(
+        binding(&e, "xs"),
+        Value::List(vec![Value::Float64(1.0), Value::Float64(3.0)])
+    );
 }
 
 #[test]
@@ -732,7 +849,9 @@ fn remove_absent_value_is_a_runtime_error() {
 
 #[test]
 fn list_membership_and_not_in() {
-    let e = run("var xs: List[Int] = [1, 2, 3]\nvar a: Bool = 2 in xs\nvar b: Bool = 5 in xs\nvar c: Bool = 5 not in xs\n");
+    let e = run(
+        "var xs: List[Int] = [1, 2, 3]\nvar a: Bool = 2 in xs\nvar b: Bool = 5 in xs\nvar c: Bool = 5 not in xs\n",
+    );
     assert_eq!(binding(&e, "a"), Value::Bool(true));
     assert_eq!(binding(&e, "b"), Value::Bool(false));
     assert_eq!(binding(&e, "c"), Value::Bool(true));
@@ -740,7 +859,9 @@ fn list_membership_and_not_in() {
 
 #[test]
 fn string_substring_membership() {
-    let e = run("var s: String = \"hello\"\nvar a: Bool = \"ell\" in s\nvar b: Bool = \"z\" not in s\n");
+    let e = run(
+        "var s: String = \"hello\"\nvar a: Bool = \"ell\" in s\nvar b: Bool = \"z\" not in s\n",
+    );
     assert_eq!(binding(&e, "a"), Value::Bool(true));
     assert_eq!(binding(&e, "b"), Value::Bool(true));
 }
@@ -753,8 +874,19 @@ fn membership_coerces_numeric_search_value() {
 
 #[test]
 fn not_in_drives_a_dedup_loop() {
-    let e = run("var xs: List[Int] = [3, 1, 4, 1, 5, 9, 4]\nvar seen: List[Int] = List[Int]()\nfor x in xs:\n    if x not in seen:\n        seen.append(x)\n");
-    assert_eq!(binding(&e, "seen"), Value::List(vec![Value::Int(3), Value::Int(1), Value::Int(4), Value::Int(5), Value::Int(9)]));
+    let e = run(
+        "var xs: List[Int] = [3, 1, 4, 1, 5, 9, 4]\nvar seen: List[Int] = List[Int]()\nfor x in xs:\n    if x not in seen:\n        seen.append(x)\n",
+    );
+    assert_eq!(
+        binding(&e, "seen"),
+        Value::List(vec![
+            Value::Int(3),
+            Value::Int(1),
+            Value::Int(4),
+            Value::Int(5),
+            Value::Int(9)
+        ])
+    );
 }
 
 // --- Member-write: place assignment + mut self ---
@@ -763,29 +895,47 @@ const EPT: &str = "@fieldwise_init\nstruct Point:\n    var x: Int\n    var y: In
 
 #[test]
 fn field_write_mutates_in_place() {
-    let e = run(&format!("{EPT}var p: Point = Point(1, 2)\np.x = 10\np.y = p.x + 5\n"));
-    assert_eq!(binding(&e, "p"), Value::Struct {
-        name: "Point".into(),
-        fields: vec![("x".into(), Value::Int(10)), ("y".into(), Value::Int(15))],
-        value_params: vec![],
-    });
+    let e = run(&format!(
+        "{EPT}var p: Point = Point(1, 2)\np.x = 10\np.y = p.x + 5\n"
+    ));
+    assert_eq!(
+        binding(&e, "p"),
+        Value::Struct {
+            name: "Point".into(),
+            fields: vec![("x".into(), Value::Int(10)), ("y".into(), Value::Int(15))],
+            value_params: vec![],
+        }
+    );
 }
 
 #[test]
 fn field_write_is_independent_across_copies() {
     // Value semantics: mutating a copy leaves the original unchanged.
-    let e = run(&format!("{EPT}var p: Point = Point(1, 2)\nvar q: Point = p\nq.x = 100\n"));
-    let px = match binding(&e, "p") { Value::Struct { fields, .. } => fields[0].1.clone(), _ => panic!() };
-    let qx = match binding(&e, "q") { Value::Struct { fields, .. } => fields[0].1.clone(), _ => panic!() };
+    let e = run(&format!(
+        "{EPT}var p: Point = Point(1, 2)\nvar q: Point = p\nq.x = 100\n"
+    ));
+    let px = match binding(&e, "p") {
+        Value::Struct { fields, .. } => fields[0].1.clone(),
+        _ => panic!(),
+    };
+    let qx = match binding(&e, "q") {
+        Value::Struct { fields, .. } => fields[0].1.clone(),
+        _ => panic!(),
+    };
     assert_eq!(px, Value::Int(1));
     assert_eq!(qx, Value::Int(100));
 }
 
 #[test]
 fn write_to_a_field_of_a_list_element() {
-    let e = run(&format!("{EPT}var ps: List[Point] = [Point(1, 1), Point(2, 2)]\nps[1].x = 99\n"));
+    let e = run(&format!(
+        "{EPT}var ps: List[Point] = [Point(1, 1), Point(2, 2)]\nps[1].x = 99\n"
+    ));
     let x = match binding(&e, "ps") {
-        Value::List(items) => match &items[1] { Value::Struct { fields, .. } => fields[0].1.clone(), _ => panic!() },
+        Value::List(items) => match &items[1] {
+            Value::Struct { fields, .. } => fields[0].1.clone(),
+            _ => panic!(),
+        },
         _ => panic!(),
     };
     assert_eq!(x, Value::Int(99));
@@ -793,19 +943,36 @@ fn write_to_a_field_of_a_list_element() {
 
 #[test]
 fn mut_self_method_persists_mutation() {
-    let e = run("@fieldwise_init\nstruct Counter:\n    var n: Int\n\n    def inc(mut self):\n        self.n = self.n + 1\n\n    def add(mut self, k: Int):\n        self.n = self.n + k\n\nvar c: Counter = Counter(0)\nc.inc()\nc.inc()\nc.add(10)\nvar total: Int = c.n\n");
+    let e = run(
+        "@fieldwise_init\nstruct Counter:\n    var n: Int\n\n    def inc(mut self):\n        self.n = self.n + 1\n\n    def add(mut self, k: Int):\n        self.n = self.n + k\n\nvar c: Counter = Counter(0)\nc.inc()\nc.inc()\nc.add(10)\nvar total: Int = c.n\n",
+    );
     assert_eq!(binding(&e, "total"), Value::Int(12));
 }
 
 #[test]
+fn method_mut_param_writes_back_to_caller() {
+    // A method's ordinary `mut` parameter mutates the caller's argument in place
+    // (reference semantics), like a free-function `mut` parameter.
+    let e = run(
+        "@fieldwise_init\nstruct C:\n    var n: Int\n\n    def add_into(self, mut dest: C):\n        dest.n = dest.n + self.n\n\nvar a: C = C(3)\nvar b: C = C(10)\na.add_into(b)\na.add_into(b)\nvar total: Int = b.n\n",
+    );
+    assert_eq!(binding(&e, "total"), Value::Int(16));
+}
+
+#[test]
 fn list_method_through_a_field() {
-    let e = run("@fieldwise_init\nstruct Bag:\n    var items: List[Int]\n\nvar b: Bag = Bag([1, 2])\nb.items.append(3)\nb.items[0] = 9\nvar n: Int = len(b.items)\n");
+    let e = run(
+        "@fieldwise_init\nstruct Bag:\n    var items: List[Int]\n\nvar b: Bag = Bag([1, 2])\nb.items.append(3)\nb.items[0] = 9\nvar n: Int = len(b.items)\n",
+    );
     assert_eq!(binding(&e, "n"), Value::Int(3));
     let items = match binding(&e, "b") {
         Value::Struct { fields, .. } => fields[0].1.clone(),
         _ => panic!(),
     };
-    assert_eq!(items, Value::List(vec![Value::Int(9), Value::Int(2), Value::Int(3)]));
+    assert_eq!(
+        items,
+        Value::List(vec![Value::Int(9), Value::Int(2), Value::Int(3)])
+    );
 }
 
 // --- Augmented assignment ---
@@ -820,32 +987,47 @@ fn augmented_assignment_arithmetic() {
 
 #[test]
 fn augmented_assignment_on_field_index_and_mut_self() {
-    let e = run("@fieldwise_init\nstruct Counter:\n    var n: Int\n\n    def bump(mut self, k: Int):\n        self.n += k\n\nvar c: Counter = Counter(0)\nc.n += 100\nc.bump(5)\nvar xs: List[Int] = [1, 2, 3]\nxs[1] += 10\n");
-    let n = match binding(&e, "c") { Value::Struct { fields, .. } => fields[0].1.clone(), _ => panic!() };
+    let e = run(
+        "@fieldwise_init\nstruct Counter:\n    var n: Int\n\n    def bump(mut self, k: Int):\n        self.n += k\n\nvar c: Counter = Counter(0)\nc.n += 100\nc.bump(5)\nvar xs: List[Int] = [1, 2, 3]\nxs[1] += 10\n",
+    );
+    let n = match binding(&e, "c") {
+        Value::Struct { fields, .. } => fields[0].1.clone(),
+        _ => panic!(),
+    };
     assert_eq!(n, Value::Int(105));
-    assert_eq!(binding(&e, "xs"), Value::List(vec![Value::Int(1), Value::Int(12), Value::Int(3)]));
+    assert_eq!(
+        binding(&e, "xs"),
+        Value::List(vec![Value::Int(1), Value::Int(12), Value::Int(3)])
+    );
 }
 
 #[test]
 fn augmented_assignment_evaluates_the_place_once() {
-    // `xs[idx(1)] += 5` must call `idx` exactly once (single read-modify-write).
-    let e = run("var log: List[Int] = List[Int]()\nvar xs: List[Int] = [10, 20, 30]\ndef idx(i: Int) -> Int:\n    log.append(i)\n    return i\nxs[idx(1)] += 5\n");
-    assert_eq!(binding(&e, "log"), Value::List(vec![Value::Int(1)]));
-    assert_eq!(binding(&e, "xs"), Value::List(vec![Value::Int(10), Value::Int(25), Value::Int(30)]));
+    // `xs[idx(1)] += 5` must call `idx` exactly once (single read-modify-write) —
+    // observed via `idx`'s single `print`.
+    let out = output(
+        "def idx(i: Int) -> Int:\n    print(\"idx\", i)\n    return i\n\ndef main():\n    var xs: List[Int] = [10, 20, 30]\n    xs[idx(1)] += 5\n    print(xs[0], xs[1], xs[2])\n",
+    );
+    assert_eq!(out, "idx 1\n10 25 30\n");
 }
 
 // --- SIMD lane writes ---
 
 fn lane(v: &Value, i: usize) -> i128 {
     match v {
-        Value::Simd { lanes: mojo_lite::evaluator::SimdLanes::Int(l), .. } => l[i],
+        Value::Simd {
+            lanes: mojo_lite::runtime::SimdLanes::Int(l),
+            ..
+        } => l[i],
         _ => panic!("not an int SIMD"),
     }
 }
 
 #[test]
 fn simd_lane_write_scalar_and_splat_and_aug() {
-    let e = run("var v: SIMD[DType.int32, 4] = SIMD[DType.int32, 4](1, 2, 3, 4)\nv[0] = 10\nv[1] = Int32(20)\nv[2] += 100\n");
+    let e = run(
+        "var v: SIMD[DType.int32, 4] = SIMD[DType.int32, 4](1, 2, 3, 4)\nv[0] = 10\nv[1] = Int32(20)\nv[2] += 100\n",
+    );
     let v = binding(&e, "v");
     assert_eq!(lane(&v, 0), 10);
     assert_eq!(lane(&v, 1), 20);
@@ -862,8 +1044,13 @@ fn simd_lane_write_wraps_to_element_width() {
 
 #[test]
 fn simd_lane_write_through_a_struct_field() {
-    let e = run("@fieldwise_init\nstruct V:\n    var data: SIMD[DType.int32, 4]\n\nvar s: V = V(SIMD[DType.int32, 4](5, 6, 7, 8))\ns.data[3] = 99\n");
-    let data = match binding(&e, "s") { Value::Struct { fields, .. } => fields[0].1.clone(), _ => panic!() };
+    let e = run(
+        "@fieldwise_init\nstruct V:\n    var data: SIMD[DType.int32, 4]\n\nvar s: V = V(SIMD[DType.int32, 4](5, 6, 7, 8))\ns.data[3] = 99\n",
+    );
+    let data = match binding(&e, "s") {
+        Value::Struct { fields, .. } => fields[0].1.clone(),
+        _ => panic!(),
+    };
     assert_eq!(lane(&data, 3), 99);
 }
 
@@ -878,20 +1065,25 @@ fn simd_lane_write_out_of_range_is_a_runtime_error() {
 #[test]
 fn width1_float64_simd_is_a_native_float64() {
     // Constructing SIMD[DType.float64, 1] yields a Value::Float64 (canonicalized).
-    let e = run("var a: SIMD[DType.float64, 1] = SIMD[DType.float64, 1](3.5)\nvar b: Float64 = a\n");
+    let e =
+        run("var a: SIMD[DType.float64, 1] = SIMD[DType.float64, 1](3.5)\nvar b: Float64 = a\n");
     assert_eq!(binding(&e, "a"), Value::Float64(3.5));
     assert_eq!(binding(&e, "b"), Value::Float64(3.5));
 }
 
 #[test]
 fn float64_vector_arithmetic_and_lane_read() {
-    let e = run("var v: SIMD[DType.float64, 4] = SIMD[DType.float64, 4](1.0, 2.0, 3.0, 4.0)\nvar d: SIMD[DType.float64, 4] = v + v\nvar lane: Float64 = d[3]\n");
+    let e = run(
+        "var v: SIMD[DType.float64, 4] = SIMD[DType.float64, 4](1.0, 2.0, 3.0, 4.0)\nvar d: SIMD[DType.float64, 4] = v + v\nvar lane: Float64 = d[3]\n",
+    );
     assert_eq!(binding(&e, "lane"), Value::Float64(8.0)); // (4+4)
 }
 
 #[test]
 fn float64_lane_write_and_aug_and_splat() {
-    let e = run("var a: Float64 = 100.0\nvar v: SIMD[DType.float64, 3] = SIMD[DType.float64, 3](1.0, 2.0, 3.0)\nv[0] = a\nv[1] += 10.0\nvar lane0: Float64 = v[0]\nvar lane1: Float64 = v[1]\n");
+    let e = run(
+        "var a: Float64 = 100.0\nvar v: SIMD[DType.float64, 3] = SIMD[DType.float64, 3](1.0, 2.0, 3.0)\nv[0] = a\nv[1] += 10.0\nvar lane0: Float64 = v[0]\nvar lane1: Float64 = v[1]\n",
+    );
     assert_eq!(binding(&e, "lane0"), Value::Float64(100.0));
     assert_eq!(binding(&e, "lane1"), Value::Float64(12.0));
 }
@@ -899,18 +1091,29 @@ fn float64_lane_write_and_aug_and_splat() {
 #[test]
 fn float64_keeps_full_precision_unlike_float32() {
     // float64 does NOT round to single precision; float32 does.
-    let e = run("var a: Float64 = 0.1\nvar big: SIMD[DType.float64, 1] = SIMD[DType.float64, 1](0.1)\nvar eq: Bool = big == a\n");
+    let e = run(
+        "var a: Float64 = 0.1\nvar big: SIMD[DType.float64, 1] = SIMD[DType.float64, 1](0.1)\nvar eq: Bool = big == a\n",
+    );
     assert_eq!(binding(&e, "eq"), Value::Bool(true));
     let f32 = run("var s: SIMD[DType.float32, 1] = SIMD[DType.float32, 1](0.1)\n");
     // The float32 lane is rounded, so it differs from the exact f64 0.1.
-    assert_ne!(binding(&f32, "s"), Value::Simd { dtype: mojo_lite::Dtype::Float32, lanes: mojo_lite::evaluator::SimdLanes::Float(vec![0.1]) });
+    assert_ne!(
+        binding(&f32, "s"),
+        Value::Simd {
+            dtype: mojo_lite::Dtype::Float32,
+            lanes: mojo_lite::runtime::SimdLanes::Float(vec![0.1])
+        }
+    );
 }
 
 // --- Walrus (parsed, unsupported at runtime) ---
 
 #[test]
 fn walrus_is_unsupported_at_runtime() {
-    assert!(matches!(run_err("var y: Int = (n := 5)\n"), RuntimeError::Unsupported(_)));
+    assert!(matches!(
+        run_err("var y: Int = (n := 5)\n"),
+        RuntimeError::Unsupported(_)
+    ));
 }
 
 // --- Inferred `var` ---
@@ -928,7 +1131,10 @@ fn inferred_var_takes_the_values_natural_type() {
 #[test]
 fn inferred_var_list_is_mutable_and_reassignable() {
     let e = run("var xs = [1, 2]\nxs.append(3)\nvar total = 0\nfor x in xs:\n    total += x\n");
-    assert_eq!(binding(&e, "xs"), Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]));
+    assert_eq!(
+        binding(&e, "xs"),
+        Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+    );
     assert_eq!(binding(&e, "total"), Value::Int(6));
 }
 
@@ -936,13 +1142,19 @@ fn inferred_var_list_is_mutable_and_reassignable() {
 
 #[test]
 fn tuple_construction_indexing_and_value_semantics() {
-    let e = run("var t: Tuple[Int, Float64, String] = (1, 2.5, \"hi\")\nvar a: Int = t[0]\nvar b: Float64 = t[1]\nvar c: String = t[2]\n");
+    let e = run(
+        "var t: Tuple[Int, Float64, String] = (1, 2.5, \"hi\")\nvar a: Int = t[0]\nvar b: Float64 = t[1]\nvar c: String = t[2]\n",
+    );
     assert_eq!(binding(&e, "a"), Value::Int(1));
     assert_eq!(binding(&e, "b"), Value::Float64(2.5));
     assert_eq!(binding(&e, "c"), Value::Str("hi".into()));
     assert_eq!(
         binding(&e, "t"),
-        Value::Tuple(vec![Value::Int(1), Value::Float64(2.5), Value::Str("hi".into())])
+        Value::Tuple(vec![
+            Value::Int(1),
+            Value::Float64(2.5),
+            Value::Str("hi".into())
+        ])
     );
 }
 
@@ -950,12 +1162,17 @@ fn tuple_construction_indexing_and_value_semantics() {
 fn tuple_element_coercion_at_runtime() {
     // `(1, 2)` into `Tuple[Float64, Float64]` materializes each element to Float64.
     let e = run("var t: Tuple[Float64, Float64] = (1, 2)\n");
-    assert_eq!(binding(&e, "t"), Value::Tuple(vec![Value::Float64(1.0), Value::Float64(2.0)]));
+    assert_eq!(
+        binding(&e, "t"),
+        Value::Tuple(vec![Value::Float64(1.0), Value::Float64(2.0)])
+    );
 }
 
 #[test]
 fn function_returns_a_tuple() {
-    let e = run("def stats() -> Tuple[Int, Int]:\n    return (512, 4)\n\nvar s = stats()\nvar points: Int = s[0]\nvar scans: Int = s[1]\n");
+    let e = run(
+        "def stats() -> Tuple[Int, Int]:\n    return (512, 4)\n\nvar s = stats()\nvar points: Int = s[0]\nvar scans: Int = s[1]\n",
+    );
     assert_eq!(binding(&e, "points"), Value::Int(512));
     assert_eq!(binding(&e, "scans"), Value::Int(4));
 }
@@ -963,31 +1180,59 @@ fn function_returns_a_tuple() {
 #[test]
 fn default_argument_values_fill_missing_trailing_args() {
     // Omitted trailing arg uses the default; provided arg overrides it.
-    let e = run("def p(b: Int, e: Int = 2) -> Int:\n    return b ** e\n\ndef main():\n    print(p(3))\n    print(p(3, 3))\n");
-    assert_eq!(e.output(), "9\n27\n");
+    let e = output(
+        "def p(b: Int, e: Int = 2) -> Int:\n    return b ** e\n\ndef main():\n    print(p(3))\n    print(p(3, 3))\n",
+    );
+    assert_eq!(e, "9\n27\n");
 }
 
 #[test]
 fn main_is_called_as_entry_point() {
-    let e = run("def main():\n    print(\"hi\")\n");
-    assert_eq!(e.output(), "hi\n");
+    let e = output("def main():\n    print(\"hi\")\n");
+    assert_eq!(e, "hi\n");
 }
 
 #[test]
 fn keyword_arguments_bind_by_name() {
     // Keyword args match by name regardless of order; mix with positional + default.
-    let e = run("def sub(a: Int, b: Int, c: Int = 100) -> Int:\n    return a - b + c\n\ndef main():\n    print(sub(10, 3))\n    print(sub(b=3, a=10))\n    print(sub(10, c=0, b=3))\n");
-    assert_eq!(e.output(), "107\n107\n7\n");
+    let e = output(
+        "def sub(a: Int, b: Int, c: Int = 100) -> Int:\n    return a - b + c\n\ndef main():\n    print(sub(10, 3))\n    print(sub(b=3, a=10))\n    print(sub(10, c=0, b=3))\n",
+    );
+    assert_eq!(e, "107\n107\n7\n");
 }
 
 #[test]
 fn variadic_args_collects_extra_positional_args() {
-    let e = run("def sum(*values: Int) -> Int:\n    var t: Int = 0\n    for v in values:\n        t = t + v\n    return t\n\ndef main():\n    print(sum())\n    print(sum(1, 2, 3))\n    print(sum(10, 20, 30, 40))\n");
-    assert_eq!(e.output(), "0\n6\n100\n");
+    let e = output(
+        "def sum(*values: Int) -> Int:\n    var t: Int = 0\n    for v in values:\n        t = t + v\n    return t\n\ndef main():\n    print(sum())\n    print(sum(1, 2, 3))\n    print(sum(10, 20, 30, 40))\n",
+    );
+    assert_eq!(e, "0\n6\n100\n");
 }
 
 #[test]
 fn variadic_args_after_regular_params() {
-    let e = run("def tag(label: String, *nums: Int) -> Int:\n    return len(nums)\n\ndef main():\n    print(tag(\"a\"))\n    print(tag(\"a\", 1, 2, 3))\n");
-    assert_eq!(e.output(), "0\n3\n");
+    let e = output(
+        "def tag(label: String, *nums: Int) -> Int:\n    return len(nums)\n\ndef main():\n    print(tag(\"a\"))\n    print(tag(\"a\", 1, 2, 3))\n",
+    );
+    assert_eq!(e, "0\n3\n");
+}
+
+#[test]
+fn mut_param_writes_back_to_caller() {
+    // A `mut` reference parameter mutates the caller's variable.
+    let ev = output("def incr(mut x: Int):\n    x = x + 1\n\ndef main():\n    var n: Int = 5\n    incr(n)\n    print(n)\n");
+    assert_eq!(ev, "6\n");
+}
+
+#[test]
+fn mut_param_mutates_a_struct_field() {
+    let ev = output("@fieldwise_init\nstruct Counter:\n    var n: Int\n\ndef bump(mut c: Counter, k: Int):\n    c.n = c.n + k\n\ndef main():\n    var c: Counter = Counter(0)\n    bump(c, 5)\n    bump(c, 3)\n    print(c.n)\n");
+    assert_eq!(ev, "8\n");
+}
+
+#[test]
+fn ref_param_also_writes_back() {
+    // `ref` (a reference) is modeled like `mut` for write-back.
+    let ev = output("def set_to(ref x: Int, v: Int):\n    x = v\n\ndef main():\n    var n: Int = 0\n    set_to(n, 42)\n    print(n)\n");
+    assert_eq!(ev, "42\n");
 }

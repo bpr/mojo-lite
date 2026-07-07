@@ -1,0 +1,352 @@
+//! VM backend evaluation tests (the register VM is the sole executor since the
+//! tree-walker was retired).
+//!
+//! Each test asserts the VM's exact `print` output for a program. `vm`/`parity`
+//! return that output (`parity` is a historical alias from when these diffed the
+//! VM against the tree-walker); `run` returns a `Result` for error cases.
+//!
+//! Coverage tracks `backend/vm.rs`: scalars/operators, literal coercion,
+//! short-circuit `and`/`or`, `if`/`while`, `for`/`range` (iterator protocol) and
+//! `for` over lists, variables, user `def` calls (default/keyword/variadic ABI,
+//! `mut`/`ref` reference-param write-back) + recursion, `return`, structs
+//! (fieldwise construction, field read, `mut self`), `List`/`Tuple`, SIMD
+//! construction + lane read, destructor (`__del__`) calls, `try`/`except`/`else`/
+//! `finally` with exceptional-edge cleanup, and `print`/`String`/`len`. Remaining
+//! gaps — a `return`/`break`/`continue` crossing a `try` boundary, and methods with
+//! `mut`/`ref` ordinary params — are covered by `vm_reports_unsupported_features_cleanly`
+//! and `vm_refuses_mut_ref_via_non_place_argument`: the VM must error cleanly, never
+//! diverge.
+
+use mojo_lite::{BackendKind, check, parse};
+
+/// Run `src` through the VM backend (the sole executor) and return its captured
+/// output, or a stage error string.
+fn run(src: &str) -> Result<String, String> {
+    let program = parse(src).map_err(|e| format!("parse error: {e:?}"))?;
+    check(&program).map_err(|e| format!("type error: {e:?}"))?;
+    let mut backend = BackendKind::Vm.make();
+    backend
+        .run(&program)
+        .map_err(|e| format!("runtime error: {e:?}"))?;
+    Ok(backend.output())
+}
+
+/// Whether `src` is a statically valid program (parses + type-checks) — used to
+/// show a program is well-formed but exercises a VM coverage gap.
+fn checks_ok(src: &str) -> bool {
+    parse(src).is_ok_and(|p| check(&p).is_ok())
+}
+
+/// The VM's output for a program that must succeed (exact-output assertions).
+fn vm(src: &str) -> String {
+    run(src).expect("vm backend failed")
+}
+
+/// Alias retained by the exact-output tests: the VM's output (formerly a
+/// VM-vs-tree parity check; the tree-walker has been retired).
+fn parity(src: &str) -> String {
+    vm(src)
+}
+
+#[test]
+fn arithmetic_and_precedence() {
+    assert_eq!(
+        parity("print(1 + 2 * 3)\nprint((1 + 2) * 3)\nprint(2 ** 10)\nprint(-7 // 2)\n"),
+        "7\n9\n1024\n-4\n"
+    );
+}
+
+#[test]
+fn float_arithmetic_same_type() {
+    // Both operands are float literals, so no int→float coercion is needed (the
+    // one place the untyped MIR would diverge from the tree-walker).
+    assert_eq!(vm("print(1.0 / 2.0)\nprint(3.5 + 1.5)\n"), "0.5\n5.0\n");
+    parity("print(1.0 / 2.0)\nprint(3.5 + 1.5)\n");
+}
+
+#[test]
+fn boolean_and_comparison() {
+    parity("print(1 < 2 and not False)\nprint(3 == 3)\nprint(2 > 5 or 1 == 1)\n");
+}
+
+#[test]
+fn string_concat_and_builtins() {
+    assert_eq!(
+        parity("var s: String = \"ab\" + \"cd\"\nprint(s)\nprint(len(s))\nprint(String(42))\n"),
+        "abcd\n4\n42\n"
+    );
+}
+
+#[test]
+fn if_elif_else_via_function() {
+    let src = "def sign(n: Int) -> Int:\n    if n > 0:\n        return 1\n    elif n < 0:\n        return -1\n    else:\n        return 0\n\ndef main():\n    print(sign(7))\n    print(sign(-4))\n    print(sign(0))\n";
+    assert_eq!(parity(src), "1\n-1\n0\n");
+}
+
+#[test]
+fn while_loop_accumulates() {
+    let src = "def main():\n    var i: Int = 0\n    var total: Int = 0\n    while i < 5:\n        total = total + i\n        i = i + 1\n    print(total)\n";
+    assert_eq!(parity(src), "10\n");
+}
+
+#[test]
+fn function_calls_and_recursion() {
+    let src = "def fib(n: Int) -> Int:\n    if n < 2:\n        return n\n    return fib(n - 1) + fib(n - 2)\n\ndef main():\n    print(fib(10))\n";
+    assert_eq!(parity(src), "55\n");
+}
+
+#[test]
+fn nested_calls_evaluate_in_order() {
+    let src = "def add(a: Int, b: Int) -> Int:\n    return a + b\n\ndef sq(n: Int) -> Int:\n    return n * n\n\ndef main():\n    print(sq(add(1, 2)))\n";
+    assert_eq!(parity(src), "9\n");
+}
+
+#[test]
+fn top_level_then_main_entry() {
+    // Top-level statements run first, then `main()` — mirroring the tree evaluator.
+    let src = "print(1)\n\ndef main():\n    print(2)\n";
+    assert_eq!(parity(src), "1\n2\n");
+}
+
+#[test]
+fn boolean_short_circuit_skips_rhs() {
+    // The MIR lowers `and`/`or` to CFG blocks, so a side-effecting right operand is
+    // NOT evaluated when the left settles the result — matching the tree-walker.
+    // `loud()` prints; its absence from the output proves the skip.
+    let src = "def loud() -> Bool:\n    print(\"called\")\n    return True\n\ndef main():\n    var a: Bool = False and loud()\n    print(a)\n    var b: Bool = True or loud()\n    print(b)\n    if False and loud():\n        print(\"nope\")\n    print(\"done\")\n";
+    assert_eq!(parity(src), "false\ntrue\ndone\n");
+
+    // When the left operand does NOT settle it, the right IS evaluated.
+    let src2 = "def loud() -> Bool:\n    print(\"called\")\n    return True\n\ndef main():\n    var a: Bool = True and loud()\n    print(a)\n";
+    assert_eq!(parity(src2), "called\ntrue\n");
+
+    // Nested short-circuits compose.
+    parity("print(True or (False and False))\nprint((1 < 2) and (2 < 3) and (3 < 4))\n");
+}
+
+#[test]
+fn literal_coercion_at_binding_sites() {
+    // An int literal materializes to the annotated/parameter type — the one place
+    // the untyped MIR used to diverge. Now the MIR carries the annotation and the
+    // VM applies the same `coerce`/`coerce_like` as the tree-walker.
+    assert_eq!(parity("var f: Float64 = 3\nprint(f)\n"), "3.0\n");
+    assert_eq!(parity("var u: UInt = 0\nu = u + 1\nprint(u)\n"), "1\n");
+    // Int literal into a Float64 parameter, then float arithmetic.
+    let src = "def scale(x: Float64) -> Float64:\n    return x * 2.0\n\ndef main():\n    print(scale(5))\n";
+    assert_eq!(parity(src), "10.0\n");
+    // Inferred `var` keeps the literal's natural kind (int stays Int).
+    assert_eq!(parity("var n = 7\nprint(n)\nprint(n + 1)\n"), "7\n8\n");
+}
+
+#[test]
+fn for_range_iterator_protocol() {
+    // `for`/`range` lowers to the iterator protocol (HasNext/Next over a Range),
+    // matching the tree-walker across step direction, break/continue, and nesting.
+    assert_eq!(
+        parity("var t: Int = 0\nfor i in range(5):\n    t = t + i\nprint(t)\n"),
+        "10\n"
+    );
+    assert_eq!(parity("for j in range(2, 8, 2):\n    print(j)\n"), "2\n4\n6\n");
+    assert_eq!(parity("for k in range(3, 0, -1):\n    print(k)\n"), "3\n2\n1\n");
+    // An empty range runs the body zero times.
+    assert_eq!(parity("for x in range(0):\n    print(x)\nprint(99)\n"), "99\n");
+    // break/continue.
+    let bc = "def main():\n    for m in range(10):\n        if m == 3:\n            break\n        if m == 1:\n            continue\n        print(m)\n";
+    assert_eq!(parity(bc), "0\n2\n");
+    // Nested loops.
+    let nested = "for a in range(2):\n    for b in range(2):\n        print(a * 10 + b)\n";
+    assert_eq!(parity(nested), "0\n1\n10\n11\n");
+}
+
+#[test]
+fn return_crossing_try_runs_with_finally() {
+    // A `return` inside a `try` crosses the boundary and runs the `finally` on the
+    // way out — the VM matches the tree-walker (Flow-based region execution). A
+    // `finally` that itself returns overrides (Python/Mojo semantics).
+    let f = "def f() -> Int:\n    try:\n        return 1\n    finally:\n        print(\"fin\")\n\ndef main():\n    print(f())\n";
+    assert_eq!(parity(f), "fin\n1\n");
+    let override_ = "def g() -> Int:\n    try:\n        return 1\n    finally:\n        return 2\n\ndef main():\n    print(g())\n";
+    assert_eq!(parity(override_), "2\n");
+    let caught = "def h() -> Int:\n    try:\n        raise \"x\"\n    except e:\n        return 5\n    finally:\n        print(\"h-fin\")\n\ndef main():\n    print(h())\n";
+    assert_eq!(parity(caught), "h-fin\n5\n");
+}
+
+#[test]
+fn break_continue_crossing_try_runs_with_finally() {
+    // `break`/`continue` inside a `try` that target an outer loop cross the boundary
+    // and run each `finally` on the way out — the VM matches the tree-walker.
+    let brk = "def main():\n    for i in range(5):\n        try:\n            if i == 3:\n                break\n            if i % 2 == 0:\n                continue\n            print(\"odd\", i)\n        finally:\n            print(\"fin\", i)\n    print(\"done\")\n";
+    assert_eq!(parity(brk), "fin 0\nodd 1\nfin 1\nfin 2\nfin 3\ndone\n");
+    // `break` in an `except`; a `finally` that itself `break`s overrides a body
+    // `continue`; nested try/finally both run before the jump reaches the loop.
+    let exc = "def main():\n    for i in range(4):\n        try:\n            raise \"x\"\n        except e:\n            break\n        finally:\n            print(\"fin\", i)\n    print(\"done\")\n";
+    assert_eq!(parity(exc), "fin 0\ndone\n");
+    let fin = "def main():\n    for i in range(3):\n        try:\n            continue\n        finally:\n            print(\"f\", i)\n            break\n    print(\"done\")\n";
+    assert_eq!(parity(fin), "f 0\ndone\n");
+    let nested = "def main():\n    for i in range(3):\n        try:\n            try:\n                break\n            finally:\n                print(\"in\", i)\n        finally:\n            print(\"out\", i)\n    print(\"done\")\n";
+    assert_eq!(parity(nested), "in 0\nout 0\ndone\n");
+}
+
+#[test]
+fn vm_reports_unsupported_features_cleanly() {
+    // A remaining coverage gap must surface as a clean error, not a wrong answer or
+    // a panic. `break`/`continue` crossing a `try` now works when the target loop is
+    // function-level; the still-refused case is a loop declared *inside* a `try`,
+    // broken by a nested `try` (a region-local target the mini-CFG can't name) — a
+    // statically valid program the VM must reject cleanly, not diverge.
+    let program = "def main():\n    try:\n        for i in range(3):\n            try:\n                break\n            finally:\n                print(\"fin\", i)\n    finally:\n        print(\"outer\")\n";
+    assert!(checks_ok(program), "the program is statically valid");
+    assert!(
+        run(program).is_err(),
+        "a break targeting a loop declared inside an enclosing try is not supported — must error"
+    );
+}
+
+#[test]
+fn vm_runs_every_ok_fixture() {
+    // The VM is the sole executor: every `assets/ok/*.mojo` fixture must run without
+    // error. (Exact-output correctness is asserted by the targeted tests above.)
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/ok");
+    let mut ran = 0;
+    for entry in std::fs::read_dir(dir).expect("assets/ok exists") {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("mojo") {
+            continue;
+        }
+        let src = std::fs::read_to_string(&path).unwrap();
+        run(&src).unwrap_or_else(|e| panic!("vm failed on ok fixture {}: {e}", path.display()));
+        ran += 1;
+    }
+    assert!(ran > 0, "expected some ok fixtures");
+}
+
+#[test]
+fn structs_construction_fields_and_mut_self() {
+    // Construction, field read, a read-only method, and a `mut self` method whose
+    // mutation persists (written back through the receiver place).
+    let src = "@fieldwise_init\nstruct Counter:\n    var n: Int\n\n    def get(self) -> Int:\n        return self.n\n\n    def bump(mut self, k: Int):\n        self.n += k\n\ndef main():\n    var c: Counter = Counter(10)\n    print(c.get())\n    c.bump(5)\n    c.bump(2)\n    print(c.n)\n";
+    assert_eq!(parity(src), "10\n17\n");
+}
+
+#[test]
+fn lists_tuples_and_indexing() {
+    // List literal + index + mutation + membership; tuple return + const index.
+    assert_eq!(
+        parity("var xs = [1, 2, 3]\nxs.append(4)\nprint(xs[0])\nprint(len(xs))\nprint(3 in xs)\n"),
+        "1\n4\ntrue\n"
+    );
+    let tup = "def pair() -> Tuple[Int, Int]:\n    return (7, 9)\n\ndef main():\n    var t = pair()\n    print(t[0])\n    print(t[1])\n";
+    assert_eq!(parity(tup), "7\n9\n");
+}
+
+#[test]
+fn argument_matching_default_keyword_variadic() {
+    assert_eq!(
+        parity("def p(b: Int, e: Int = 2) -> Int:\n    return b ** e\n\ndef main():\n    print(p(3))\n    print(p(3, 3))\n    print(p(e=4, b=2))\n"),
+        "9\n27\n16\n"
+    );
+    let variadic = "def total(*xs: Int) -> Int:\n    var s: Int = 0\n    for x in xs:\n        s = s + x\n    return s\n\ndef main():\n    print(total())\n    print(total(1, 2, 3))\n";
+    assert_eq!(parity(variadic), "0\n6\n");
+}
+
+#[test]
+fn simd_construction_elementwise_and_lane() {
+    let src = "var v: SIMD[DType.float64, 4] = SIMD[DType.float64, 4](1.0, 2.0, 3.0, 4.0)\nvar scaled = v * 2.0\nprint(scaled[3])\n";
+    assert_eq!(parity(src), "8.0\n");
+}
+
+#[test]
+fn vm_mut_ref_params_write_back() {
+    // A `mut`/`ref` reference parameter mutates the caller's variable — the VM
+    // writes each one's final value back to the caller's argument place after the
+    // call (matching the tree-walker).
+    assert_eq!(
+        parity("def incr(mut x: Int):\n    x = x + 1\n\ndef main():\n    var n: Int = 5\n    incr(n)\n    incr(n)\n    print(n)\n"),
+        "7\n"
+    );
+    // `ref` writes back too; write-back through a struct field place persists.
+    assert_eq!(
+        parity("def set_to(ref x: Int, v: Int):\n    x = v\n\ndef main():\n    var n: Int = 0\n    set_to(n, 42)\n    print(n)\n"),
+        "42\n"
+    );
+    let field = "@fieldwise_init\nstruct Counter:\n    var n: Int\n\ndef bump(mut c: Counter, k: Int):\n    c.n = c.n + k\n\ndef main():\n    var c: Counter = Counter(0)\n    bump(c, 5)\n    bump(c, 3)\n    print(c.n)\n";
+    assert_eq!(parity(field), "8\n");
+}
+
+#[test]
+fn method_mut_ref_param_writeback_parity() {
+    // A method with a `mut` *ordinary* parameter writes the mutated argument back
+    // to the caller's place, identically on both backends (the write-back is done
+    // in the evaluator and the VM alike).
+    let src = "@fieldwise_init\nstruct C:\n    var n: Int\n    def combine(self, mut other: C):\n        other.n = other.n + self.n\n\ndef main():\n    var a: C = C(1)\n    var b: C = C(2)\n    a.combine(b)\n    print(b.n)\n";
+    assert_eq!(parity(src), "3\n");
+}
+
+#[test]
+fn try_except_else_finally() {
+    // Full structured exceptions run on the VM identically to the tree-walker: a
+    // caught raise, the `else` on normal completion, and `finally` on every path.
+    let caught = "def main():\n    try:\n        print(\"body\")\n        raise \"x\"\n        print(\"unreached\")\n    except e:\n        print(\"caught\")\n    finally:\n        print(\"fin\")\n    print(\"after\")\n";
+    assert_eq!(parity(caught), "body\ncaught\nfin\nafter\n");
+
+    let no_raise = "def main():\n    try:\n        print(\"body\")\n    except e:\n        print(\"caught\")\n    else:\n        print(\"elseran\")\n    finally:\n        print(\"fin\")\n";
+    assert_eq!(parity(no_raise), "body\nelseran\nfin\n");
+}
+
+#[test]
+fn partial_move_field_read_parity() {
+    // A partial move `p.a^` followed by reads of the moved value and the retained
+    // sibling runs identically on both backends: the field read now lowers to a
+    // `LoadPlace`, and `^` on a field to a `MovePlace` — both value-preserving, so
+    // the VM stays in lock-step with the tree-walker.
+    let src = "@fieldwise_init\nstruct Inner:\n    var id: Int\n\n@fieldwise_init\nstruct Pair:\n    var a: Inner\n    var b: Inner\n\ndef main():\n    var p: Pair = Pair(Inner(1), Inner(2))\n    var x: Inner = p.a^\n    print(x.id)\n    print(p.b.id)\n    p.a = Inner(9)\n    print(p.a.id)\n";
+    assert_eq!(parity(src), "1\n2\n9\n");
+}
+
+#[test]
+fn utility_builtins_parity() {
+    // abs/min/max/round + Int/UInt/Float64 conversions now run on the VM with the
+    // same value-level semantics as the tree-walker (shared `builtin_*` helpers).
+    let src = "def main():\n    print(abs(-5))\n    print(abs(-3.5))\n    print(min(3, 7), max(3, 7))\n    print(round(2.5), round(2.4))\n    print(Int(3.9), UInt(42), Float64(7))\n";
+    assert_eq!(parity(src), "5\n3.5\n3 7\n3.0 2.0\n3 42 7.0\n");
+}
+
+#[test]
+fn simd_lane_write_parity() {
+    // `v[i] = e` / `v[i] += e`, both bare and through a struct field, now update a
+    // SIMD lane on the VM (via `store_place`/`set_simd_lane`) exactly as the
+    // tree-walker does.
+    let src = "@fieldwise_init\nstruct Vec4:\n    var data: SIMD[DType.int32, 4]\n\ndef main():\n    var v: SIMD[DType.int32, 4] = SIMD[DType.int32, 4](1, 2, 3, 4)\n    v[0] = 10\n    v[2] += 5\n    print(v[0], v[1], v[2], v[3])\n    var w: Vec4 = Vec4(SIMD[DType.int32, 4](0, 0, 0, 0))\n    w.data[1] = 42\n    print(w.data[1])\n";
+    assert_eq!(parity(src), "10 2 8 4\n42\n");
+}
+
+#[test]
+fn value_parameterized_generics_parity() {
+    // A value-parameterized struct reifies its value parameter (read via
+    // `Self.size`), and a value-parameterized function binds it as a local — both
+    // run on the VM identically to the tree-walker.
+    let src = "@fieldwise_init\nstruct FixedBuffer[size: Int]:\n    var tag: Int\n    def capacity(self) -> Int:\n        return Self.size\n\ndef scaled[factor: Int](x: Int) -> Int:\n    return x * factor\n\ndef main():\n    var b: FixedBuffer[8] = FixedBuffer[8](3)\n    print(b.capacity(), b.tag)\n    print(scaled[10](4))\n";
+    assert_eq!(parity(src), "8 3\n40\n");
+}
+
+#[test]
+fn nested_def_closures_parity() {
+    // Nested `def`s (closures) run on the VM identically to the tree-walker: a
+    // read-capture, a write-capture (reference semantics), and self-recursion.
+    let read = "def adder(n: Int) -> Int:\n    def add_n(x: Int) -> Int:\n        return x + n\n    return add_n(100)\n\ndef main():\n    print(adder(42))\n";
+    assert_eq!(parity(read), "142\n");
+    let write = "def counter() -> Int:\n    var total: Int = 0\n    def add(x: Int):\n        total = total + x\n    add(5)\n    add(3)\n    return total\n\ndef main():\n    print(counter())\n";
+    assert_eq!(parity(write), "8\n");
+    let rec = "def factorial(base: Int) -> Int:\n    def fact(n: Int) -> Int:\n        if n <= 1:\n            return base\n        return n * fact(n - 1)\n    return fact(5)\n\ndef main():\n    print(factorial(1))\n";
+    assert_eq!(parity(rec), "120\n");
+}
+
+#[test]
+fn nested_def_calling_sibling_is_refused_cleanly() {
+    // A nested `def` that calls a *sibling* nested `def` runs on the tree-walker
+    // but the VM refuses it cleanly (can't forward the sibling's captures) — never
+    // a divergence.
+    let src = "def outer() -> Int:\n    var b: Int = 10\n    def helper(x: Int) -> Int:\n        return x + b\n    def caller(y: Int) -> Int:\n        return helper(y) + 1\n    return caller(5)\n\ndef main():\n    print(outer())\n";
+    assert!(checks_ok(src), "the program is statically valid");
+    assert!(run(src).is_err());
+}

@@ -1,3 +1,13 @@
+/// A source byte range `(start, end)` — a half-open `[start, end)` slice of the
+/// original source. This is the single, canonical span type shared by the lexer
+/// (which stamps each token), the parser (which propagates spans onto AST nodes),
+/// and the MIR (whose `SpanTable` maps each temporary back to its origin span).
+pub type Span = (usize, usize);
+
+/// The zero-width, position-`0` span used for synthetic nodes that have no source
+/// text (e.g. the `main()` call the evaluator synthesizes as a program entry).
+pub const DUMMY_SPAN: Span = (0, 0);
+
 /// The token set for the implemented subset of Mojo.
 ///
 /// Keywords are split the way the reference tree-sitter Mojo grammar splits them
@@ -62,7 +72,10 @@ pub enum Token {
     /// A t-string (`t"…{expr}…"`) or raw t-string (`rt"…"`), lexed into
     /// alternating literal text and raw interpolation-expression text; the parser
     /// re-parses each interpolation into a real `Expr`. `raw` is true for `rt`.
-    TString { chunks: Vec<TStringChunk>, raw: bool },
+    TString {
+        chunks: Vec<TStringChunk>,
+        raw: bool,
+    },
 
     // Operators & Punctuation
     Assign,
@@ -82,28 +95,28 @@ pub enum Token {
     At,       // `@`
     Amp,      // `&` (trait-bound conjunction)
     Caret,    // `^` (transfer sigil)
-    Arrow, // `->`
+    Arrow,    // `->`
     LParen,
     RParen,
     LBracket, // `[`  (type-parameter / type-argument list)
     RBracket, // `]`
 
     // Arithmetic operators
-    Plus,       // `+`
-    Minus,      // `-`
-    Star,       // `*`
-    DoubleStar, // `**`
-    Slash,      // `/`
+    Plus,        // `+`
+    Minus,       // `-`
+    Star,        // `*`
+    DoubleStar,  // `**`
+    Slash,       // `/`
     DoubleSlash, // `//`
-    Percent,    // `%`
+    Percent,     // `%`
 
     // Comparison operators
-    EqEq, // `==`
+    EqEq,  // `==`
     NotEq, // `!=`
-    Lt,   // `<`
-    Gt,   // `>`
-    Le,   // `<=`
-    Ge,   // `>=`
+    Lt,    // `<`
+    Gt,    // `>`
+    Le,    // `<=`
+    Ge,    // `>=`
 
     // Structural (Offside Rule) Tokens
     Newline,

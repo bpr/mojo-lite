@@ -1,9 +1,14 @@
 use mojo_lite::ast::{
-    ArgConvention, Decorator, Expr, FnParam, ImportName, ImportNames, InfixOp, KwArg, Method, Param,
+    ArgConvention, Decorator, Expr, ExprKind, FnParam, ImportName, ImportNames, InfixOp, KwArg, Method, Param, StmtKind,
     ParamArg, ParamKind, PrefixOp, Stmt, TStringPart, TraitComptime, TraitMethod, Type, TypeParam,
     WithItem,
 };
 use mojo_lite::{Lexer, Parser};
+
+/// Box an `ExprKind` into a `Box<Expr>` child (dummy span; equality ignores it).
+fn bx(kind: ExprKind) -> Box<Expr> {
+    Box::new(Expr::from(kind))
+}
 
 /// The `@fieldwise_init` decorator, as it appears in a parsed struct's list.
 fn fieldwise_deco() -> Decorator {
@@ -28,18 +33,18 @@ fn parse(source: &str) -> Vec<Stmt> {
 fn parse_expr(source: &str) -> Expr {
     let stmts = parse(source);
     assert_eq!(stmts.len(), 1, "expected exactly one statement");
-    match stmts.into_iter().next().unwrap() {
-        Stmt::Expr(expr) => expr,
+    match stmts.into_iter().next().unwrap().kind {
+        StmtKind::Expr(expr) => expr,
         other => panic!("expected an expression statement, got {:?}", other),
     }
 }
 
 fn int(n: i64) -> Box<Expr> {
-    Box::new(Expr::Int(n))
+    bx(ExprKind::Int(n))
 }
 
 fn ident(name: &str) -> Box<Expr> {
-    Box::new(Expr::Identifier(name.into()))
+    bx(ExprKind::Identifier(name.into()))
 }
 
 #[test]
@@ -47,11 +52,11 @@ fn product_binds_tighter_than_sum() {
     // 1 + 2 * 3  ==  1 + (2 * 3)
     assert_eq!(
         parse_expr("1 + 2 * 3"),
-        Expr::Infix(
+        Expr::from(ExprKind::Infix(
             InfixOp::Add,
             int(1),
-            Box::new(Expr::Infix(InfixOp::Mul, int(2), int(3)))
-        )
+            bx(ExprKind::Infix(InfixOp::Mul, int(2), int(3)))
+        ))
     );
 }
 
@@ -60,11 +65,11 @@ fn parentheses_override_precedence() {
     // (1 + 2) * 3
     assert_eq!(
         parse_expr("(1 + 2) * 3"),
-        Expr::Infix(
+        Expr::from(ExprKind::Infix(
             InfixOp::Mul,
-            Box::new(Expr::Infix(InfixOp::Add, int(1), int(2))),
+            bx(ExprKind::Infix(InfixOp::Add, int(1), int(2))),
             int(3)
-        )
+        ))
     );
 }
 
@@ -73,11 +78,11 @@ fn subtraction_is_left_associative() {
     // 1 - 2 - 3  ==  (1 - 2) - 3
     assert_eq!(
         parse_expr("1 - 2 - 3"),
-        Expr::Infix(
+        Expr::from(ExprKind::Infix(
             InfixOp::Sub,
-            Box::new(Expr::Infix(InfixOp::Sub, int(1), int(2))),
+            bx(ExprKind::Infix(InfixOp::Sub, int(1), int(2))),
             int(3)
-        )
+        ))
     );
 }
 
@@ -86,11 +91,11 @@ fn unary_minus_binds_tighter_than_sum() {
     // -a + 1  ==  (-a) + 1
     assert_eq!(
         parse_expr("-a + 1"),
-        Expr::Infix(
+        Expr::from(ExprKind::Infix(
             InfixOp::Add,
-            Box::new(Expr::Prefix(PrefixOp::Neg, ident("a"))),
+            bx(ExprKind::Prefix(PrefixOp::Neg, ident("a"))),
             int(1)
-        )
+        ))
     );
 }
 
@@ -99,10 +104,10 @@ fn not_binds_looser_than_comparison() {
     // not a == b  ==  not (a == b)
     assert_eq!(
         parse_expr("not a == b"),
-        Expr::Prefix(
+        Expr::from(ExprKind::Prefix(
             PrefixOp::Not,
-            Box::new(Expr::Infix(InfixOp::Eq, ident("a"), ident("b")))
-        )
+            bx(ExprKind::Infix(InfixOp::Eq, ident("a"), ident("b")))
+        ))
     );
 }
 
@@ -111,11 +116,11 @@ fn or_is_looser_than_and() {
     // a or b and c  ==  a or (b and c)
     assert_eq!(
         parse_expr("a or b and c"),
-        Expr::Infix(
+        Expr::from(ExprKind::Infix(
             InfixOp::Or,
             ident("a"),
-            Box::new(Expr::Infix(InfixOp::And, ident("b"), ident("c")))
-        )
+            bx(ExprKind::Infix(InfixOp::And, ident("b"), ident("c")))
+        ))
     );
 }
 
@@ -123,12 +128,12 @@ fn or_is_looser_than_and() {
 fn parses_call_with_args() {
     assert_eq!(
         parse_expr("f(1, a)"),
-        Expr::Call {
+        Expr::from(ExprKind::Call {
             name: "f".into(),
             param_args: vec![],
-            args: vec![Expr::Int(1), Expr::Identifier("a".into())],
+            args: vec![Expr::from(ExprKind::Int(1)), Expr::from(ExprKind::Identifier("a".into()))],
             kwargs: vec![],
-        }
+        })
     );
 }
 
@@ -138,7 +143,7 @@ fn parses_struct_with_field_and_method() {
         parse("@fieldwise_init\nstruct Point:\n    var x: Int\n\n    def get(self) -> Int:\n        return self.x\n");
     assert_eq!(
         stmts[0],
-        Stmt::Struct {
+        Stmt::from(StmtKind::Struct {
             name: "Point".into(),
             decorators: vec![fieldwise_deco()],
             type_params: vec![],
@@ -154,13 +159,13 @@ fn parses_struct_with_field_and_method() {
                 keyword_only: None,
                 raises: false,
                 ret: Some(Type::Int),
-                body: vec![Stmt::Return(Some(Expr::Member {
+                body: vec![Stmt::from(StmtKind::Return(Some(Expr::from(ExprKind::Member {
                     object: ident("self"),
                     field: "x".into(),
-                }))],
+                }))))],
             }],
             fieldwise_init: true,
-        }
+        })
     );
 }
 
@@ -168,16 +173,16 @@ fn parses_struct_with_field_and_method() {
 fn parses_member_access_and_method_call() {
     assert_eq!(
         parse_expr("p.x"),
-        Expr::Member { object: ident("p"), field: "x".into() }
+        Expr::from(ExprKind::Member { object: ident("p"), field: "x".into() })
     );
     assert_eq!(
         parse_expr("p.move(1, a)"),
-        Expr::MethodCall {
+        Expr::from(ExprKind::MethodCall {
             object: ident("p"),
             method: "move".into(),
-            args: vec![Expr::Int(1), Expr::Identifier("a".into())],
+            args: vec![Expr::from(ExprKind::Int(1)), Expr::from(ExprKind::Identifier("a".into()))],
             kwargs: vec![],
-        }
+        })
     );
 }
 
@@ -186,10 +191,10 @@ fn member_access_chains_left_to_right() {
     // a.b.c  ==  (a.b).c
     assert_eq!(
         parse_expr("a.b.c"),
-        Expr::Member {
-            object: Box::new(Expr::Member { object: ident("a"), field: "b".into() }),
+        Expr::from(ExprKind::Member {
+            object: bx(ExprKind::Member { object: ident("a"), field: "b".into() }),
             field: "c".into(),
-        }
+        })
     );
 }
 
@@ -198,19 +203,19 @@ fn power_is_right_associative_and_binds_tighter_than_unary_minus() {
     // 2 ** 3 ** 2  ==  2 ** (3 ** 2)
     assert_eq!(
         parse_expr("2 ** 3 ** 2"),
-        Expr::Infix(
+        Expr::from(ExprKind::Infix(
             InfixOp::Pow,
             int(2),
-            Box::new(Expr::Infix(InfixOp::Pow, int(3), int(2))),
-        )
+            bx(ExprKind::Infix(InfixOp::Pow, int(3), int(2))),
+        ))
     );
     // -2 ** 2  ==  -(2 ** 2)
     assert_eq!(
         parse_expr("-2 ** 2"),
-        Expr::Prefix(
+        Expr::from(ExprKind::Prefix(
             PrefixOp::Neg,
-            Box::new(Expr::Infix(InfixOp::Pow, int(2), int(2))),
-        )
+            bx(ExprKind::Infix(InfixOp::Pow, int(2), int(2))),
+        ))
     );
 }
 
@@ -219,15 +224,15 @@ fn floor_div_and_mod_have_product_precedence() {
     // 1 + 6 // 4 % 3  ==  1 + ((6 // 4) % 3)
     assert_eq!(
         parse_expr("1 + 6 // 4 % 3"),
-        Expr::Infix(
+        Expr::from(ExprKind::Infix(
             InfixOp::Add,
             int(1),
-            Box::new(Expr::Infix(
+            bx(ExprKind::Infix(
                 InfixOp::Mod,
-                Box::new(Expr::Infix(InfixOp::FloorDiv, int(6), int(4))),
+                bx(ExprKind::Infix(InfixOp::FloorDiv, int(6), int(4))),
                 int(3),
             )),
-        )
+        ))
     );
 }
 
@@ -236,15 +241,15 @@ fn parses_float_literal_and_division() {
     // 1.0 / 2.0 + 3  ==  (1.0 / 2.0) + 3   ('/' has product precedence)
     assert_eq!(
         parse_expr("1.0 / 2.0 + 3"),
-        Expr::Infix(
+        Expr::from(ExprKind::Infix(
             InfixOp::Add,
-            Box::new(Expr::Infix(
+            bx(ExprKind::Infix(
                 InfixOp::Div,
-                Box::new(Expr::Float(1.0)),
-                Box::new(Expr::Float(2.0)),
+                bx(ExprKind::Float(1.0)),
+                bx(ExprKind::Float(2.0)),
             )),
             int(3),
-        )
+        ))
     );
 }
 
@@ -252,19 +257,19 @@ fn parses_float_literal_and_division() {
 fn parses_uint_and_float64_annotations() {
     assert_eq!(
         parse("var u: UInt = UInt(0)")[0],
-        Stmt::VarDecl {
+        Stmt::from(StmtKind::VarDecl {
             name: "u".into(),
             ty: Some(Type::UInt),
-            value: Expr::Call { name: "UInt".into(), param_args: vec![], args: vec![Expr::Int(0)], kwargs: vec![] },
-        }
+            value: Expr::from(ExprKind::Call { name: "UInt".into(), param_args: vec![], args: vec![Expr::from(ExprKind::Int(0))], kwargs: vec![] }),
+        })
     );
     assert_eq!(
         parse("var f: Float64 = 3.5")[0],
-        Stmt::VarDecl {
+        Stmt::from(StmtKind::VarDecl {
             name: "f".into(),
             ty: Some(Type::Float64),
-            value: Expr::Float(3.5),
-        }
+            value: Expr::from(ExprKind::Float(3.5)),
+        })
     );
 }
 
@@ -272,11 +277,11 @@ fn parses_uint_and_float64_annotations() {
 fn parses_typed_var_decl() {
     assert_eq!(
         parse("var x: Int = 1 + 2")[0],
-        Stmt::VarDecl {
+        Stmt::from(StmtKind::VarDecl {
             name: "x".into(),
             ty: Some(Type::Int),
-            value: Expr::Infix(InfixOp::Add, int(1), int(2)),
-        }
+            value: Expr::from(ExprKind::Infix(InfixOp::Add, int(1), int(2))),
+        })
     );
 }
 
@@ -285,7 +290,7 @@ fn parses_def_signature_and_body() {
     let stmts = parse("def add(a: Int, b: Int) -> Int:\n    return a + b\n");
     assert_eq!(
         stmts[0],
-        Stmt::Def {
+        Stmt::from(StmtKind::Def {
             name: "add".into(),
             decorators: vec![],
             type_params: vec![],
@@ -294,12 +299,12 @@ fn parses_def_signature_and_body() {
             keyword_only: None,
             raises: false,
             ret: Some(Type::Int),
-            body: vec![Stmt::Return(Some(Expr::Infix(
+            body: vec![Stmt::from(StmtKind::Return(Some(Expr::from(ExprKind::Infix(
                 InfixOp::Add,
                 ident("a"),
                 ident("b")
-            )))],
-        }
+            )))))],
+        })
     );
 }
 
@@ -308,13 +313,13 @@ fn parses_if_elif_else() {
     let stmts = parse("if a:\n    pass\nelif b:\n    pass\nelse:\n    pass\n");
     assert_eq!(
         stmts[0],
-        Stmt::If {
+        Stmt::from(StmtKind::If {
             branches: vec![
-                (Expr::Identifier("a".into()), vec![Stmt::Pass]),
-                (Expr::Identifier("b".into()), vec![Stmt::Pass]),
+                (Expr::from(ExprKind::Identifier("a".into())), vec![Stmt::from(StmtKind::Pass)]),
+                (Expr::from(ExprKind::Identifier("b".into())), vec![Stmt::from(StmtKind::Pass)]),
             ],
-            orelse: Some(vec![Stmt::Pass]),
-        }
+            orelse: Some(vec![Stmt::from(StmtKind::Pass)]),
+        })
     );
 }
 
@@ -323,10 +328,10 @@ fn parses_if_without_else() {
     let stmts = parse("if a:\n    pass\n");
     assert_eq!(
         stmts[0],
-        Stmt::If {
-            branches: vec![(Expr::Identifier("a".into()), vec![Stmt::Pass])],
+        Stmt::from(StmtKind::If {
+            branches: vec![(Expr::from(ExprKind::Identifier("a".into())), vec![Stmt::from(StmtKind::Pass)])],
             orelse: None,
-        }
+        })
     );
 }
 
@@ -335,10 +340,10 @@ fn parses_while() {
     let stmts = parse("while a:\n    pass\n");
     assert_eq!(
         stmts[0],
-        Stmt::While {
-            cond: Expr::Identifier("a".into()),
-            body: vec![Stmt::Pass],
-        }
+        Stmt::from(StmtKind::While {
+            cond: Expr::from(ExprKind::Identifier("a".into())),
+            body: vec![Stmt::from(StmtKind::Pass)],
+        })
     );
 }
 
@@ -347,16 +352,16 @@ fn parses_for_over_range() {
     let stmts = parse("for i in range(n):\n    pass\n");
     assert_eq!(
         stmts[0],
-        Stmt::For {
+        Stmt::from(StmtKind::For {
             var: "i".into(),
-            iter: Expr::Call {
+            iter: Expr::from(ExprKind::Call {
                 name: "range".into(),
                 param_args: vec![],
-                args: vec![Expr::Identifier("n".into())],
+                args: vec![Expr::from(ExprKind::Identifier("n".into()))],
                 kwargs: vec![],
-            },
-            body: vec![Stmt::Pass],
-        }
+            }),
+            body: vec![Stmt::from(StmtKind::Pass)],
+        })
     );
 }
 
@@ -364,10 +369,10 @@ fn parses_for_over_range() {
 fn parses_assignment() {
     assert_eq!(
         parse("x = 1 + 2")[0],
-        Stmt::Assign {
+        Stmt::from(StmtKind::Assign {
             name: "x".into(),
-            value: Expr::Infix(InfixOp::Add, int(1), int(2)),
-        }
+            value: Expr::from(ExprKind::Infix(InfixOp::Add, int(1), int(2))),
+        })
     );
 }
 
@@ -382,10 +387,10 @@ fn parses_break_and_continue() {
     let stmts = parse("while a:\n    break\n    continue\n");
     assert_eq!(
         stmts[0],
-        Stmt::While {
-            cond: Expr::Identifier("a".into()),
-            body: vec![Stmt::Break, Stmt::Continue],
-        }
+        Stmt::from(StmtKind::While {
+            cond: Expr::from(ExprKind::Identifier("a".into())),
+            body: vec![Stmt::from(StmtKind::Break), Stmt::from(StmtKind::Continue)],
+        })
     );
 }
 
@@ -398,7 +403,7 @@ fn parses_generic_struct_header_and_self_param_field() {
     );
     assert_eq!(
         stmts[0],
-        Stmt::Struct {
+        Stmt::from(StmtKind::Struct {
             name: "Pair".into(),
             decorators: vec![fieldwise_deco()],
             type_params: vec![TypeParam {
@@ -412,7 +417,7 @@ fn parses_generic_struct_header_and_self_param_field() {
             ],
             methods: vec![],
             fieldwise_init: true,
-        }
+        })
     );
 }
 
@@ -421,7 +426,7 @@ fn parses_generic_def_with_type_param_signature() {
     let stmts = parse("def id[T: AnyType](x: T) -> T:\n    return x\n");
     assert_eq!(
         stmts[0],
-        Stmt::Def {
+        Stmt::from(StmtKind::Def {
             name: "id".into(),
             decorators: vec![],
             type_params: vec![TypeParam { name: "T".into(), bounds: vec!["AnyType".into()] }],
@@ -430,8 +435,8 @@ fn parses_generic_def_with_type_param_signature() {
             keyword_only: None,
             raises: false,
             ret: Some(Type::Named("T".into(), vec![])),
-            body: vec![Stmt::Return(Some(Expr::Identifier("x".into())))],
-        }
+            body: vec![Stmt::from(StmtKind::Return(Some(Expr::from(ExprKind::Identifier("x".into())))))],
+        })
     );
 }
 
@@ -439,8 +444,8 @@ fn parses_generic_def_with_type_param_signature() {
 fn parses_parameterized_type_annotation() {
     // `Pair[Int]` in a `var` annotation carries its type argument.
     let stmts = parse("var p: Pair[Int] = q\n");
-    match &stmts[0] {
-        Stmt::VarDecl { ty: Some(ty), .. } => {
+    match &stmts[0].kind {
+        StmtKind::VarDecl { ty: Some(ty), .. } => {
             assert_eq!(*ty, Type::Named("Pair".into(), vec![ParamArg::Type(Type::Int)]));
         }
         other => panic!("expected a var decl, got {:?}", other),
@@ -463,7 +468,7 @@ fn parses_trait_with_method_requirements() {
     );
     assert_eq!(
         stmts[0],
-        Stmt::Trait {
+        Stmt::from(StmtKind::Trait {
             name: "Quackable".into(),
             refines: vec![],
             methods: vec![
@@ -485,15 +490,15 @@ fn parses_trait_with_method_requirements() {
                 },
             ],
             comptime_members: vec![],
-        }
+        })
     );
 }
 
 #[test]
 fn parses_struct_conformance_list() {
     let stmts = parse("@fieldwise_init\nstruct Duck(Copyable, Quackable):\n    var name: String\n");
-    match &stmts[0] {
-        Stmt::Struct { conforms, .. } => {
+    match &stmts[0].kind {
+        StmtKind::Struct { conforms, .. } => {
             assert_eq!(conforms, &vec!["Copyable".to_string(), "Quackable".to_string()]);
         }
         other => panic!("expected a struct, got {:?}", other),
@@ -504,8 +509,8 @@ fn parses_struct_conformance_list() {
 fn parses_bare_self_type_in_trait_method() {
     // `other: Self` — the `Self` type in a trait requirement.
     let stmts = parse("trait Eq2:\n    def same(self, other: Self) -> Bool:\n        ...\n");
-    match &stmts[0] {
-        Stmt::Trait { methods, .. } => {
+    match &stmts[0].kind {
+        StmtKind::Trait { methods, .. } => {
             assert_eq!(methods[0].params[0].ty, Type::SelfType);
         }
         other => panic!("expected a trait, got {:?}", other),
@@ -516,9 +521,9 @@ fn parses_bare_self_type_in_trait_method() {
 fn parses_trait_default_method_body() {
     // A real method body parses as a default implementation (was a parse error);
     // the checker flags it — see the checker/asset tests.
-    match &parse("trait Q:\n    def q(self) -> Int:\n        return 1\n")[0] {
-        Stmt::Trait { methods, .. } => {
-            assert_eq!(methods[0].default_body, Some(vec![Stmt::Return(Some(Expr::Int(1)))]));
+    match &parse("trait Q:\n    def q(self) -> Int:\n        return 1\n")[0].kind {
+        StmtKind::Trait { methods, .. } => {
+            assert_eq!(methods[0].default_body, Some(vec![Stmt::from(StmtKind::Return(Some(Expr::from(ExprKind::Int(1)))))]));
         }
         other => panic!("expected a trait, got {:?}", other),
     }
@@ -527,8 +532,8 @@ fn parses_trait_default_method_body() {
 #[test]
 fn parses_trait_inheritance_list() {
     // `trait Bird(Animal, Named):` — the refinement (super-trait) list.
-    match &parse("trait Bird(Animal, Named):\n    def fly(self):\n        ...\n")[0] {
-        Stmt::Trait { refines, methods, .. } => {
+    match &parse("trait Bird(Animal, Named):\n    def fly(self):\n        ...\n")[0].kind {
+        StmtKind::Trait { refines, methods, .. } => {
             assert_eq!(refines, &vec!["Animal".to_string(), "Named".to_string()]);
             assert_eq!(methods[0].default_body, None); // `...` is a pure requirement
         }
@@ -539,8 +544,8 @@ fn parses_trait_inheritance_list() {
 #[test]
 fn parses_trait_comptime_member() {
     // `comptime count: Int` — a compile-time member requirement.
-    match &parse("trait Repeater:\n    comptime count: Int\n")[0] {
-        Stmt::Trait { comptime_members, .. } => {
+    match &parse("trait Repeater:\n    comptime count: Int\n")[0].kind {
+        StmtKind::Trait { comptime_members, .. } => {
             assert_eq!(
                 comptime_members,
                 &vec![TraitComptime { name: "count".into(), ty: Type::Int }]
@@ -557,22 +562,22 @@ fn parses_comptime_constant() {
     let stmts = parse("comptime N = 2 * 4\n");
     assert_eq!(
         stmts[0],
-        Stmt::Comptime {
+        Stmt::from(StmtKind::Comptime {
             name: "N".into(),
-            value: Expr::Infix(InfixOp::Mul, int(2), int(4)),
-        }
+            value: Expr::from(ExprKind::Infix(InfixOp::Mul, int(2), int(4))),
+        })
     );
 }
 
 #[test]
 fn parses_comptime_if_with_else() {
     // `comptime if` mirrors a normal `if` (branches + optional else).
-    match &parse("comptime if N > 4:\n    pass\nelse:\n    pass\n")[0] {
-        Stmt::ComptimeIf { branches, orelse } => {
+    match &parse("comptime if N > 4:\n    pass\nelse:\n    pass\n")[0].kind {
+        StmtKind::ComptimeIf { branches, orelse } => {
             assert_eq!(branches.len(), 1);
-            assert_eq!(branches[0].0, Expr::Infix(InfixOp::Gt, ident("N"), int(4)));
-            assert_eq!(branches[0].1, vec![Stmt::Pass]);
-            assert_eq!(orelse, &Some(vec![Stmt::Pass]));
+            assert_eq!(branches[0].0, Expr::from(ExprKind::Infix(InfixOp::Gt, ident("N"), int(4))));
+            assert_eq!(branches[0].1, vec![Stmt::from(StmtKind::Pass)]);
+            assert_eq!(orelse, &Some(vec![Stmt::from(StmtKind::Pass)]));
         }
         other => panic!("expected a ComptimeIf, got {:?}", other),
     }
@@ -582,16 +587,16 @@ fn parses_comptime_if_with_else() {
 fn parses_comptime_for() {
     assert_eq!(
         parse("comptime for i in range(4):\n    pass\n")[0],
-        Stmt::ComptimeFor {
+        Stmt::from(StmtKind::ComptimeFor {
             var: "i".into(),
-            iter: Expr::Call {
+            iter: Expr::from(ExprKind::Call {
                 name: "range".into(),
                 param_args: vec![],
-                args: vec![Expr::Int(4)],
+                args: vec![Expr::from(ExprKind::Int(4))],
                 kwargs: vec![],
-            },
-            body: vec![Stmt::Pass],
-        }
+            }),
+            body: vec![Stmt::from(StmtKind::Pass)],
+        })
     );
 }
 
@@ -599,8 +604,8 @@ fn parses_comptime_for() {
 fn parses_value_parameter_header() {
     // `[size: Int]` parses like any other parameter (the checker classifies it).
     let stmts = parse("@fieldwise_init\nstruct FixedBuffer[size: Int]:\n    var tag: Int\n");
-    match &stmts[0] {
-        Stmt::Struct { type_params, .. } => {
+    match &stmts[0].kind {
+        StmtKind::Struct { type_params, .. } => {
             assert_eq!(
                 type_params,
                 &vec![TypeParam { name: "size".into(), bounds: vec!["Int".into()] }]
@@ -614,24 +619,24 @@ fn parses_value_parameter_header() {
 fn parses_explicit_value_argument_in_annotation_and_call() {
     // Value argument in an annotation: `FixedBuffer[2 + 3]`.
     let stmts = parse("var b: FixedBuffer[2 + 3] = FixedBuffer[5](0)\n");
-    match &stmts[0] {
-        Stmt::VarDecl { ty: Some(ty), value, .. } => {
+    match &stmts[0].kind {
+        StmtKind::VarDecl { ty: Some(ty), value, .. } => {
             assert_eq!(
                 *ty,
                 Type::Named(
                     "FixedBuffer".into(),
-                    vec![ParamArg::Value(Expr::Infix(InfixOp::Add, int(2), int(3)))],
+                    vec![ParamArg::Value(Expr::from(ExprKind::Infix(InfixOp::Add, int(2), int(3))))],
                 )
             );
             // Value argument in a construction: `FixedBuffer[5](0)`.
             assert_eq!(
                 *value,
-                Expr::Call {
+                Expr::from(ExprKind::Call {
                     name: "FixedBuffer".into(),
-                    param_args: vec![ParamArg::Value(Expr::Int(5))],
-                    args: vec![Expr::Int(0)],
+                    param_args: vec![ParamArg::Value(Expr::from(ExprKind::Int(5)))],
+                    args: vec![Expr::from(ExprKind::Int(0))],
                     kwargs: vec![],
-                }
+                })
             );
         }
         other => panic!("expected a var decl, got {:?}", other),
@@ -644,11 +649,11 @@ fn parses_explicit_value_argument_in_annotation_and_call() {
 fn parses_import_dotted_with_alias() {
     assert_eq!(
         parse("import mypackage.mymodule as mm\n")[0],
-        Stmt::Import { path: vec!["mypackage".into(), "mymodule".into()], alias: Some("mm".into()) }
+        Stmt::from(StmtKind::Import { path: vec!["mypackage".into(), "mymodule".into()], alias: Some("mm".into()) })
     );
     assert_eq!(
         parse("import mymodule\n")[0],
-        Stmt::Import { path: vec!["mymodule".into()], alias: None }
+        Stmt::from(StmtKind::Import { path: vec!["mymodule".into()], alias: None })
     );
 }
 
@@ -656,7 +661,7 @@ fn parses_import_dotted_with_alias() {
 fn parses_from_import_names_and_aliases() {
     assert_eq!(
         parse("from mypackage.mymodule import a, b as c, d\n")[0],
-        Stmt::FromImport {
+        Stmt::from(StmtKind::FromImport {
             level: 0,
             path: vec!["mypackage".into(), "mymodule".into()],
             names: ImportNames::Names(vec![
@@ -664,7 +669,7 @@ fn parses_from_import_names_and_aliases() {
                 iname("b", Some("c")),
                 iname("d", None),
             ]),
-        }
+        })
     );
 }
 
@@ -672,7 +677,7 @@ fn parses_from_import_names_and_aliases() {
 fn parses_from_import_wildcard() {
     assert_eq!(
         parse("from mymodule import *\n")[0],
-        Stmt::FromImport { level: 0, path: vec!["mymodule".into()], names: ImportNames::Wildcard }
+        Stmt::from(StmtKind::FromImport { level: 0, path: vec!["mymodule".into()], names: ImportNames::Wildcard })
     );
 }
 
@@ -681,22 +686,22 @@ fn parses_relative_imports() {
     // One dot before a module.
     assert_eq!(
         parse("from .mymodule import X\n")[0],
-        Stmt::FromImport { level: 1, path: vec!["mymodule".into()], names: ImportNames::Names(vec![iname("X", None)]) }
+        Stmt::from(StmtKind::FromImport { level: 1, path: vec!["mymodule".into()], names: ImportNames::Names(vec![iname("X", None)]) })
     );
     // Dots only (`from . import X`).
     assert_eq!(
         parse("from . import X\n")[0],
-        Stmt::FromImport { level: 1, path: vec![], names: ImportNames::Names(vec![iname("X", None)]) }
+        Stmt::from(StmtKind::FromImport { level: 1, path: vec![], names: ImportNames::Names(vec![iname("X", None)]) })
     );
     // Two dots.
     assert_eq!(
         parse("from ..pkg import X\n")[0],
-        Stmt::FromImport { level: 2, path: vec!["pkg".into()], names: ImportNames::Names(vec![iname("X", None)]) }
+        Stmt::from(StmtKind::FromImport { level: 2, path: vec!["pkg".into()], names: ImportNames::Names(vec![iname("X", None)]) })
     );
     // Three dots come through as a single ellipsis token.
     assert_eq!(
         parse("from ...pkg import X\n")[0],
-        Stmt::FromImport { level: 3, path: vec!["pkg".into()], names: ImportNames::Names(vec![iname("X", None)]) }
+        Stmt::from(StmtKind::FromImport { level: 3, path: vec!["pkg".into()], names: ImportNames::Names(vec![iname("X", None)]) })
     );
 }
 
@@ -713,12 +718,12 @@ fn parses_raise() {
     let stmts = parse("raise Error(\"boom\")\n");
     assert_eq!(
         stmts[0],
-        Stmt::Raise(Expr::Call {
+        Stmt::from(StmtKind::Raise(Expr::from(ExprKind::Call {
             name: "Error".into(),
             param_args: vec![],
-            args: vec![Expr::Str("boom".into())],
+            args: vec![Expr::from(ExprKind::Str("boom".into()))],
             kwargs: vec![],
-        })
+        })))
     );
 }
 
@@ -727,12 +732,12 @@ fn parses_try_except_else_finally() {
     let stmts = parse("try:\n    pass\nexcept e:\n    pass\nelse:\n    pass\nfinally:\n    pass\n");
     assert_eq!(
         stmts[0],
-        Stmt::Try {
-            body: vec![Stmt::Pass],
-            except: Some((Some("e".into()), vec![Stmt::Pass])),
-            orelse: Some(vec![Stmt::Pass]),
-            finalbody: Some(vec![Stmt::Pass]),
-        }
+        Stmt::from(StmtKind::Try {
+            body: vec![Stmt::from(StmtKind::Pass)],
+            except: Some((Some("e".into()), vec![Stmt::from(StmtKind::Pass)])),
+            orelse: Some(vec![Stmt::from(StmtKind::Pass)]),
+            finalbody: Some(vec![Stmt::from(StmtKind::Pass)]),
+        })
     );
 }
 
@@ -741,11 +746,11 @@ fn parses_try_with_only_finally_and_bare_except() {
     // A bare `except:` (no name) and finally-only forms.
     assert_eq!(
         parse("try:\n    pass\nfinally:\n    pass\n")[0],
-        Stmt::Try { body: vec![Stmt::Pass], except: None, orelse: None, finalbody: Some(vec![Stmt::Pass]) }
+        Stmt::from(StmtKind::Try { body: vec![Stmt::from(StmtKind::Pass)], except: None, orelse: None, finalbody: Some(vec![Stmt::from(StmtKind::Pass)]) })
     );
     assert_eq!(
         parse("try:\n    pass\nexcept:\n    pass\n")[0],
-        Stmt::Try { body: vec![Stmt::Pass], except: Some((None, vec![Stmt::Pass])), orelse: None, finalbody: None }
+        Stmt::from(StmtKind::Try { body: vec![Stmt::from(StmtKind::Pass)], except: Some((None, vec![Stmt::from(StmtKind::Pass)])), orelse: None, finalbody: None })
     );
 }
 
@@ -755,30 +760,30 @@ fn parses_try_with_only_finally_and_bare_except() {
 fn parses_with_single_item_and_binding() {
     assert_eq!(
         parse("with open(p) as f:\n    pass\n")[0],
-        Stmt::With {
+        Stmt::from(StmtKind::With {
             items: vec![WithItem {
-                context: Expr::Call {
+                context: Expr::from(ExprKind::Call {
                     name: "open".into(),
                     param_args: vec![],
-                    args: vec![Expr::Identifier("p".into())],
+                    args: vec![Expr::from(ExprKind::Identifier("p".into()))],
                     kwargs: vec![],
-                },
+                }),
                 var: Some("f".into()),
             }],
-            body: vec![Stmt::Pass],
-        }
+            body: vec![Stmt::from(StmtKind::Pass)],
+        })
     );
 }
 
 #[test]
 fn parses_with_multiple_items_and_optional_binding() {
     // Comma-separated managers; the `as` binding is optional per item.
-    match &parse("with a() as x, lock():\n    pass\n")[0] {
-        Stmt::With { items, body } => {
+    match &parse("with a() as x, lock():\n    pass\n")[0].kind {
+        StmtKind::With { items, body } => {
             assert_eq!(items.len(), 2);
             assert_eq!(items[0].var, Some("x".into()));
             assert_eq!(items[1].var, None);
-            assert_eq!(body, &vec![Stmt::Pass]);
+            assert_eq!(body, &vec![Stmt::from(StmtKind::Pass)]);
         }
         other => panic!("expected a With statement, got {:?}", other),
     }
@@ -793,23 +798,23 @@ fn rejects_with_missing_name_after_as() {
 #[test]
 fn parses_raises_effect_on_def() {
     // `raises` (with a discarded error type) parses; the def records it.
-    match &parse("def f(x: Int) raises ValidationError -> Int:\n    return x\n")[0] {
-        Stmt::Def { raises, .. } => assert!(*raises),
+    match &parse("def f(x: Int) raises ValidationError -> Int:\n    return x\n")[0].kind {
+        StmtKind::Def { raises, .. } => assert!(*raises),
         other => panic!("expected a def, got {:?}", other),
     }
-    match &parse("def g(x: Int) -> Int:\n    return x\n")[0] {
-        Stmt::Def { raises, .. } => assert!(!*raises),
+    match &parse("def g(x: Int) -> Int:\n    return x\n")[0].kind {
+        StmtKind::Def { raises, .. } => assert!(!*raises),
         other => panic!("expected a def, got {:?}", other),
     }
 }
 
 #[test]
 fn parses_transfer_sigil() {
-    assert_eq!(parse_expr("x^"), Expr::Transfer(ident("x")));
+    assert_eq!(parse_expr("x^"), Expr::from(ExprKind::Transfer(ident("x"))));
     // `raise e^` — transfer inside a raise.
     assert_eq!(
         parse("raise e^\n")[0],
-        Stmt::Raise(Expr::Transfer(ident("e")))
+        Stmt::from(StmtKind::Raise(Expr::from(ExprKind::Transfer(ident("e")))))
     );
 }
 
@@ -824,23 +829,23 @@ fn rejects_try_without_except_or_finally() {
 #[test]
 fn parses_simd_type_and_construction() {
     let stmts = parse("var v: SIMD[DType.int32, 4] = SIMD[DType.int32, 4](1, 2, 3, 4)\n");
-    match &stmts[0] {
-        Stmt::VarDecl { ty: Some(ty), value, .. } => {
+    match &stmts[0].kind {
+        StmtKind::VarDecl { ty: Some(ty), value, .. } => {
             assert_eq!(
                 *ty,
                 Type::Named(
                     "SIMD".into(),
                     vec![
-                        ParamArg::Value(Expr::Member {
+                        ParamArg::Value(Expr::from(ExprKind::Member {
                             object: ident("DType"),
                             field: "int32".into(),
-                        }),
-                        ParamArg::Value(Expr::Int(4)),
+                        })),
+                        ParamArg::Value(Expr::from(ExprKind::Int(4))),
                     ],
                 )
             );
-            match value {
-                Expr::Call { name, param_args, args, .. } => {
+            match &value.kind {
+                ExprKind::Call { name, param_args, args, .. } => {
                     assert_eq!(name, "SIMD");
                     assert_eq!(param_args.len(), 2);
                     assert_eq!(args.len(), 4);
@@ -857,7 +862,7 @@ fn parses_subscript_as_index() {
     // `v[0]` (no following `(`) is a subscript, not a generic call.
     assert_eq!(
         parse_expr("v[0]"),
-        Expr::Index { object: ident("v"), index: int(0) }
+        Expr::from(ExprKind::Index { object: ident("v"), index: int(0) })
     );
 }
 
@@ -865,8 +870,8 @@ fn parses_subscript_as_index() {
 fn parses_nested_type_argument() {
     // A parameterized type as a type argument: `Box[Pair[Int]]`.
     let stmts = parse("var b: Box[Pair[Int]] = q\n");
-    match &stmts[0] {
-        Stmt::VarDecl { ty: Some(ty), .. } => {
+    match &stmts[0].kind {
+        StmtKind::VarDecl { ty: Some(ty), .. } => {
             assert_eq!(
                 *ty,
                 Type::Named(
@@ -888,7 +893,7 @@ fn parses_nested_type_argument() {
 fn parses_list_literal() {
     assert_eq!(
         parse_expr("[1, 2, 3]"),
-        Expr::ListLit(vec![Expr::Int(1), Expr::Int(2), Expr::Int(3)])
+        Expr::from(ExprKind::ListLit(vec![Expr::from(ExprKind::Int(1)), Expr::from(ExprKind::Int(2)), Expr::from(ExprKind::Int(3))]))
     );
 }
 
@@ -904,11 +909,11 @@ fn rejects_empty_list_literal() {
 fn parses_in_and_not_in() {
     assert_eq!(
         parse_expr("x in xs"),
-        Expr::Infix(InfixOp::In, ident("x"), ident("xs"))
+        Expr::from(ExprKind::Infix(InfixOp::In, ident("x"), ident("xs")))
     );
     assert_eq!(
         parse_expr("x not in xs"),
-        Expr::Infix(InfixOp::NotIn, ident("x"), ident("xs"))
+        Expr::from(ExprKind::Infix(InfixOp::NotIn, ident("x"), ident("xs")))
     );
 }
 
@@ -917,11 +922,11 @@ fn in_shares_comparison_precedence() {
     // `1 in xs and 2 in ys` == `(1 in xs) and (2 in ys)`
     assert_eq!(
         parse_expr("1 in xs and 2 in ys"),
-        Expr::Infix(
+        Expr::from(ExprKind::Infix(
             InfixOp::And,
-            Box::new(Expr::Infix(InfixOp::In, int(1), ident("xs"))),
-            Box::new(Expr::Infix(InfixOp::In, int(2), ident("ys"))),
-        )
+            bx(ExprKind::Infix(InfixOp::In, int(1), ident("xs"))),
+            bx(ExprKind::Infix(InfixOp::In, int(2), ident("ys"))),
+        ))
     );
 }
 
@@ -936,21 +941,21 @@ fn rejects_not_without_in() {
 #[test]
 fn parses_mut_self_method() {
     let stmts = parse("@fieldwise_init\nstruct C:\n    var n: Int\n\n    def inc(mut self):\n        self.n = self.n + 1\n");
-    let Stmt::Struct { methods, .. } = &stmts[0] else { panic!("expected a struct") };
+    let StmtKind::Struct { methods, .. } = &stmts[0].kind else { panic!("expected a struct") };
     assert_eq!(methods[0].self_convention, Some(ArgConvention::Mut), "method should be mut self");
 }
 
 #[test]
 fn parses_field_and_nested_place_assignment() {
     // `p.x = e` → SetPlace with a Member place.
-    match &parse("p.x = 1\n")[0] {
-        Stmt::SetPlace { place, .. } => {
-            assert_eq!(*place, Expr::Member { object: ident("p"), field: "x".into() });
+    match &parse("p.x = 1\n")[0].kind {
+        StmtKind::SetPlace { place, .. } => {
+            assert_eq!(*place, Expr::from(ExprKind::Member { object: ident("p"), field: "x".into() }));
         }
         other => panic!("expected SetPlace, got {:?}", other),
     }
     // `xs[i].y = e` is also a place.
-    assert!(matches!(&parse("xs[0].y = 1\n")[0], Stmt::SetPlace { .. }));
+    assert!(matches!(&parse("xs[0].y = 1\n")[0].kind, StmtKind::SetPlace { .. }));
 }
 
 #[test]
@@ -965,10 +970,10 @@ fn rejects_non_place_assignment_target() {
 fn parses_tuple_unpacking() {
     assert_eq!(
         parse("x, y = point\n")[0],
-        Stmt::Unpack {
-            targets: vec![Expr::Identifier("x".into()), Expr::Identifier("y".into())],
-            value: Expr::Identifier("point".into()),
-        }
+        Stmt::from(StmtKind::Unpack {
+            targets: vec![Expr::from(ExprKind::Identifier("x".into())), Expr::from(ExprKind::Identifier("y".into()))],
+            value: Expr::from(ExprKind::Identifier("point".into())),
+        })
     );
 }
 
@@ -976,10 +981,10 @@ fn parses_tuple_unpacking() {
 fn tuple_unpacking_allows_place_targets() {
     // Each target obeys the assignment-target rule: a NAME or a place.
     assert!(matches!(
-        &parse("p.x, xs[0] = t\n")[0],
-        Stmt::Unpack { targets, .. }
-            if matches!(targets[0], Expr::Member { .. })
-                && matches!(targets[1], Expr::Index { .. })
+        &parse("p.x, xs[0] = t\n")[0].kind,
+        StmtKind::Unpack { targets, .. }
+            if matches!(targets[0].kind, ExprKind::Member { .. })
+                && matches!(targets[1].kind, ExprKind::Index { .. })
     ));
 }
 
@@ -988,10 +993,10 @@ fn tuple_unpacking_allows_a_trailing_comma() {
     // `a, = t` is a one-target unpack (a trailing comma terminates the list).
     assert_eq!(
         parse("a, = t\n")[0],
-        Stmt::Unpack {
-            targets: vec![Expr::Identifier("a".into())],
-            value: Expr::Identifier("t".into()),
-        }
+        Stmt::from(StmtKind::Unpack {
+            targets: vec![Expr::from(ExprKind::Identifier("a".into()))],
+            value: Expr::from(ExprKind::Identifier("t".into())),
+        })
     );
 }
 
@@ -1020,12 +1025,12 @@ fn parse_helper_surfaces_errors() {
 fn parses_augmented_assignment() {
     assert_eq!(
         parse("x += 1\n")[0],
-        Stmt::AugAssign { place: Expr::Identifier("x".into()), op: InfixOp::Add, value: Expr::Int(1) }
+        Stmt::from(StmtKind::AugAssign { place: Expr::from(ExprKind::Identifier("x".into())), op: InfixOp::Add, value: Expr::from(ExprKind::Int(1)) })
     );
     // A place target is allowed too.
     assert!(matches!(
-        &parse("xs[0] *= 2\n")[0],
-        Stmt::AugAssign { op: InfixOp::Mul, .. }
+        &parse("xs[0] *= 2\n")[0].kind,
+        StmtKind::AugAssign { op: InfixOp::Mul, .. }
     ));
 }
 
@@ -1041,7 +1046,7 @@ fn rejects_augmented_assignment_to_non_place() {
 fn parses_walrus_as_named_expression() {
     assert_eq!(
         parse_expr("(n := 5)"),
-        Expr::Named { name: "n".into(), value: int(5) }
+        Expr::from(ExprKind::Named { name: "n".into(), value: int(5) })
     );
 }
 
@@ -1050,10 +1055,10 @@ fn walrus_binds_looser_than_comparison() {
     // `(n := a > b)` == `n := (a > b)`
     assert_eq!(
         parse_expr("(n := a > b)"),
-        Expr::Named {
+        Expr::from(ExprKind::Named {
             name: "n".into(),
-            value: Box::new(Expr::Infix(InfixOp::Gt, ident("a"), ident("b"))),
-        }
+            value: bx(ExprKind::Infix(InfixOp::Gt, ident("a"), ident("b"))),
+        })
     );
 }
 
@@ -1069,18 +1074,18 @@ fn rejects_walrus_with_non_name_target() {
 fn parses_inferred_var_decl() {
     assert_eq!(
         parse("var x = 1 + 2")[0],
-        Stmt::VarDecl {
+        Stmt::from(StmtKind::VarDecl {
             name: "x".into(),
             ty: None,
-            value: Expr::Infix(InfixOp::Add, int(1), int(2)),
-        }
+            value: Expr::from(ExprKind::Infix(InfixOp::Add, int(1), int(2))),
+        })
     );
 }
 
 #[test]
 fn annotated_var_still_parses_with_some_ty() {
-    match &parse("var x: Int = 5")[0] {
-        Stmt::VarDecl { ty: Some(Type::Int), .. } => {}
+    match &parse("var x: Int = 5")[0].kind {
+        StmtKind::VarDecl { ty: Some(Type::Int), .. } => {}
         other => panic!("expected an annotated var decl, got {:?}", other),
     }
 }
@@ -1090,19 +1095,19 @@ fn annotated_var_still_parses_with_some_ty() {
 #[test]
 fn parses_tuple_literals_and_grouping() {
     // A comma makes a tuple; a bare `(e)` is grouping (not a 1-tuple).
-    assert_eq!(parse_expr("(1, 2, 3)"), Expr::TupleLit(vec![Expr::Int(1), Expr::Int(2), Expr::Int(3)]));
-    assert_eq!(parse_expr("(1 + 2)"), Expr::Infix(InfixOp::Add, int(1), int(2)));
-    assert_eq!(parse_expr("()"), Expr::TupleLit(vec![]));
+    assert_eq!(parse_expr("(1, 2, 3)"), Expr::from(ExprKind::TupleLit(vec![Expr::from(ExprKind::Int(1)), Expr::from(ExprKind::Int(2)), Expr::from(ExprKind::Int(3))])));
+    assert_eq!(parse_expr("(1 + 2)"), Expr::from(ExprKind::Infix(InfixOp::Add, int(1), int(2))));
+    assert_eq!(parse_expr("()"), Expr::from(ExprKind::TupleLit(vec![])));
     // Trailing comma: `(a,)` is a 1-tuple.
-    assert_eq!(parse_expr("(7,)"), Expr::TupleLit(vec![Expr::Int(7)]));
+    assert_eq!(parse_expr("(7,)"), Expr::from(ExprKind::TupleLit(vec![Expr::from(ExprKind::Int(7))])));
 }
 
 // --- Function-argument forms (parsed; semantics deferred) ---
 
 /// Extract a `def`'s params + marker positions from a one-def program.
 fn def_params(src: &str) -> (Vec<FnParam>, Option<usize>, Option<usize>) {
-    match parse(src).into_iter().next().unwrap() {
-        Stmt::Def { params, positional_only, keyword_only, .. } => {
+    match parse(src).into_iter().next().unwrap().kind {
+        StmtKind::Def { params, positional_only, keyword_only, .. } => {
             (params, positional_only, keyword_only)
         }
         other => panic!("expected a def, got {:?}", other),
@@ -1113,7 +1118,7 @@ fn def_params(src: &str) -> (Vec<FnParam>, Option<usize>, Option<usize>) {
 fn parses_default_argument_value() {
     let (params, _, _) = def_params("def my_pow(base: Int, exp: Int = 2) -> Int:\n    return base\n");
     assert_eq!(params[0].default, None);
-    assert_eq!(params[1].default, Some(Expr::Int(2)));
+    assert_eq!(params[1].default, Some(Expr::from(ExprKind::Int(2))));
     assert_eq!(params[1].kind, ParamKind::Regular);
 }
 
@@ -1180,8 +1185,8 @@ fn parses_ref_self_receiver() {
     let stmts = parse(
         "struct S:\n    def get(ref self) -> Int:\n        return 0\n    def peek(ref[o] self) -> Int:\n        return 0\n",
     );
-    match &stmts[0] {
-        Stmt::Struct { methods, .. } => {
+    match &stmts[0].kind {
+        StmtKind::Struct { methods, .. } => {
             assert_eq!(methods[0].self_convention, Some(ArgConvention::Ref));
             assert!(methods[0].has_self);
             assert_eq!(methods[1].self_convention, Some(ArgConvention::Ref));
@@ -1194,8 +1199,8 @@ fn parses_ref_self_receiver() {
 fn parses_ref_return_type() {
     // `-> ref[origin] T` parses into a `Type::Ref` (origin discarded).
     let stmts = parse("def f(x: Int) -> ref[origin_of(x)] Int:\n    return x\n");
-    match &stmts[0] {
-        Stmt::Def { ret, .. } => {
+    match &stmts[0].kind {
+        StmtKind::Def { ret, .. } => {
             assert_eq!(ret, &Some(Type::Ref(Box::new(Type::Int))));
         }
         other => panic!("expected a def, got {:?}", other),
@@ -1206,25 +1211,25 @@ fn parses_ref_return_type() {
 fn parses_keyword_call_arguments() {
     assert_eq!(
         parse_expr("f(a=1, b=2)"),
-        Expr::Call {
+        Expr::from(ExprKind::Call {
             name: "f".into(),
             param_args: vec![],
             args: vec![],
             kwargs: vec![
-                KwArg { name: "a".into(), value: Expr::Int(1) },
-                KwArg { name: "b".into(), value: Expr::Int(2) },
+                KwArg { name: "a".into(), value: Expr::from(ExprKind::Int(1)) },
+                KwArg { name: "b".into(), value: Expr::from(ExprKind::Int(2)) },
             ],
-        }
+        })
     );
     // Mixed: positional then keyword.
     assert_eq!(
         parse_expr("f(1, b=2)"),
-        Expr::Call {
+        Expr::from(ExprKind::Call {
             name: "f".into(),
             param_args: vec![],
-            args: vec![Expr::Int(1)],
-            kwargs: vec![KwArg { name: "b".into(), value: Expr::Int(2) }],
-        }
+            args: vec![Expr::from(ExprKind::Int(1))],
+            kwargs: vec![KwArg { name: "b".into(), value: Expr::from(ExprKind::Int(2)) }],
+        })
     );
 }
 
@@ -1240,11 +1245,11 @@ fn rejects_positional_after_keyword_argument() {
 fn parses_conditional_expression() {
     assert_eq!(
         parse_expr("a if c else b"),
-        Expr::IfExpr {
+        Expr::from(ExprKind::IfExpr {
             cond: ident("c"),
             then_branch: ident("a"),
             else_branch: ident("b"),
-        }
+        })
     );
 }
 
@@ -1253,15 +1258,15 @@ fn conditional_expression_nests_right() {
     // a if p else b if q else c  ==  a if p else (b if q else c)
     assert_eq!(
         parse_expr("a if p else b if q else c"),
-        Expr::IfExpr {
+        Expr::from(ExprKind::IfExpr {
             cond: ident("p"),
             then_branch: ident("a"),
-            else_branch: Box::new(Expr::IfExpr {
+            else_branch: bx(ExprKind::IfExpr {
                 cond: ident("q"),
                 then_branch: ident("b"),
                 else_branch: ident("c"),
             }),
-        }
+        })
     );
 }
 
@@ -1270,46 +1275,46 @@ fn parses_chained_comparison() {
     // 0 <= i < n  becomes a Compare node with two links.
     assert_eq!(
         parse_expr("0 <= i < n"),
-        Expr::Compare {
+        Expr::from(ExprKind::Compare {
             first: int(0),
             rest: vec![
-                (InfixOp::Le, Expr::Identifier("i".into())),
-                (InfixOp::Lt, Expr::Identifier("n".into())),
+                (InfixOp::Le, Expr::from(ExprKind::Identifier("i".into()))),
+                (InfixOp::Lt, Expr::from(ExprKind::Identifier("n".into()))),
             ],
-        }
+        })
     );
 }
 
 #[test]
 fn single_comparison_stays_infix() {
     // A lone comparison is unchanged (not a Compare node).
-    assert_eq!(parse_expr("a < b"), Expr::Infix(InfixOp::Lt, ident("a"), ident("b")));
-    assert_eq!(parse_expr("a not in b"), Expr::Infix(InfixOp::NotIn, ident("a"), ident("b")));
+    assert_eq!(parse_expr("a < b"), Expr::from(ExprKind::Infix(InfixOp::Lt, ident("a"), ident("b"))));
+    assert_eq!(parse_expr("a not in b"), Expr::from(ExprKind::Infix(InfixOp::NotIn, ident("a"), ident("b"))));
 }
 
 #[test]
 fn parses_slice_subscripts() {
     assert_eq!(
         parse_expr("xs[1:2]"),
-        Expr::Slice {
+        Expr::from(ExprKind::Slice {
             object: ident("xs"),
             lower: Some(int(1)),
             upper: Some(int(2)),
             step: None,
-        }
+        })
     );
     assert_eq!(
         parse_expr("xs[::2]"),
-        Expr::Slice { object: ident("xs"), lower: None, upper: None, step: Some(int(2)) }
+        Expr::from(ExprKind::Slice { object: ident("xs"), lower: None, upper: None, step: Some(int(2)) })
     );
     assert_eq!(
         parse_expr("xs[i:]"),
-        Expr::Slice {
+        Expr::from(ExprKind::Slice {
             object: ident("xs"),
-            lower: Some(Box::new(Expr::Identifier("i".into()))),
+            lower: Some(bx(ExprKind::Identifier("i".into()))),
             upper: None,
             step: None,
-        }
+        })
     );
 }
 
@@ -1317,7 +1322,7 @@ fn parses_slice_subscripts() {
 fn plain_index_is_not_a_slice() {
     assert_eq!(
         parse_expr("xs[i]"),
-        Expr::Index { object: ident("xs"), index: ident("i") }
+        Expr::from(ExprKind::Index { object: ident("xs"), index: ident("i") })
     );
 }
 
@@ -1326,18 +1331,18 @@ fn plain_index_is_not_a_slice() {
 #[test]
 fn parses_general_decorators_on_def() {
     let stmts = parse("@staticmethod\n@a.b(1, k=2)\ndef f(x: Int) -> Int:\n    return x\n");
-    let Stmt::Def { decorators, .. } = &stmts[0] else { panic!("expected a def") };
+    let StmtKind::Def { decorators, .. } = &stmts[0].kind else { panic!("expected a def") };
     assert_eq!(decorators.len(), 2);
     assert_eq!(decorators[0].path, vec!["staticmethod".to_string()]);
     assert_eq!(decorators[1].path, vec!["a".to_string(), "b".to_string()]);
-    assert_eq!(decorators[1].args, vec![Expr::Int(1)]);
-    assert_eq!(decorators[1].kwargs, vec![KwArg { name: "k".into(), value: Expr::Int(2) }]);
+    assert_eq!(decorators[1].args, vec![Expr::from(ExprKind::Int(1))]);
+    assert_eq!(decorators[1].kwargs, vec![KwArg { name: "k".into(), value: Expr::from(ExprKind::Int(2)) }]);
 }
 
 #[test]
 fn parses_decorator_on_struct_and_keeps_fieldwise_init() {
     let stmts = parse("@value\n@fieldwise_init\nstruct P:\n    var x: Int\n");
-    let Stmt::Struct { decorators, fieldwise_init, .. } = &stmts[0] else {
+    let StmtKind::Struct { decorators, fieldwise_init, .. } = &stmts[0].kind else {
         panic!("expected a struct")
     };
     assert_eq!(decorators.len(), 2);
@@ -1349,7 +1354,7 @@ fn parses_receiver_conventions_and_static_methods() {
     let stmts = parse(
         "struct S:\n    var n: Int\n    def a(mut self):\n        pass\n    def b(out self):\n        pass\n    @staticmethod\n    def c(x: Int) -> Int:\n        return x\n",
     );
-    let Stmt::Struct { methods, .. } = &stmts[0] else { panic!("expected a struct") };
+    let StmtKind::Struct { methods, .. } = &stmts[0].kind else { panic!("expected a struct") };
     assert_eq!(methods[0].self_convention, Some(ArgConvention::Mut));
     assert!(methods[0].has_self);
     assert_eq!(methods[1].self_convention, Some(ArgConvention::Out));
@@ -1363,7 +1368,7 @@ fn parses_dunder_method_names() {
     let stmts = parse(
         "@fieldwise_init\nstruct V:\n    var x: Int\n    def __eq__(self, o: V) -> Bool:\n        return self.x == o.x\n",
     );
-    let Stmt::Struct { methods, .. } = &stmts[0] else { panic!("expected a struct") };
+    let StmtKind::Struct { methods, .. } = &stmts[0].kind else { panic!("expected a struct") };
     assert_eq!(methods[0].name, "__eq__");
 }
 
@@ -1371,8 +1376,8 @@ fn parses_dunder_method_names() {
 
 /// Extract the annotated type from `var NAME: TYPE = expr`.
 fn var_anno_type(src: &str) -> Type {
-    match parse(src).into_iter().next().unwrap() {
-        Stmt::VarDecl { ty: Some(ty), .. } => ty,
+    match parse(src).into_iter().next().unwrap().kind {
+        StmtKind::VarDecl { ty: Some(ty), .. } => ty,
         other => panic!("expected an annotated var decl, got {:?}", other),
     }
 }
@@ -1423,7 +1428,7 @@ fn function_type_return_nests() {
 fn parses_function_typed_parameter() {
     // A function-typed parameter (with `thin`) parses.
     let stmts = parse("def apply(cb: def(Int) thin -> Int, x: Int) -> Int:\n    return x\n");
-    let Stmt::Def { params, .. } = &stmts[0] else { panic!("expected a def") };
+    let StmtKind::Def { params, .. } = &stmts[0].kind else { panic!("expected a def") };
     assert_eq!(
         params[0].ty,
         Type::Func { params: vec![Type::Int], ret: Box::new(Type::Int), thin: true, raises: false }
@@ -1434,22 +1439,43 @@ fn parses_function_typed_parameter() {
 fn parses_tstring_interpolations_into_subexprs() {
     assert_eq!(
         parse_expr("t\"n={n}, x={a + b}\""),
-        Expr::TString {
+        Expr::from(ExprKind::TString {
             parts: vec![
                 TStringPart::Literal("n=".into()),
                 TStringPart::Expr(ident("n")),
                 TStringPart::Literal(", x=".into()),
-                TStringPart::Expr(Box::new(Expr::Infix(InfixOp::Add, ident("a"), ident("b")))),
+                TStringPart::Expr(bx(ExprKind::Infix(InfixOp::Add, ident("a"), ident("b")))),
             ],
             raw: false,
-        }
+        })
     );
     // A raw t-string sets `raw`.
     assert_eq!(
         parse_expr("rt\"v={x}\""),
-        Expr::TString {
+        Expr::from(ExprKind::TString {
             parts: vec![TStringPart::Literal("v=".into()), TStringPart::Expr(ident("x"))],
             raw: true,
-        }
+        })
     );
+}
+
+#[test]
+fn expr_and_stmt_nodes_carry_real_source_spans() {
+    // Both `Expr` and `Stmt` are stamped with byte ranges that slice their exact
+    // source text (spans are metadata — equality above ignores them, so this is
+    // the only place they're asserted).
+    let src = "var total: Int = 40 + 2\n";
+    let stmts = parse(src);
+    // The statement spans the whole `var ... = 40 + 2`.
+    assert_eq!(&src[stmts[0].span.0..stmts[0].span.1], "var total: Int = 40 + 2");
+    // Its initializer expression spans just `40 + 2`.
+    let StmtKind::VarDecl { value, .. } = &stmts[0].kind else {
+        panic!("expected a var decl")
+    };
+    assert_eq!(&src[value.span.0..value.span.1], "40 + 2");
+
+    // A second statement's span starts after the first (not at 0 / DUMMY_SPAN).
+    let two = parse("pass\nreturn x\n");
+    assert_eq!(&"pass\nreturn x\n"[two[1].span.0..two[1].span.1], "return x");
+    assert_ne!(two[1].span, (0, 0));
 }

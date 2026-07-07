@@ -1,16 +1,117 @@
 # mojo-lite
 
-A Rust (edition 2024, no external dependencies) front-end for a growing **strict
-subset of the [Mojo](https://www.modular.com/mojo) language**. It aims to accept only
-valid Mojo syntax — it may *restrict* the language (e.g. requiring some annotations
-Mojo would infer) but never invents syntax Mojo lacks.
+mojo-lite is a small Rust implementation of a strict, experimental subset of
+[Mojo](https://www.modular.com/mojo). It is not Mojo, and it is not trying to
+compete with Mojo's production compiler. It is a compact compiler playground for
+studying the shape of a modern systems programming language: Python-like syntax,
+value semantics, ownership transfer, borrowing, ASAP destruction, generics, and a
+register-VM execution model.
 
-The pipeline runs in stages — **lex → parse → check** — and many constructs are parsed
-and grammar-documented well before they are fully modeled: the parser accepts the broad
-Mojo surface, while the checker flags the parts whose semantics are still deferred. The
-surface syntax is documented in [`grammar.md`](grammar.md).
+Think of it as a tiny cousin of Rust, C++, and of course, Mojo, striving for at least syntactic compatibility with Mojo. High performance is not a current goal. The current goal is making
+ownership, moves, destructors, borrowing, and control-flow lowering visible in a
+codebase small enough to hold in your head.
 
-## Build & test
+## Status
+
+mojo-lite currently has:
+
+- a lexer and Pratt parser for a useful slice of Mojo-like syntax
+- a type checker with structs, functions, methods, traits, generics, value
+  parameters, builtin scalar types, lists, tuples, strings, and SIMD-like values
+- a HIR control-flow graph lowering pass
+- a MIR/A-normal lowering pass with explicit registers, variables, places, moves,
+  drops, calls, method calls, exceptions, and loop control
+- ownership analysis for `^` moves, including use-after-move, conditional moves,
+  double moves, partial field moves, and reinitialization
+- borrow checking for ordinary call arguments, including mutable/shared aliasing
+  checks and place-sensitive field borrowing
+- liveness-driven ASAP destruction via `__del__(deinit self)`
+- a register VM backend used as the runtime implementation
+- fixture-based tests for accepted programs, parse errors, type errors, runtime
+  errors, ownership errors, and ownership-ok cases
+
+This project is intentionally small and direct. Rust plus `petgraph` is the core
+tooling; the compiler is not wrapped in a large framework.
+
+## Not Mojo Proper
+
+mojo-lite is much smaller than real Mojo. Its gaps fall into two different
+categories: language subset work that belongs on the near-term roadmap, and
+larger infrastructure work that may or may not ever be part of this project.
+
+Language deficiencies:
+
+- no full `comptime` implementation yet; syntax and limited integer value
+  parameters exist, but real compile-time execution is planned next
+- no package/module system beyond parsed imports
+- no real Mojo standard library
+- no full trait system; only a limited structural subset is checked
+- no full parametric polymorphism story comparable to Mojo
+- no complete effect system
+- no full exception/unwind model beyond the VM-supported subset
+- no complete lifetime model comparable to Rust's borrow checker
+- limited nested-function/capture support; Mojo does not support general escaping
+  closures, so this is about matching Mojo's supported non-escaping patterns, not
+  adding a Python-style closure system
+- no complete support for every Mojo expression form, such as slices,
+  t-strings, tuple unpacking, `with`, chained comparisons, or ternary
+  expressions
+
+Infrastructure and backend deficiencies:
+
+- no deep MLIR integration
+- no real GPU backend, GPU programming model, kernels, device memory model, or
+  accelerator codegen
+- no production optimizer
+- no general MLIR dialect lowering, ABI integration, or native object generation
+- no Python interop
+- no real SIMD lowering to machine vector instructions; SIMD values are modeled
+  at the VM value level
+- no performance claim beyond "useful as a reference implementation"
+
+The language deficiencies are the ones most likely to shrink as mojo-lite grows.
+The infrastructure deficiencies are larger bets: interesting, but not necessary
+for mojo-lite to be useful as a model implementation of ownership, borrowing,
+ASAP destruction, and a register-VM compiler.
+
+The goal is honest subset semantics. A feature is usually parsed before it is
+fully supported, and unsupported semantics should fail cleanly instead of
+producing a wrong answer.
+
+## Pipeline
+
+The compiler pipeline is:
+
+```text
+source
+  -> lex
+  -> parse
+  -> check
+  -> HIR CFG
+  -> MIR
+  -> ownership / borrow / liveness analysis
+  -> drop elaboration
+  -> register VM
+```
+
+The major source directories are:
+
+- `src/lexer.rs`, `src/parser.rs`, `src/ast.rs`: tokens, AST, Pratt parser, and
+  statement parsing
+- `src/checker.rs`: type checking, trait checks, call matching, value-parameter
+  checks, and borrow checks
+- `src/hir/mod.rs`: control-flow graph lowering
+- `src/mir/mod.rs`: flattened register/place MIR
+- `src/analysis/mod.rs`: move analysis, liveness, and drop insertion
+- `src/backend/vm.rs`: register VM execution
+- `src/runtime/mod.rs`: shared runtime values and builtin operations
+- `assets/`: executable and negative test fixtures
+- `tests/`: parser, checker, HIR, MIR, VM, ownership, and drop tests
+
+The surface syntax is documented in [`grammar.md`](grammar.md). The VM transition
+history and design notes live in [`vm-compiler-plan.md`](vm-compiler-plan.md).
+
+## Build And Test
 
 ```sh
 cargo build
@@ -18,42 +119,207 @@ cargo test
 cargo clippy --all-targets
 ```
 
-## Usage
-
-The CLI runs a single stage of the pipeline over your source:
-
-```sh
-cargo run -- <mode> [FILE]
-```
-
-| Mode    | What it does                                             |
-| ------- | -------------------------------------------------------- |
-| `lex`   | print the token stream, one token per line               |
-| `parse` | print the parsed AST (pretty-printed)                    |
-| `check` | lex + parse + type-check; report `ok` or the first error |
-| `run`   | run the program and print its output                     |
-
-Running with no arguments (`cargo run`) executes a built-in demo.
-
-### Reading files
-
-`FILE` is optional. Pass a path to read a source file, or use `-` (or omit it) to read
-from standard input:
+If your local environment sets `RUSTC_WRAPPER` to a tool that cannot write its
+cache, this form is useful:
 
 ```sh
-cargo run -- parse assets/ok/arithmetic.mojo   # read a file
-cargo run -- check -                            # read from stdin
-echo 'var x: Int = 1' | cargo run -- lex        # pipe source in
+env RUSTC_WRAPPER= cargo test
+env RUSTC_WRAPPER= cargo clippy --all-targets
 ```
 
-A stage error is written to standard error with a non-zero exit code, so the modes
-compose in scripts.
+## CLI Usage
 
-## Library
+Run a compiler stage over a file:
 
-The stages are also available as library functions:
+```sh
+cargo run -- <command> [FILE]
+```
+
+Commands:
+
+| Command | What it does |
+| ------- | ------------ |
+| `lex` | print the token stream, one token per line |
+| `parse` | print the parsed AST |
+| `check` | parse, type-check, and run ownership analysis |
+| `own` | parse, type-check, and report ownership diagnostics |
+| `run` | compile and execute on the register VM |
+
+`FILE` is optional. Use a path, `-`, or omit it to read from standard input:
+
+```sh
+cargo run -- parse assets/ok/arithmetic.mojo
+cargo run -- check -
+echo 'var x: Int = 1' | cargo run -- lex
+cargo run -- run assets/ok/list_and_struct.mojo
+```
+
+Stage errors are written to standard error with a non-zero exit code, so the CLI
+is usable in scripts.
+
+## Writing Programs
+
+mojo-lite executes top-level statements. If a file defines a zero-argument
+`main()`, `main()` is called after top-level evaluation.
+
+Example:
+
+```mojo
+@fieldwise_init
+struct Counter:
+    var n: Int
+
+    def bump(mut self, by: Int):
+        self.n += by
+
+def main():
+    var c: Counter = Counter(10)
+    c.bump(5)
+    print(c.n)
+```
+
+Run it:
+
+```sh
+cargo run -- run path/to/file.mojo
+```
+
+## Fixture Workflow
+
+The easiest way to add coverage is to place `.mojo` files under `assets/`.
+
+The test harness walks these folders:
+
+| Folder | Meaning |
+| ------ | ------- |
+| `assets/ok/` | program should lex, parse, check, pass ownership analysis, and run |
+| `assets/parse_error/` | lexer or parser should reject it |
+| `assets/type_error/` | parser accepts it, checker rejects it |
+| `assets/runtime_error/` | checker accepts it, VM reports a runtime error |
+| `assets/ownership_ok/` | ownership analysis should accept it |
+| `assets/ownership_error/` | ownership analysis should reject it |
+
+So adding an accepted language example is usually just:
+
+```sh
+$EDITOR assets/ok/my_feature.mojo
+cargo test
+cargo run -- run assets/ok/my_feature.mojo
+```
+
+Negative fixtures can pin part of the expected error with a top comment:
+
+```mojo
+# expect: use after move
+@fieldwise_init
+struct Box:
+    var n: Int
+
+def main():
+    var a: Box = Box(1)
+    var b: Box = a^
+    print(a.n)
+```
+
+See [`assets/README.md`](assets/README.md) for the fixture rules.
+
+## Ownership, Borrowing, And Destruction
+
+mojo-lite treats `^` as an ownership transfer. Moving a value leaves the source
+uninitialized. Later use is rejected by analysis before the VM runs.
+
+Examples of modeled behavior:
+
+- `var b = a^` transfers ownership from `a` to `b`
+- moving the same value twice is rejected
+- moving a value on one branch and using it after the merge is rejected
+- partial field moves are tracked separately from sibling fields
+- assigning back to a moved field reinitializes it
+- `owned` parameters consume their argument
+- `mut` and `ref` parameters borrow and can write back through caller places
+- conflicting borrows in the same call are rejected
+- values with `__del__(deinit self)` are destroyed at last use, not scope end
+- moved values are dropped once, at their new owner
+- structs drop their own destructor first, then fields in reverse declaration
+  order
+
+This is the part of the project that makes it useful as a model implementation:
+it shows how systems-language semantics can be enforced as compiler analyses
+over a small MIR instead of being scattered through an interpreter.
+
+## Comptime
+
+`comptime` is the next major planned area.
+
+Today, mojo-lite parses comptime syntax and supports a narrow integer constant
+evaluator for value parameters such as SIMD widths and simple value-parameterized
+types. It does not yet implement full compile-time execution.
+
+Missing pieces include:
+
+- `comptime if` branch selection
+- `comptime for` unrolling
+- compile-time function execution
+- type values as compile-time values
+- trait comptime members
+- generated declarations
+- a real compile-time value environment distinct from runtime locals
+
+## Development Direction
+
+Near-term work:
+
+- implement real `comptime`
+- continue tightening Mojo compatibility within the chosen subset
+- improve diagnostics and source spans
+- expand trait and generic support
+- document the architecture in `docs/architecture.md`
+- add more VM disassembly/introspection tools
+- keep growing fixture coverage from real Mojo examples
+
+Longer-term possible directions:
+
+- an assembler/disassembler for the register VM
+- bytecode serialization
+- a second backend once MIR semantics are solid
+- richer borrow checking and lifetime diagnostics
+- better specialization of value-parameterized code
+- an explicitly documented unsafe/unsupported boundary
+
+MLIR and GPU support remain north-star topics, not current implementation
+features.
+
+## Library API
+
+The frontend stages are also available as library functions:
 
 ```rust
-let tokens = mojo_lite::lex(source)?;   // Vec<Token>
-let ast    = mojo_lite::parse(source)?; // Vec<Stmt>
+let tokens = mojo_lite::lex(source)?;
+let ast = mojo_lite::parse(source)?;
+mojo_lite::check(&ast)?;
+mojo_lite::check_ownership(&ast)?;
 ```
+
+For execution, use the backend trait:
+
+```rust
+use mojo_lite::{BackendKind, Backend};
+
+let program = mojo_lite::parse(source)?;
+mojo_lite::check(&program)?;
+mojo_lite::check_ownership(&program)?;
+
+let mut backend = BackendKind::Vm.make();
+backend.run(&program)?;
+println!("{}", backend.output());
+```
+
+## Philosophy
+
+mojo-lite is deliberately modest. It should be small enough to read, strict
+enough to be meaningful, and honest enough to say "unsupported" when a feature
+has not earned its semantics yet.
+
+The aspiration is a clear reference implementation of a Mojo-like systems
+language core: lexing, parsing, checking, MIR lowering, ownership, borrowing,
+ASAP destruction, and execution on a transparent register VM.
