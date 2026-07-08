@@ -90,6 +90,17 @@ pub enum TypeError {
     },
     /// Constructing a struct that has no constructor (no `@fieldwise_init`).
     NoConstructor(String),
+    /// An `out self` lifecycle method (`__init__`/`__copyinit__`/`__moveinit__`)
+    /// leaves a declared field unassigned (definite initialization: every field must
+    /// be initialized in the body).
+    UninitializedField {
+        struct_name: String,
+        method: String,
+        field: String,
+    },
+    /// A struct declares both `@fieldwise_init` and a hand-written `__init__`
+    /// (each defines a constructor — the decorator *generates* `__init__`).
+    ConflictingConstructor(String),
     /// A type-parameter bound named a trait that is not a recognized built-in
     /// (user-defined traits are not supported yet).
     UnknownTrait(String),
@@ -307,6 +318,18 @@ impl fmt::Display for TypeError {
                     f,
                     "struct '{}' has no constructor (add @fieldwise_init)",
                     name
+                )
+            }
+            TypeError::UninitializedField { struct_name, method, field } => {
+                write!(
+                    f,
+                    "'{struct_name}.{method}' does not initialize field '{field}'"
+                )
+            }
+            TypeError::ConflictingConstructor(name) => {
+                write!(
+                    f,
+                    "struct '{name}' has both @fieldwise_init and a hand-written __init__"
                 )
             }
             TypeError::UnknownTrait(name) => {

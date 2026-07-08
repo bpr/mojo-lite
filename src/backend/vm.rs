@@ -36,7 +36,7 @@ use crate::runtime::{
     promote_numeric_elems, read_simd_lane, simd_from_values, value_as_index,
 };
 use crate::hir::VarId;
-use crate::mir::{Const, MirBlock, MirInstr, MirPlace, MirProgram, MirTerm, Proj};
+use crate::mir::{Const, MirBlock, MirInstr, MirPlace, MirProgram, MirTerm, Proj, Reg};
 use std::collections::HashMap;
 
 /// The control-flow outcome of executing an instruction or a `try` sub-region.
@@ -98,6 +98,12 @@ impl Prog {
     fn index_of(&self, name: &str) -> Option<usize> {
         self.mir.functions.iter().position(|(n, _)| n == name)
     }
+
+    /// Whether any function name ends with `suffix` (e.g. `.__copyinit__`) — used to
+    /// decide whether copy/move needs the lifecycle-method path at all.
+    fn defines(&self, suffix: &str) -> bool {
+        self.mir.functions.iter().any(|(n, _)| n.ends_with(suffix))
+    }
 }
 
 #[derive(Default)]
@@ -106,11 +112,49 @@ pub struct VmBackend {
     /// The final top-level (`__toplevel__`) variable values, by name — the global
     /// bindings, captured after execution for the CLI `run` dump and tests.
     bindings: Vec<(String, Value)>,
+    /// The type-erased heap arena backing `UnsafePointer[T]` (Option B): an
+    /// `UnsafePointer(base)` is an offset into this `Vec`. `alloc(n)` appends `n`
+    /// slots and returns the base; `free()` is a no-op (a model-level arena that
+    /// never reclaims — fine for a bounded interpreter).
+    heap: Vec<Value>,
+    /// Whether the program defines any `__copyinit__` / `__moveinit__`. When false,
+    /// a value copy/move is the default (a raw deep `Clone` / a slot transfer) — the
+    /// common fast path, keeping non-lifecycle programs unchanged. When true, a
+    /// struct copy/move routes through its lifecycle method (`clone_value`/
+    /// `move_value`), giving a pointer-owning type correct value semantics.
+    has_copyinit: bool,
+    has_moveinit: bool,
 }
 
 impl VmBackend {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Allocate `n` uninitialized (`None`) slots in the heap arena, returning a
+    /// pointer to the base. A negative/absurd count is a runtime error.
+    fn heap_alloc(&mut self, n: i64) -> Result<Value, RuntimeError> {
+        if n < 0 {
+            return Err(RuntimeError::TypeError(
+                "vm: UnsafePointer.alloc count must be non-negative".to_string(),
+            ));
+        }
+        let base = self.heap.len();
+        self.heap.resize(base + n as usize, Value::None);
+        Ok(Value::Pointer(base))
+    }
+
+    /// Resolve `base + offset` to an arena index, bounds-checking against the arena
+    /// (a truly out-of-arena access errors rather than panicking; an in-arena but
+    /// past-allocation access is permitted — `UnsafePointer` is unchecked).
+    fn heap_index(&self, base: usize, offset: i64) -> Result<usize, RuntimeError> {
+        let i = base as i64 + offset;
+        if i < 0 || i as usize >= self.heap.len() {
+            return Err(RuntimeError::TypeError(
+                "vm: UnsafePointer access out of bounds".to_string(),
+            ));
+        }
+        Ok(i as usize)
     }
 
     /// Execute one function, returning its return value plus the final variable
@@ -203,6 +247,225 @@ impl VmBackend {
         Ok(self.call_frame(prog, fidx, args, value_params)?.0)
     }
 
+    /// Call a struct dunder `Type.method(args…)` (`args[0]` is the receiver). The
+    /// checker has already verified the method exists and its argument types, so a
+    /// missing method here is a compiler bug (reported cleanly rather than a panic).
+    fn call_dunder(
+        &mut self,
+        prog: &Prog,
+        sname: &str,
+        method: &str,
+        args: Vec<Value>,
+    ) -> Result<Value, RuntimeError> {
+        let fname = format!("{sname}.{method}");
+        let idx = prog.index_of(&fname).ok_or_else(|| {
+            RuntimeError::Unsupported(format!("vm: struct '{sname}' has no method '{method}'"))
+        })?;
+        self.call_function(prog, idx, args, &[])
+    }
+
+    /// Apply a binary operator, dispatching to a user struct's **dunder** when an
+    /// operand is a struct (operator overloading): `a OP b` → `a.__op__(b)` for a
+    /// struct left operand; `x in c` / `x not in c` → `c.__contains__(x)` (negated
+    /// for `not in`). Primitive operands go through the shared `apply_infix`.
+    fn apply_binop(
+        &mut self,
+        prog: &Prog,
+        op: crate::ast::InfixOp,
+        l: Value,
+        r: Value,
+    ) -> Result<Value, RuntimeError> {
+        use crate::ast::InfixOp;
+        if matches!(op, InfixOp::In | InfixOp::NotIn) {
+            if let Value::Struct { name, .. } = &r {
+                let sname = name.clone();
+                let res = self.call_dunder(prog, &sname, "__contains__", vec![r, l])?;
+                return Ok(match (op, res) {
+                    (InfixOp::NotIn, Value::Bool(b)) => Value::Bool(!b),
+                    (_, v) => v,
+                });
+            }
+        } else if let Value::Struct { name, .. } = &l
+            && let Some(dunder) = op.dunder()
+        {
+            let sname = name.clone();
+            return self.call_dunder(prog, &sname, dunder, vec![l, r]);
+        }
+        apply_infix(op, l, r)
+    }
+
+    /// `c[i] = value` where the container `c` (at `parent`) is a user struct →
+    /// `c.__setitem__(i, value)`, writing the mutated `self` back to `c`'s place.
+    /// The MIR has already evaluated the receiver root, index, and RHS exactly once;
+    /// this clones the receiver, runs the `mut self` method, and stores its resulting
+    /// `self` (frame slot 0) back — the same write-back a normal `mut self` call uses.
+    fn store_index_dunder(
+        &mut self,
+        prog: &Prog,
+        parent: &MirPlace,
+        idx: Value,
+        value: Value,
+        regs: &[Value],
+        vars: &mut [Value],
+    ) -> Result<(), RuntimeError> {
+        let recv = nav_mut(vars, regs, parent)?.clone();
+        let Value::Struct { name, .. } = &recv else {
+            unreachable!("store_index_dunder is only called on a struct container");
+        };
+        let fname = format!("{name}.__setitem__");
+        let fidx = prog.index_of(&fname).ok_or_else(|| {
+            RuntimeError::Unsupported(format!("vm: struct '{name}' has no method '__setitem__'"))
+        })?;
+        let (_, frame_vars) = self.call_frame(prog, fidx, vec![recv, idx, value], &[])?;
+        *nav_mut(vars, regs, parent)? = frame_vars.into_iter().next().unwrap_or(Value::None);
+        Ok(())
+    }
+
+    /// Construct a struct via a hand-written `def __init__(out self, …)`: build an
+    /// uninitialized `self` skeleton (fields = `None` placeholders, value parameters
+    /// reified), run `__init__(self, args…)`, and return the initialized `self`
+    /// (frame slot 0). The checker's definite-init check guarantees every field is
+    /// assigned in the body, so no placeholder survives. Arguments are coerced to the
+    /// `__init__` parameter types by the normal call ABI.
+    fn construct_via_init(
+        &mut self,
+        prog: &Prog,
+        name: &str,
+        args: Vec<Value>,
+        param_vals: &[Option<Value>],
+    ) -> Result<Value, RuntimeError> {
+        let def = &prog.structs[name];
+        let fields = def
+            .fields
+            .iter()
+            .map(|(f, _)| (f.clone(), Value::None))
+            .collect();
+        let value_params = def
+            .param_decls
+            .iter()
+            .zip(param_vals)
+            .filter(|((_, is_value), _)| *is_value)
+            .map(|((pname, _), val)| (pname.clone(), val.clone().unwrap_or(Value::None)))
+            .collect();
+        let skeleton = Value::Struct { name: name.to_string(), fields, value_params };
+        let fidx = prog
+            .index_of(&format!("{name}.__init__"))
+            .expect("caller checked __init__ is present");
+        let mut call_args = Vec::with_capacity(args.len() + 1);
+        call_args.push(skeleton);
+        call_args.extend(args);
+        let (_, frame_vars) = self.call_frame(prog, fidx, call_args, &[])?;
+        Ok(frame_vars.into_iter().next().unwrap_or(Value::None))
+    }
+
+    /// Produce a semantically-correct **copy** of a value (a `UseVar { Copy }` read,
+    /// a by-value argument, or a return). For a struct that defines `__copyinit__`,
+    /// run it (so a pointer-owning type deep-copies its storage instead of aliasing);
+    /// for a struct without one, recurse into fields (a nested field may define it);
+    /// `List`/`Tuple` recurse element-wise. Only reached when `has_copyinit` is set.
+    fn clone_value(&mut self, prog: &Prog, v: &Value) -> Result<Value, RuntimeError> {
+        match v {
+            Value::Struct { name, fields, value_params } => {
+                if let Some(fidx) = prog.index_of(&format!("{name}.__copyinit__")) {
+                    let skeleton = self.struct_skeleton(prog, name, value_params.clone());
+                    let (_, frame_vars) =
+                        self.call_frame(prog, fidx, vec![skeleton, v.clone()], &[])?;
+                    Ok(frame_vars.into_iter().next().unwrap_or(Value::None))
+                } else {
+                    let mut new_fields = Vec::with_capacity(fields.len());
+                    for (f, fv) in fields {
+                        new_fields.push((f.clone(), self.clone_value(prog, fv)?));
+                    }
+                    Ok(Value::Struct {
+                        name: name.clone(),
+                        fields: new_fields,
+                        value_params: value_params.clone(),
+                    })
+                }
+            }
+            Value::List(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for it in items {
+                    out.push(self.clone_value(prog, it)?);
+                }
+                Ok(Value::List(out))
+            }
+            Value::Tuple(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for it in items {
+                    out.push(self.clone_value(prog, it)?);
+                }
+                Ok(Value::Tuple(out))
+            }
+            // Scalars alias/copy trivially; a bare pointer copy *aliases* (correct —
+            // deep-copy is the owning struct's `__copyinit__` job, handled above).
+            other => Ok(other.clone()),
+        }
+    }
+
+    /// Relocate a **moved** value (a `UseVar { Move }` / `^` transfer). For a struct
+    /// that defines `__moveinit__`, run it (`existing` is consumed); otherwise the
+    /// default move — the value's slot was already tombstoned — suffices. Only
+    /// reached when `has_moveinit` is set.
+    fn move_value(&mut self, prog: &Prog, v: Value) -> Result<Value, RuntimeError> {
+        if let Value::Struct { name, value_params, .. } = &v
+            && let Some(fidx) = prog.index_of(&format!("{name}.__moveinit__"))
+        {
+            let skeleton = self.struct_skeleton(prog, name, value_params.clone());
+            let (_, frame_vars) = self.call_frame(prog, fidx, vec![skeleton, v], &[])?;
+            return Ok(frame_vars.into_iter().next().unwrap_or(Value::None));
+        }
+        Ok(v)
+    }
+
+    /// Build an uninitialized `self` skeleton for `name` (fields = `None`), carrying
+    /// the given reified `value_params`. Shared by `__init__`/`__copyinit__`/
+    /// `__moveinit__` construction.
+    fn struct_skeleton(
+        &self,
+        prog: &Prog,
+        name: &str,
+        value_params: Vec<(String, Value)>,
+    ) -> Value {
+        let fields = prog.structs[name]
+            .fields
+            .iter()
+            .map(|(f, _)| (f.clone(), Value::None))
+            .collect();
+        Value::Struct { name: name.to_string(), fields, value_params }
+    }
+
+    /// If `place` is `c[i]` with `c` a user struct or an `UnsafePointer`, read it via
+    /// `c.__getitem__(i)` / the heap arena — the read half of `c[i] += e` on such a
+    /// container (a projected `LoadPlace`). Returns `None` otherwise, so the caller
+    /// uses `load_place` (a slot read or a SIMD-lane read).
+    fn load_index_dunder(
+        &mut self,
+        prog: &Prog,
+        place: &MirPlace,
+        regs: &[Value],
+        vars: &mut [Value],
+    ) -> Result<Option<Value>, RuntimeError> {
+        let Some((Proj::Index(ireg), prefix)) = place.proj.split_last() else {
+            return Ok(None);
+        };
+        let parent = MirPlace { root: place.root, proj: prefix.to_vec() };
+        let recv = nav_mut(vars, regs, &parent)?.clone();
+        match &recv {
+            Value::Struct { name, .. } => {
+                let sname = name.clone();
+                let idx = regs[ireg.0 as usize].clone();
+                Ok(Some(self.call_dunder(prog, &sname, "__getitem__", vec![recv, idx])?))
+            }
+            Value::Pointer(b) => {
+                let off = value_as_index(&regs[ireg.0 as usize])?;
+                let i = self.heap_index(*b, off)?;
+                Ok(Some(self.heap[i].clone()))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Call a free function that has `mut`/`ref` parameters, writing each one's
     /// final value back to the caller's argument place (`arg_places`). This is the
     /// runtime half of reference parameters — the tree-walker's `eval_call`
@@ -274,7 +537,17 @@ impl VmBackend {
                 // ownership analysis rejects this statically, so this only fires on a
                 // compiler bug).
                 let value = match mode {
-                    crate::mir::UseMode::Move => std::mem::replace(&mut vars[slot], Value::Moved),
+                    crate::mir::UseMode::Move => {
+                        let moved = std::mem::replace(&mut vars[slot], Value::Moved);
+                        if self.has_moveinit {
+                            self.move_value(prog, moved)?
+                        } else {
+                            moved
+                        }
+                    }
+                    // A copy runs `__copyinit__` (deep copy) for a lifecycle type;
+                    // otherwise a plain deep `Clone`.
+                    _ if self.has_copyinit => self.clone_value(prog, &vars[slot])?,
                     _ => vars[slot].clone(),
                 };
                 if matches!(value, Value::Moved) {
@@ -298,7 +571,7 @@ impl VmBackend {
             MirInstr::BinOp { op, dest, a, b } => {
                 let l = regs[a.0 as usize].clone();
                 let r = regs[b.0 as usize].clone();
-                regs[dest.0 as usize] = apply_infix(*op, l, r)?;
+                regs[dest.0 as usize] = self.apply_binop(prog, *op, l, r)?;
             }
             MirInstr::Call { dest, func, args, kwargs, arg_places, param_arg_regs } => {
                 let argv: Vec<Value> = args.iter().map(|r| regs[r.0 as usize].clone()).collect();
@@ -334,8 +607,39 @@ impl VmBackend {
                 regs[dest.0 as usize] = get_field(&regs[base.0 as usize], field)?;
             }
             MirInstr::Index { dest, base, index } => {
-                let idx = value_as_index(&regs[index.0 as usize])?;
-                regs[dest.0 as usize] = index_value(&regs[base.0 as usize], idx)?;
+                match &regs[base.0 as usize] {
+                    // A user struct with `__getitem__` is subscriptable: `c[i]` →
+                    // `c.__getitem__(i)` (index passed as-is, not coerced to Int).
+                    Value::Struct { name, .. } => {
+                        let sname = name.clone();
+                        let recv = regs[base.0 as usize].clone();
+                        let idx = regs[index.0 as usize].clone();
+                        regs[dest.0 as usize] =
+                            self.call_dunder(prog, &sname, "__getitem__", vec![recv, idx])?;
+                    }
+                    // `ptr[i]` loads the pointee at `base + i` from the heap arena.
+                    Value::Pointer(b) => {
+                        let b = *b;
+                        let off = value_as_index(&regs[index.0 as usize])?;
+                        let i = self.heap_index(b, off)?;
+                        regs[dest.0 as usize] = self.heap[i].clone();
+                    }
+                    _ => {
+                        let idx = value_as_index(&regs[index.0 as usize])?;
+                        regs[dest.0 as usize] = index_value(&regs[base.0 as usize], idx)?;
+                    }
+                }
+            }
+            MirInstr::Slice { dest, object, lower, upper, step } => {
+                let bound = |b: &Option<Reg>| -> Result<Option<i64>, RuntimeError> {
+                    match b {
+                        Some(r) => Ok(Some(value_as_index(&regs[r.0 as usize])?)),
+                        None => Ok(None),
+                    }
+                };
+                let (lo, hi, st) = (bound(lower)?, bound(upper)?, bound(step)?);
+                regs[dest.0 as usize] =
+                    crate::runtime::slice_value(&regs[object.0 as usize], lo, hi, st)?;
             }
             MirInstr::MakeList { dest, elems } => {
                 let mut items: Vec<Value> = elems.iter().map(|r| regs[r.0 as usize].clone()).collect();
@@ -352,10 +656,45 @@ impl VmBackend {
             }
             MirInstr::Store { place, src } => {
                 let v = regs[src.0 as usize].clone();
-                store_place(vars, regs, place, v)?;
+                // Classify a projected `container[i] = v` by the container's runtime
+                // type: a heap pointer writes the arena; a user struct dispatches
+                // `__setitem__` (mut-self write-back); anything else (a slot / List /
+                // SIMD lane) goes through `store_place`.
+                enum StoreTarget {
+                    Ptr(usize, Reg),
+                    StructIdx(MirPlace, Reg),
+                }
+                let target = if let Some((Proj::Index(ireg), prefix)) = place.proj.split_last() {
+                    let parent = MirPlace { root: place.root, proj: prefix.to_vec() };
+                    let ireg = *ireg;
+                    match nav_mut(vars, regs, &parent)? {
+                        Value::Pointer(b) => Some(StoreTarget::Ptr(*b, ireg)),
+                        Value::Struct { .. } => Some(StoreTarget::StructIdx(parent, ireg)),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                match target {
+                    Some(StoreTarget::Ptr(base, ireg)) => {
+                        let off = value_as_index(&regs[ireg.0 as usize])?;
+                        let i = self.heap_index(base, off)?;
+                        self.heap[i] = v;
+                    }
+                    Some(StoreTarget::StructIdx(parent, ireg)) => {
+                        let idx = regs[ireg.0 as usize].clone();
+                        self.store_index_dunder(prog, &parent, idx, v, regs, vars)?;
+                    }
+                    None => store_place(vars, regs, place, v)?,
+                }
             }
             MirInstr::LoadPlace { dest, place } => {
-                regs[dest.0 as usize] = load_place(vars, regs, place)?;
+                // The read half of `c[i] += e` on a user struct goes through
+                // `c.__getitem__(i)`; any other place reads its slot / SIMD lane.
+                regs[dest.0 as usize] = match self.load_index_dunder(prog, place, regs, vars)? {
+                    Some(v) => v,
+                    None => load_place(vars, regs, place)?,
+                };
             }
             MirInstr::MovePlace { dest, place } => {
                 // A partial move `p.a^`: transfer the field's value out, leaving a
@@ -373,37 +712,80 @@ impl VmBackend {
             }
             // Iterator protocol (`for`). Range: counter with step direction. List:
             // consume the (copied) list from the front, preserving order.
+            MirInstr::GetIter { iter } => {
+                // Normalize a user struct iterable to its iterator (`c.__iter__()`);
+                // a built-in `range`/`List` iterates in place (no-op).
+                let slot = *iter as usize;
+                if let Value::Struct { name, .. } = &vars[slot] {
+                    let sname = name.clone();
+                    let it = vars[slot].clone();
+                    vars[slot] = self.call_dunder(prog, &sname, "__iter__", vec![it])?;
+                }
+            }
             MirInstr::HasNext { dest, iter } => {
-                let has = match &vars[*iter as usize] {
-                    Value::Range { start, stop, step } => {
-                        (*step > 0 && start < stop) || (*step < 0 && start > stop)
+                let slot = *iter as usize;
+                // A struct iterator reports remaining length via `__len__` (bounded
+                // iteration): more elements iff `len(it) > 0`.
+                let has = if let Value::Struct { name, .. } = &vars[slot] {
+                    let sname = name.clone();
+                    let it = vars[slot].clone();
+                    match self.call_dunder(prog, &sname, "__len__", vec![it])? {
+                        Value::Int(n) => n > 0,
+                        other => {
+                            return Err(RuntimeError::TypeError(format!(
+                                "vm: iterator __len__ must return Int, got {}",
+                                crate::runtime::type_name(&other)
+                            )));
+                        }
                     }
-                    Value::List(items) => !items.is_empty(),
-                    other => {
-                        return Err(RuntimeError::Unsupported(format!(
-                            "vm: `for` iterator must be a range or List, got {}",
-                            crate::runtime::type_name(other)
-                        )));
+                } else {
+                    match &vars[slot] {
+                        Value::Range { start, stop, step } => {
+                            (*step > 0 && start < stop) || (*step < 0 && start > stop)
+                        }
+                        Value::List(items) => !items.is_empty(),
+                        other => {
+                            return Err(RuntimeError::Unsupported(format!(
+                                "vm: `for` iterator must be a range, List, or a type with \
+                                 __iter__, got {}",
+                                crate::runtime::type_name(other)
+                            )));
+                        }
                     }
                 };
                 regs[dest.0 as usize] = Value::Bool(has);
             }
             MirInstr::Next { dest, iter } => {
                 let slot = *iter as usize;
-                match &mut vars[slot] {
-                    Value::Range { start, stop, step } => {
-                        let (cur, st, sp) = (*start, *stop, *step);
-                        regs[dest.0 as usize] = Value::Int(cur);
-                        vars[slot] = Value::Range { start: cur + sp, stop: st, step: sp };
-                    }
-                    Value::List(items) => {
-                        regs[dest.0 as usize] = items.remove(0);
-                    }
-                    ref other => {
-                        return Err(RuntimeError::Unsupported(format!(
-                            "vm: `for` iterator must be a range or List, got {}",
-                            crate::runtime::type_name(other)
-                        )));
+                // A struct iterator advances via `__next__(mut self)`: the element is
+                // the return value, and the advanced iterator (frame slot 0) is
+                // written back into the iterator variable.
+                if let Value::Struct { name, .. } = &vars[slot] {
+                    let sname = name.clone();
+                    let it = vars[slot].clone();
+                    let fidx = prog.index_of(&format!("{sname}.__next__")).ok_or_else(|| {
+                        RuntimeError::Unsupported(format!("vm: struct '{sname}' has no '__next__'"))
+                    })?;
+                    let (ret, frame_vars) = self.call_frame(prog, fidx, vec![it], &[])?;
+                    vars[slot] = frame_vars.into_iter().next().unwrap_or(Value::None);
+                    regs[dest.0 as usize] = ret;
+                } else {
+                    match &mut vars[slot] {
+                        Value::Range { start, stop, step } => {
+                            let (cur, st, sp) = (*start, *stop, *step);
+                            regs[dest.0 as usize] = Value::Int(cur);
+                            vars[slot] = Value::Range { start: cur + sp, stop: st, step: sp };
+                        }
+                        Value::List(items) => {
+                            regs[dest.0 as usize] = items.remove(0);
+                        }
+                        ref other => {
+                            return Err(RuntimeError::Unsupported(format!(
+                                "vm: `for` iterator must be a range, List, or a type with \
+                                 __iter__, got {}",
+                                crate::runtime::type_name(other)
+                            )));
+                        }
                     }
                 }
             }
@@ -593,6 +975,14 @@ impl VmBackend {
                 }
             }
             Value::List(items) => list_query(items, method, &args),
+            // `UnsafePointer` methods: `free()` releases the allocation (a no-op in
+            // the arena model — the arena never reclaims).
+            Value::Pointer(_) => match method {
+                "free" => Ok(Value::None),
+                _ => Err(RuntimeError::Unsupported(format!(
+                    "vm: UnsafePointer has no method '{method}'"
+                ))),
+            },
             Value::Struct { name, .. } => {
                 let fname = format!("{name}.{method}");
                 let fidx = prog.index_of(&fname).ok_or_else(|| {
@@ -696,14 +1086,25 @@ impl VmBackend {
                 self.output.push('\n');
                 Ok(Value::None)
             }
-            "String" => Ok(Value::Str(
-                args.first().map(|v| v.to_string()).unwrap_or_default(),
-            )),
-            "len" => match args.first() {
+            // `String(c)` on a user struct dispatches to `c.__str__()`; a primitive
+            // value uses its `Display`.
+            "String" => match args.into_iter().next() {
+                Some(Value::Struct { name, fields, value_params }) => {
+                    let recv = Value::Struct { name: name.clone(), fields, value_params };
+                    self.call_dunder(prog, &name, "__str__", vec![recv])
+                }
+                other => Ok(Value::Str(other.map(|v| v.to_string()).unwrap_or_default())),
+            },
+            // `len(c)` on a user struct dispatches to `c.__len__()`.
+            "len" => match args.into_iter().next() {
                 Some(Value::Str(s)) => Ok(Value::Int(s.len() as i64)),
                 Some(Value::List(items)) => Ok(Value::Int(items.len() as i64)),
+                Some(Value::Struct { name, fields, value_params }) => {
+                    let recv = Value::Struct { name: name.clone(), fields, value_params };
+                    self.call_dunder(prog, &name, "__len__", vec![recv])
+                }
                 _ => Err(RuntimeError::Unsupported(
-                    "vm: len supports String and List so far".into(),
+                    "vm: len supports String, List, and structs with __len__".into(),
                 )),
             },
             "range" => build_range(&args),
@@ -729,9 +1130,29 @@ impl VmBackend {
                 promote_numeric_elems(&mut items);
                 Ok(Value::List(items))
             }
-            // A struct constructor (`Point(3, 4)`).
+            // `UnsafePointer[T].alloc(n)` — reserve `n` slots in the heap arena and
+            // return a pointer to the base (the element type is erased).
+            "UnsafePointer.alloc" => {
+                let n = match arg1(name, args)? {
+                    Value::Int(n) => n,
+                    other => {
+                        return Err(RuntimeError::TypeError(format!(
+                            "vm: UnsafePointer.alloc expects an Int, got {}",
+                            crate::runtime::type_name(&other)
+                        )));
+                    }
+                };
+                self.heap_alloc(n)
+            }
+            // A struct constructor. A hand-written `def __init__(out self, …)`
+            // takes precedence over the fieldwise constructor: build an uninitialized
+            // `self` skeleton, run `__init__`, and return the initialized value.
             _ if prog.structs.contains_key(name) => {
-                construct(&prog.structs[name], name, args, param_vals)
+                if prog.index_of(&format!("{name}.__init__")).is_some() {
+                    self.construct_via_init(prog, name, args, param_vals)
+                } else {
+                    construct(&prog.structs[name], name, args, param_vals)
+                }
             }
             _ => match prog.index_of(name) {
                 Some(idx) => {
@@ -774,6 +1195,10 @@ impl Backend for VmBackend {
             structs: build_structs(program),
             sigs: build_sigs(program),
         };
+        // A program with no lifecycle copy/move methods uses the default (raw clone /
+        // slot transfer) path everywhere — so non-lifecycle programs are unchanged.
+        self.has_copyinit = prog.defines(".__copyinit__");
+        self.has_moveinit = prog.defines(".__moveinit__");
         // Run the top-level block, then `main()`. Capture the top-level frame's
         // user variables (skipping synthetic `$…` temporaries) as the global
         // bindings.

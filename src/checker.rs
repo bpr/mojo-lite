@@ -97,6 +97,10 @@ enum Ty {
     List(Box<Ty>),
     /// The built-in `Tuple[T1, …, Tn]` — a fixed-size heterogeneous value type.
     Tuple(Vec<Ty>),
+    /// The built-in `UnsafePointer[T]` — a low-level, *aliasing* handle to
+    /// contiguous storage of element type `T` (unlike value types, copying a
+    /// pointer shares the storage). Allocated with `UnsafePointer[T].alloc(n)`.
+    Pointer(Box<Ty>),
 }
 
 /// A declared compile-time parameter of a generic `struct`/`def`, classified from
@@ -201,6 +205,7 @@ impl fmt::Display for Ty {
             }
             Ty::Simd { dtype, width } => write!(f, "SIMD[DType.{}, {}]", dtype.name(), width),
             Ty::Error => write!(f, "Error"),
+            Ty::Pointer(elem) => write!(f, "UnsafePointer[{}]", elem),
             Ty::List(elem) => write!(f, "List[{}]", elem),
             Ty::Tuple(elems) => {
                 write!(f, "Tuple[")?;
@@ -333,6 +338,9 @@ impl Checker {
                 if name == "Tuple" {
                     return self.tuple_type(args);
                 }
+                if name == "UnsafePointer" {
+                    return self.pointer_type(args);
+                }
                 let decls = match self.structs.get(name) {
                     Some(info) => info.decls.clone(),
                     None => return Err(TypeError::UnknownType(name.clone())),
@@ -441,6 +449,31 @@ impl Checker {
                 context: "List element type".to_string(),
             }),
         }
+    }
+
+    /// Resolve `UnsafePointer[T]` from its single type argument.
+    fn pointer_type(&self, args: &[crate::ast::ParamArg]) -> Result<Ty, TypeError> {
+        if args.len() != 1 {
+            return Err(TypeError::WrongTypeArgCount {
+                name: "UnsafePointer".to_string(),
+                expected: 1,
+                got: args.len(),
+            });
+        }
+        let elem = match &args[0] {
+            crate::ast::ParamArg::Type(t) => self.ty_from_anno(t)?,
+            crate::ast::ParamArg::Value(Expr { kind: ExprKind::Identifier(id), .. }) => {
+                self.ty_from_anno(&Type::Named(id.clone(), vec![]))?
+            }
+            crate::ast::ParamArg::Value(_) => {
+                return Err(TypeError::TypeMismatch {
+                    expected: "a type".to_string(),
+                    found: "a value".to_string(),
+                    context: "UnsafePointer element type".to_string(),
+                });
+            }
+        };
+        Ok(Ty::Pointer(Box::new(elem)))
     }
 
     /// Resolve `Tuple[T1, …, Tn]` from its type arguments (each a type).
@@ -658,7 +691,58 @@ impl Checker {
             // Tuple unpacking `a, b = t` is parsed and grammar-documented, but its
             // semantics (splitting a tuple across targets) are deferred — flagged
             // here, consistent with the other syntax-first parse-only constructs.
-            StmtKind::Unpack { .. } => Err(TypeError::Unsupported("tuple unpacking".to_string())),
+            // Tuple unpacking `a, b = t`: `t` must be a tuple of matching arity; each
+            // target (a NAME or a place) receives the corresponding element type. A
+            // NAME follows the assignment rules (re-assign if in scope, else a
+            // var-less introduction).
+            StmtKind::Unpack { targets, value } => {
+                let vt = self.infer(value)?;
+                let Ty::Tuple(elems) = &vt else {
+                    return Err(TypeError::TypeMismatch {
+                        expected: "a tuple".to_string(),
+                        found: vt.to_string(),
+                        context: "tuple unpacking".to_string(),
+                    });
+                };
+                if elems.len() != targets.len() {
+                    return Err(TypeError::TypeMismatch {
+                        expected: format!("a {}-element tuple", targets.len()),
+                        found: vt.to_string(),
+                        context: "tuple unpacking".to_string(),
+                    });
+                }
+                let elems = elems.clone();
+                for (target, elem) in targets.iter().zip(&elems) {
+                    match &target.kind {
+                        ExprKind::Identifier(name) => match self.lookup(name).cloned() {
+                            Some(existing) => {
+                                if !coerces(elem, &existing) {
+                                    return Err(TypeError::TypeMismatch {
+                                        expected: existing.to_string(),
+                                        found: elem.to_string(),
+                                        context: format!("unpacking into '{name}'"),
+                                    });
+                                }
+                            }
+                            None => {
+                                let declared = self.inferred_binding_ty(elem, name)?;
+                                self.declare(name, declared)?;
+                            }
+                        },
+                        _ => {
+                            let target_ty = self.check_place(target)?;
+                            if !coerces(elem, &target_ty) {
+                                return Err(TypeError::TypeMismatch {
+                                    expected: target_ty.to_string(),
+                                    found: elem.to_string(),
+                                    context: "unpacking into a place".to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
 
             // `with` blocks parse, but the context-manager (`__enter__`/`__exit__`)
             // protocol is deferred — flagged, like the other parse-only constructs.
@@ -869,10 +953,21 @@ impl Checker {
             } => self.check_trait(name, refines, methods, comptime_members),
 
             StmtKind::Comptime { name, value } => {
-                let v = self.eval_ct(value)?;
-                self.comptimes.insert(name.clone(), v);
-                // Also an ordinary `Int` binding, so it is usable at runtime.
-                self.declare(name, Ty::Int)
+                // A comptime `Int` is recorded (for value-parameter use) and bound as
+                // `Int`. A richer comptime value (tuple/list/string) the `Int` folder
+                // can't evaluate is still an ordinary binding — the elaborator has
+                // already consumed it for any `comptime for`/`comptime if`.
+                match self.eval_ct(value) {
+                    Ok(v) => {
+                        self.comptimes.insert(name.clone(), v);
+                        self.declare(name, Ty::Int)
+                    }
+                    Err(_) => {
+                        let ty = self.infer(value)?;
+                        let declared = self.inferred_binding_ty(&ty, name)?;
+                        self.declare(name, declared)
+                    }
+                }
             }
 
             // `comptime if` / `comptime for` parse and are grammar-documented, but
@@ -946,13 +1041,16 @@ impl Checker {
 
             StmtKind::For { var, iter, body } => {
                 // The loop variable's type comes from the iterable: `Int` for a
-                // `range`, or the element type for a `List`.
-                let elem_ty = match self.infer(iter)? {
+                // `range`, the element type for a `List`, or — for a user struct —
+                // the element type of its `__iter__()` iterator (`__next__`'s return).
+                let iter_ty = self.infer(iter)?;
+                let elem_ty = match &iter_ty {
                     Ty::Range => Ty::Int,
-                    Ty::List(elem) => *elem,
+                    Ty::List(elem) => (**elem).clone(),
+                    Ty::Struct(..) => self.iter_element_ty(&iter_ty)?,
                     other => {
                         return Err(TypeError::TypeMismatch {
-                            expected: "range or List".to_string(),
+                            expected: "range, List, or a type with __iter__".to_string(),
                             found: other.to_string(),
                             context: "for-loop iterable".to_string(),
                         });
@@ -1256,6 +1354,16 @@ impl Checker {
                 return Err(TypeError::Redeclaration(m.name.clone()));
             }
         }
+        // `@fieldwise_init` and a hand-written `__init__` both define a constructor;
+        // having both is a conflict (the decorator *generates* `__init__`).
+        if fieldwise_init
+            && self
+                .structs
+                .get(name)
+                .is_some_and(|i| i.methods.contains_key("__init__"))
+        {
+            return Err(TypeError::ConflictingConstructor(name.to_string()));
+        }
         // Verify each declared conformance now that the method signatures exist.
         for tr in conforms {
             self.verify_conformance(name, tr, self_ty)?;
@@ -1324,16 +1432,23 @@ impl Checker {
                 "a method without a 'self' receiver (@staticmethod)".to_string(),
             ));
         }
-        // `out self` (hand-written `__init__`) and `ref self` (parametric-mutability
-        // references) need init / reference semantics that aren't modeled yet, so
+        // `out self` initializes the receiver: it is allowed on the **`__init__`**
+        // lifecycle method (a hand-written constructor), where `self`'s fields are
+        // assigned in the body. `ref self` (parametric-mutability references), and
+        // `out self` on any other method, still need semantics we don't model, so
         // they stay flagged. A plain `self`, `read self`, `mut self`, or **`owned
-        // self`** (a consuming method — notably `__del__(owned self)`) is fine:
-        // `owned self` binds the receiver by value (like `read self`), and its
-        // consuming meaning is handled by the ownership analysis / ASAP drops.
-        if matches!(
-            m.self_convention,
-            Some(crate::ast::ArgConvention::Out | crate::ast::ArgConvention::Ref)
-        ) {
+        // self`** (a consuming method — notably `__del__(owned self)`) is fine.
+        // `out self` initializes the receiver — allowed on the lifecycle methods
+        // `__init__` (constructor), `__copyinit__` (copy), and `__moveinit__` (move),
+        // whose bodies assign `self`'s fields. `ref self`, and `out self` elsewhere,
+        // stay flagged.
+        let is_lifecycle_init =
+            matches!(m.name.as_str(), "__init__" | "__copyinit__" | "__moveinit__");
+        let out_init = matches!(m.self_convention, Some(crate::ast::ArgConvention::Out))
+            && is_lifecycle_init;
+        if matches!(m.self_convention, Some(crate::ast::ArgConvention::Ref))
+            || (matches!(m.self_convention, Some(crate::ast::ArgConvention::Out)) && !out_init)
+        {
             return Err(TypeError::Unsupported(
                 "'out self' / 'ref self' receiver".to_string(),
             ));
@@ -1343,9 +1458,40 @@ impl Checker {
             None => Ty::None,
         };
         self.scopes.push(HashMap::new());
-        let result = self.bind_and_check_method(self_ty, m, &ret_ty);
+        let mut result = self.bind_and_check_method(self_ty, m, &ret_ty);
+        // Definite initialization (conservative, flow-insensitive first pass): an
+        // `__init__` must assign every declared field somewhere in its body, so a
+        // constructed value has no unset fields. Path-sensitive DI (assign exactly
+        // once, before any read, on every path) is left for a later refinement.
+        if result.is_ok() && out_init && let Ty::Struct(sname, _) = self_ty {
+            result = self.check_definite_init(sname, &m.name, &m.body);
+        }
         self.scopes.pop();
         result
+    }
+
+    /// Verify an `out self` lifecycle method (`method`) assigns every declared field
+    /// of `sname` (flow-insensitive: assigned *somewhere*). Reports the first missing
+    /// field.
+    fn check_definite_init(
+        &self,
+        sname: &str,
+        method: &str,
+        body: &[Stmt],
+    ) -> Result<(), TypeError> {
+        let mut assigned = std::collections::HashSet::new();
+        collect_self_assigned_fields(body, &mut assigned);
+        let info = self.structs.get(sname).expect("struct types are registered");
+        for (field, _) in &info.fields {
+            if !assigned.contains(field.as_str()) {
+                return Err(TypeError::UninitializedField {
+                    struct_name: sname.to_string(),
+                    method: method.to_string(),
+                    field: field.clone(),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn bind_and_check_method(
@@ -1359,10 +1505,14 @@ impl Checker {
             let pty = self.ty_from_anno(&p.ty)?;
             self.declare(&p.name, pty)?;
         }
-        // `self` is writable only in a `mut self` method (restored after).
+        // `self` is writable in a `mut self` method, or an `out self` `__init__`
+        // (which assigns its fields). Restored after the body.
         let saved = std::mem::replace(
             &mut self.self_mutable,
-            matches!(m.self_convention, Some(crate::ast::ArgConvention::Mut)),
+            matches!(
+                m.self_convention,
+                Some(crate::ast::ArgConvention::Mut | crate::ast::ArgConvention::Out)
+            ),
         );
         let result = self.check_block(&m.body, Some(ret_ty), false);
         self.self_mutable = saved;
@@ -1386,6 +1536,41 @@ impl Checker {
             .structs
             .get(name)
             .expect("caller checked it is a struct");
+        // A hand-written `def __init__(out self, …)` is the constructor: check the
+        // call arguments against its parameters (the `self` receiver is implicit).
+        // Takes precedence over `@fieldwise_init`. On a **generic** struct, the type
+        // parameters are solved by unifying `__init__`'s parameter types against the
+        // argument types — exactly as the fieldwise path unifies field types.
+        if let Some(sig) = info.methods.get("__init__") {
+            let params = sig.params.clone();
+            let decls = info.decls.clone();
+            if params.len() != args.len() {
+                return Err(TypeError::ArityMismatch {
+                    name: name.to_string(),
+                    expected: params.len(),
+                    got: args.len(),
+                });
+            }
+            let arg_tys = args
+                .iter()
+                .map(|a| self.infer(a))
+                .collect::<Result<Vec<_>, _>>()?;
+            let (subst, tyargs) =
+                self.resolve_use_params(name, &decls, param_args, &params, &arg_tys)?;
+            for (i, (aty, pty)) in arg_tys.iter().zip(&params).enumerate() {
+                let expected = substitute(pty, &subst);
+                if !coerces(aty, &expected) {
+                    return Err(TypeError::TypeMismatch {
+                        expected: expected.to_string(),
+                        found: aty.to_string(),
+                        context: format!("argument {} to '{}.__init__'", i + 1, name),
+                    });
+                }
+                // A constructor argument is bound into `self` by value — consuming.
+                self.check_consuming(&args[i], aty, &format!("argument {} to '{}'", i + 1, name))?;
+            }
+            return Ok(Ty::Struct(name.to_string(), tyargs));
+        }
         if !info.fieldwise_init {
             return Err(TypeError::NoConstructor(name.to_string()));
         }
@@ -1517,14 +1702,18 @@ impl Checker {
     /// Whether a value of this type may be **copied** (implicitly duplicated). Mojo
     /// is move-only by default: scalars and the built-in value types are Copyable,
     /// (see the free [`is_place_expr`] used by [`Self::check_consuming`]).
-    /// but a `struct` is Copyable only if it declares `Copyable` conformance, and a
-    /// type parameter only if bounded by `Copyable`.
+    /// but a `struct` is Copyable only if it declares `Copyable` conformance **or
+    /// defines `__copyinit__`** (which is what makes a type copyable), and a type
+    /// parameter only if bounded by `Copyable`.
     fn is_copyable(&self, ty: &Ty) -> bool {
         match ty {
             Ty::Struct(name, _) => self
                 .structs
                 .get(name)
-                .map(|s| s.conforms.iter().any(|c| c == "Copyable"))
+                .map(|s| {
+                    s.conforms.iter().any(|c| c == "Copyable")
+                        || s.methods.contains_key("__copyinit__")
+                })
                 .unwrap_or(true),
             Ty::Param { bounds, .. } => bounds.iter().any(|b| b == "Copyable"),
             // Scalars, `String`, `List`/`Tuple`/`Simd`/`Range`, `Error`, closures,
@@ -1643,13 +1832,81 @@ impl Checker {
             // unsupported). The name is not bound here — `infer` is read-only — so
             // a program that *uses* the walrus-bound name later won't type-check.
             ExprKind::Named { value, .. } => self.infer(value),
-            // Parsed, semantics deferred (syntax-first phase).
-            ExprKind::IfExpr { .. } => {
-                Err(TypeError::Unsupported("conditional expression".to_string()))
+            // Ternary `a if cond else b`: `cond` must be `Bool`; the branches must
+            // have a common type (the result type).
+            ExprKind::IfExpr {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                let ct = self.infer(cond)?;
+                if ct != Ty::Bool {
+                    return Err(TypeError::TypeMismatch {
+                        expected: "Bool".to_string(),
+                        found: ct.to_string(),
+                        context: "conditional-expression condition".to_string(),
+                    });
+                }
+                let tt = self.infer(then_branch)?;
+                let et = self.infer(else_branch)?;
+                common_branch_ty(&tt, &et).ok_or_else(|| TypeError::TypeMismatch {
+                    expected: tt.to_string(),
+                    found: et.to_string(),
+                    context: "conditional-expression branches".to_string(),
+                })
             }
-            ExprKind::Compare { .. } => Err(TypeError::Unsupported("chained comparison".to_string())),
-            ExprKind::Slice { .. } => Err(TypeError::Unsupported("slice subscript".to_string())),
+            // Chained comparison `a < b < c`: each adjacent pair must compare to a
+            // `Bool` (same rules as a single comparison); the result is `Bool`.
+            ExprKind::Compare { first, rest } => {
+                let mut left: &Expr = first;
+                for (op, right) in rest {
+                    if self.infer_infix(*op, left, right)? != Ty::Bool {
+                        return Err(TypeError::BadOperator {
+                            op: infix_symbol(*op).to_string(),
+                            operands: "a chained comparison must compare to Bool".to_string(),
+                        });
+                    }
+                    left = right;
+                }
+                Ok(Ty::Bool)
+            }
+            // Slice `object[lower:upper:step]` on a `List`/`String`: each present
+            // bound must be `Int`; the result is the same sequence type.
+            ExprKind::Slice {
+                object,
+                lower,
+                upper,
+                step,
+            } => {
+                let obj_ty = self.infer(object)?;
+                for bound in [lower.as_deref(), upper.as_deref(), step.as_deref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    let bt = self.infer(bound)?;
+                    if !coerces(&bt, &Ty::Int) {
+                        return Err(TypeError::TypeMismatch {
+                            expected: "Int".to_string(),
+                            found: bt.to_string(),
+                            context: "slice bound".to_string(),
+                        });
+                    }
+                }
+                match &obj_ty {
+                    Ty::List(_) => Ok(obj_ty.clone()),
+                    Ty::String => Ok(Ty::String),
+                    _ => Err(TypeError::NotIndexable(obj_ty.to_string())),
+                }
+            }
             ExprKind::TString { .. } => Err(TypeError::Unsupported("t-string".to_string())),
+            // A parameterized type is not a runtime value; it is only valid as a
+            // static-method receiver (`UnsafePointer[T].alloc(…)`), typed in
+            // `infer_method_call`.
+            ExprKind::TypeApply { name, .. } => Err(TypeError::TypeMismatch {
+                expected: "a value".to_string(),
+                found: format!("the type '{name}[…]'"),
+                context: "a parameterized type is not a value".to_string(),
+            }),
         }
     }
 
@@ -1729,8 +1986,46 @@ impl Checker {
             }
             ExprKind::Index { object, index } => {
                 let obj_ty = self.check_place(object)?;
+                // A user struct with `__setitem__(mut self, i, v)` is index-assignable:
+                // `c[i] = e` → `c.__setitem__(i, e)`. The index must coerce to the
+                // first parameter; the *target* type (what `e` must be) is the second.
+                if let Ty::Struct(sname, targs) = &obj_ty {
+                    let info = self.structs.get(sname).expect("struct types are registered");
+                    let sig = info
+                        .methods
+                        .get("__setitem__")
+                        .ok_or_else(|| TypeError::NotIndexable(obj_ty.to_string()))?;
+                    if !sig.mut_self {
+                        return Err(TypeError::TypeMismatch {
+                            expected: "a 'mut self' __setitem__".to_string(),
+                            found: "read-only self".to_string(),
+                            context: format!("index assignment on '{sname}'"),
+                        });
+                    }
+                    let subst = struct_subst(&info.decls, targs);
+                    let params: Vec<Ty> =
+                        sig.params.iter().map(|t| substitute(t, &subst)).collect();
+                    if params.len() != 2 {
+                        return Err(TypeError::ArityMismatch {
+                            name: "__setitem__".to_string(),
+                            expected: 2,
+                            got: params.len(),
+                        });
+                    }
+                    let idx_ty = self.infer(index)?;
+                    if !coerces(&idx_ty, &params[0]) {
+                        return Err(TypeError::TypeMismatch {
+                            expected: params[0].to_string(),
+                            found: idx_ty.to_string(),
+                            context: "argument to '__setitem__'".to_string(),
+                        });
+                    }
+                    return Ok(params[1].clone());
+                }
                 let elem = match &obj_ty {
                     Ty::List(elem) => (**elem).clone(),
+                    // A pointer store `ptr[i] = e`: the target is the pointee type.
+                    Ty::Pointer(elem) => (**elem).clone(),
                     // A SIMD lane write `v[i] = e`: the target is the width-1 scalar.
                     Ty::Simd { dtype, .. } => simd_ty(*dtype, 1),
                     _ => return Err(TypeError::NotIndexable(obj_ty.to_string())),
@@ -1770,10 +2065,20 @@ impl Checker {
             }
             return Ok(elems[i as usize].clone());
         }
-        // The result of indexing: a SIMD lane, or a List element.
+        // A user struct with `__getitem__` is subscriptable: `c[i]` →
+        // `c.__getitem__(i)`, typed by the method (the index need not be `Int`).
+        if matches!(obj_ty, Ty::Struct(..)) {
+            let idx_ty = self.infer(index)?;
+            if let Some(r) = self.struct_dunder(&obj_ty, "__getitem__", &[&idx_ty]) {
+                return r;
+            }
+            return Err(TypeError::NotIndexable(obj_ty.to_string()));
+        }
+        // The result of indexing: a SIMD lane, a List element, or a pointer pointee.
         let result = match &obj_ty {
             Ty::Simd { dtype, .. } => simd_ty(*dtype, 1),
             Ty::List(elem) => (**elem).clone(),
+            Ty::Pointer(elem) => (**elem).clone(),
             _ => return Err(TypeError::NotIndexable(obj_ty.to_string())),
         };
         let idx_ty = self.infer(index)?;
@@ -1828,10 +2133,20 @@ impl Checker {
         method: &str,
         args: &[Expr],
     ) -> Result<Ty, TypeError> {
+        // A **static** method on a parameterized built-in type — the receiver is a
+        // type, not a value (`UnsafePointer[T].alloc(n)`). Handled before inferring
+        // the object (which would reject a bare `TypeApply`).
+        if let ExprKind::TypeApply { name, args: targs } = &object.kind {
+            return self.infer_static_method(name, targs, method, args);
+        }
         let obj_ty = self.infer(object)?;
         // Built-in `List` methods (mutating; require a plain variable receiver).
         if let Ty::List(elem) = &obj_ty {
             return self.infer_list_method(object, method, elem, args);
+        }
+        // Built-in `UnsafePointer` methods (`free`).
+        if let Ty::Pointer(elem) = &obj_ty {
+            return self.infer_pointer_method(method, elem, args);
         }
         // Resolve the method to a concrete signature (params + return + whether
         // it mutates `self`) for this receiver, substituting the receiver's type
@@ -1891,6 +2206,179 @@ impl Checker {
             }
         }
         Ok(ret)
+    }
+
+    /// Type a static method on a parameterized built-in type. Currently only
+    /// `UnsafePointer[T].alloc(count: Int) -> UnsafePointer[T]`.
+    fn infer_static_method(
+        &self,
+        tyname: &str,
+        targs: &[crate::ast::ParamArg],
+        method: &str,
+        args: &[Expr],
+    ) -> Result<Ty, TypeError> {
+        if tyname != "UnsafePointer" {
+            return Err(TypeError::NoSuchMethod {
+                object_type: format!("{tyname}[…]"),
+                method: method.to_string(),
+            });
+        }
+        let ptr_ty = self.pointer_type(targs)?;
+        match method {
+            "alloc" => {
+                if args.len() != 1 {
+                    return Err(TypeError::ArityMismatch {
+                        name: "alloc".to_string(),
+                        expected: 1,
+                        got: args.len(),
+                    });
+                }
+                let aty = self.infer(&args[0])?;
+                if !coerces(&aty, &Ty::Int) {
+                    return Err(TypeError::TypeMismatch {
+                        expected: "Int".to_string(),
+                        found: aty.to_string(),
+                        context: "argument to 'UnsafePointer.alloc'".to_string(),
+                    });
+                }
+                Ok(ptr_ty)
+            }
+            _ => Err(TypeError::NoSuchMethod {
+                object_type: ptr_ty.to_string(),
+                method: method.to_string(),
+            }),
+        }
+    }
+
+    /// Type an `UnsafePointer[T]` instance method. Currently only `free()` → `None`
+    /// (indexed load/store go through `infer_index` / `check_place`).
+    fn infer_pointer_method(
+        &self,
+        method: &str,
+        elem: &Ty,
+        args: &[Expr],
+    ) -> Result<Ty, TypeError> {
+        match method {
+            "free" => {
+                if !args.is_empty() {
+                    return Err(TypeError::ArityMismatch {
+                        name: "free".to_string(),
+                        expected: 0,
+                        got: args.len(),
+                    });
+                }
+                Ok(Ty::None)
+            }
+            _ => Err(TypeError::NoSuchMethod {
+                object_type: Ty::Pointer(Box::new(elem.clone())).to_string(),
+                method: method.to_string(),
+            }),
+        }
+    }
+
+    /// If `recv` is a `struct` defining dunder method `name`, type the implicit
+    /// call `recv.name(args…)` — the operator / subscript / builtin dispatch that
+    /// turns a user struct into a first-class value type. Checks arity and argument
+    /// coercion and returns the (type-argument-substituted) result type. Returns
+    /// `None` when `recv` isn't a struct or has no such method, so the caller falls
+    /// back to its own operator/builtin error.
+    fn struct_dunder(&self, recv: &Ty, name: &str, args: &[&Ty]) -> Option<Result<Ty, TypeError>> {
+        let Ty::Struct(sname, targs) = recv else {
+            return None;
+        };
+        let info = self.structs.get(sname)?;
+        let sig = info.methods.get(name)?;
+        let subst = struct_subst(&info.decls, targs);
+        let params: Vec<Ty> = sig.params.iter().map(|t| substitute(t, &subst)).collect();
+        if params.len() != args.len() {
+            return Some(Err(TypeError::ArityMismatch {
+                name: name.to_string(),
+                expected: params.len(),
+                got: args.len(),
+            }));
+        }
+        for (arg, expected) in args.iter().zip(&params) {
+            if !coerces(arg, expected) {
+                return Some(Err(TypeError::TypeMismatch {
+                    expected: expected.to_string(),
+                    found: arg.to_string(),
+                    context: format!("argument to '{name}'"),
+                }));
+            }
+        }
+        Some(Ok(substitute(&sig.ret, &subst)))
+    }
+
+    /// The `for`-loop element type of a user struct iterable, validating the stable
+    /// Mojo iterator protocol: the struct defines `__iter__(self) -> Iter`, where
+    /// `Iter` is a struct with `__next__(mut self) -> Element` (advances) and
+    /// `__len__(self) -> Int` (remaining count — bounded iteration). Returns
+    /// `Element`.
+    fn iter_element_ty(&self, c_ty: &Ty) -> Result<Ty, TypeError> {
+        let no_method = |ty: &Ty, m: &str| TypeError::NoSuchMethod {
+            object_type: ty.to_string(),
+            method: m.to_string(),
+        };
+        let Ty::Struct(cname, ctargs) = c_ty else {
+            return Err(no_method(c_ty, "__iter__"));
+        };
+        let cinfo = self.structs.get(cname).expect("struct types are registered");
+        let iter_sig = cinfo
+            .methods
+            .get("__iter__")
+            .ok_or_else(|| no_method(c_ty, "__iter__"))?;
+        if !iter_sig.params.is_empty() {
+            return Err(TypeError::ArityMismatch {
+                name: "__iter__".to_string(),
+                expected: 0,
+                got: iter_sig.params.len(),
+            });
+        }
+        let it_ty = substitute(&iter_sig.ret, &struct_subst(&cinfo.decls, ctargs));
+        // The iterator must itself be a struct with `__next__` and `__len__`.
+        let bad_iter = || TypeError::TypeMismatch {
+            expected: "an iterator struct (with __next__ and __len__)".to_string(),
+            found: it_ty.to_string(),
+            context: "__iter__ return type".to_string(),
+        };
+        let Ty::Struct(iname, itargs) = &it_ty else {
+            return Err(bad_iter());
+        };
+        let iinfo = self.structs.get(iname).ok_or_else(bad_iter)?;
+        let isubst = struct_subst(&iinfo.decls, itargs);
+        // `__len__(self) -> Int` — bounded iteration (loop while `len(it) > 0`).
+        let len_sig = iinfo
+            .methods
+            .get("__len__")
+            .ok_or_else(|| no_method(&it_ty, "__len__"))?;
+        let len_ret = substitute(&len_sig.ret, &isubst);
+        if len_ret != Ty::Int {
+            return Err(TypeError::TypeMismatch {
+                expected: "Int".to_string(),
+                found: len_ret.to_string(),
+                context: "return type of iterator '__len__'".to_string(),
+            });
+        }
+        // `__next__(mut self) -> Element` — advances, so it must mutate `self`.
+        let next_sig = iinfo
+            .methods
+            .get("__next__")
+            .ok_or_else(|| no_method(&it_ty, "__next__"))?;
+        if !next_sig.params.is_empty() {
+            return Err(TypeError::ArityMismatch {
+                name: "__next__".to_string(),
+                expected: 0,
+                got: next_sig.params.len(),
+            });
+        }
+        if !next_sig.mut_self {
+            return Err(TypeError::TypeMismatch {
+                expected: "a 'mut self' __next__".to_string(),
+                found: "read-only self".to_string(),
+                context: "iterator '__next__'".to_string(),
+            });
+        }
+        Ok(substitute(&next_sig.ret, &isubst))
     }
 
     /// Type a `List` method call. The **mutating** methods (`append`, `insert`,
@@ -2062,7 +2550,17 @@ impl Checker {
             Eq | Ne if common.is_some() || (lt == rt && is_scalar(&lt)) => Some(Ty::Bool),
             _ => None,
         };
-        result.ok_or_else(|| TypeError::BadOperator {
+        if let Some(ty) = result {
+            return Ok(ty);
+        }
+        // Operator overloading: `a OP b` on a user struct dispatches to the left
+        // operand's dunder method (`a.__add__(b)`, `a.__eq__(b)`, …).
+        if let Some(dunder) = op.dunder()
+            && let Some(r) = self.struct_dunder(&lt, dunder, &[&rt])
+        {
+            return r;
+        }
+        Err(TypeError::BadOperator {
             op: infix_symbol(op).to_string(),
             operands: format!("{} and {}", lt, rt),
         })
@@ -2078,13 +2576,17 @@ impl Checker {
             _ => false,
         };
         if ok {
-            Ok(Ty::Bool)
-        } else {
-            Err(TypeError::BadOperator {
-                op: infix_symbol(op).to_string(),
-                operands: format!("{} and {}", lt, rt),
-            })
+            return Ok(Ty::Bool);
         }
+        // `x in c` on a user struct dispatches to the container's `__contains__`
+        // (`c.__contains__(x)`), which must return `Bool`.
+        if let Some(r) = self.struct_dunder(rt, "__contains__", &[lt]) {
+            return r.and_then(|ret| require_dunder_ret(ret, &Ty::Bool, "__contains__"));
+        }
+        Err(TypeError::BadOperator {
+            op: infix_symbol(op).to_string(),
+            operands: format!("{} and {}", lt, rt),
+        })
     }
 
     /// Type an elementwise SIMD operator. Both operands must be the same SIMD
@@ -2421,14 +2923,18 @@ impl Checker {
     fn infer_stringify(&self, args: &[Expr]) -> Result<Ty, TypeError> {
         let tys = self.builtin_args("String", 1, args)?;
         if is_numeric(&tys[0]) || tys[0] == Ty::Bool || tys[0] == Ty::String {
-            Ok(Ty::String)
-        } else {
-            Err(TypeError::TypeMismatch {
-                expected: "a numeric, Bool, or String value".to_string(),
-                found: tys[0].to_string(),
-                context: "argument to 'String'".to_string(),
-            })
+            return Ok(Ty::String);
         }
+        // `String(c)` on a user struct dispatches to `c.__str__()` (`Stringable`),
+        // which must return `String`.
+        if let Some(r) = self.struct_dunder(&tys[0], "__str__", &[]) {
+            return r.and_then(|ret| require_dunder_ret(ret, &Ty::String, "__str__"));
+        }
+        Err(TypeError::TypeMismatch {
+            expected: "a numeric, Bool, or String value".to_string(),
+            found: tys[0].to_string(),
+            context: "argument to 'String'".to_string(),
+        })
     }
 
     /// Type `abs(x)`: a numeric argument, returning the same numeric type.
@@ -2473,14 +2979,18 @@ impl Checker {
     fn infer_len(&self, args: &[Expr]) -> Result<Ty, TypeError> {
         let tys = self.builtin_args("len", 1, args)?;
         if matches!(tys[0], Ty::String | Ty::List(_)) {
-            Ok(Ty::Int)
-        } else {
-            Err(TypeError::TypeMismatch {
-                expected: "String or List".to_string(),
-                found: tys[0].to_string(),
-                context: "argument to 'len'".to_string(),
-            })
+            return Ok(Ty::Int);
         }
+        // `len(c)` on a user struct dispatches to `c.__len__()` (`Sized`), which
+        // must return `Int`.
+        if let Some(r) = self.struct_dunder(&tys[0], "__len__", &[]) {
+            return r.and_then(|ret| require_dunder_ret(ret, &Ty::Int, "__len__"));
+        }
+        Err(TypeError::TypeMismatch {
+            expected: "String or List".to_string(),
+            found: tys[0].to_string(),
+            context: "argument to 'len'".to_string(),
+        })
     }
 
     /// Type the built-in `range(stop)` / `range(start, stop)` /
@@ -3088,6 +3598,63 @@ fn is_scalar(ty: &Ty) -> bool {
     matches!(ty, Ty::Bool | Ty::String | Ty::None)
 }
 
+/// Collect the field names assigned via `self.FIELD = …` anywhere in a body
+/// (recursing into nested `if`/`while`/`for`/`try` blocks) — the flow-insensitive
+/// basis of the `__init__` definite-initialization check. A nested write like
+/// `self.a.b = e` does *not* count as initializing `a` (its object isn't `self`).
+fn collect_self_assigned_fields(body: &[Stmt], out: &mut std::collections::HashSet<String>) {
+    for stmt in body {
+        match &stmt.kind {
+            StmtKind::SetPlace { place, .. } => {
+                if let ExprKind::Member { object, field } = &place.kind
+                    && matches!(&object.kind, ExprKind::Identifier(n) if n == "self")
+                {
+                    out.insert(field.clone());
+                }
+            }
+            StmtKind::If { branches, orelse } => {
+                for (_, b) in branches {
+                    collect_self_assigned_fields(b, out);
+                }
+                if let Some(b) = orelse {
+                    collect_self_assigned_fields(b, out);
+                }
+            }
+            StmtKind::While { body, .. } | StmtKind::For { body, .. } => {
+                collect_self_assigned_fields(body, out);
+            }
+            StmtKind::Try { body, except, orelse, finalbody } => {
+                collect_self_assigned_fields(body, out);
+                if let Some((_, b)) = except {
+                    collect_self_assigned_fields(b, out);
+                }
+                if let Some(b) = orelse {
+                    collect_self_assigned_fields(b, out);
+                }
+                if let Some(b) = finalbody {
+                    collect_self_assigned_fields(b, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Enforce that a builtin-driven dunder (`__len__`/`__str__`/`__contains__`)
+/// returns its Mojo-mandated type, so `len`/`String`/`in` on a user struct stay
+/// well-typed.
+fn require_dunder_ret(ret: Ty, expected: &Ty, name: &str) -> Result<Ty, TypeError> {
+    if ret == *expected {
+        Ok(ret)
+    } else {
+        Err(TypeError::TypeMismatch {
+            expected: expected.to_string(),
+            found: ret.to_string(),
+            context: format!("return type of '{name}'"),
+        })
+    }
+}
+
 /// Whether list elements of type `ty` can be compared for equality (needed by
 /// `List.remove`/`count`/`index`) — the same scalar set `==`/`!=` accept.
 fn is_list_equatable(ty: &Ty) -> bool {
@@ -3157,6 +3724,24 @@ fn common_elem(a: &Ty, b: &Ty) -> Option<Ty> {
 
 /// The common type of two numeric operands, coercing literals as needed, or
 /// `None` if they can't be unified (e.g. two different concrete types).
+/// The common type of a ternary's two branches: unify numerics (widening
+/// literals), else an exact match or a one-way literal coercion. `None` if the
+/// branches are incompatible.
+fn common_branch_ty(a: &Ty, b: &Ty) -> Option<Ty> {
+    if let Some(c) = common_numeric(a, b) {
+        return Some(c);
+    }
+    if a == b {
+        Some(a.clone())
+    } else if coerces(a, b) {
+        Some(b.clone())
+    } else if coerces(b, a) {
+        Some(a.clone())
+    } else {
+        None
+    }
+}
+
 fn common_numeric(a: &Ty, b: &Ty) -> Option<Ty> {
     if !is_numeric(a) || !is_numeric(b) {
         return None;

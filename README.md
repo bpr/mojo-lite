@@ -18,6 +18,10 @@ mojo-lite currently has:
 - a lexer and Pratt parser for a useful slice of Mojo-like syntax
 - a type checker with structs, functions, methods, traits, generics, value
   parameters, builtin scalar types, lists, tuples, strings, and SIMD-like values
+- a simple module linker for `import` / `from ... import ...` across `.mojo`
+  files
+- compile-time elaboration for `comptime if`, `comptime for`, richer compile-time
+  values, and small pure-function CTFE with fuel
 - a HIR control-flow graph lowering pass
 - a MIR/A-normal lowering pass with explicit registers, variables, places, moves,
   drops, calls, method calls, exceptions, and loop control
@@ -27,6 +31,8 @@ mojo-lite currently has:
   checks and place-sensitive field borrowing
 - liveness-driven ASAP destruction via `__del__(deinit self)`
 - a register VM backend used as the runtime implementation
+- self-hosted standard-library proofs in `stdlib/`, including generic
+  `Optional`, `List`, `Set`, and `Dict` implementations
 - fixture-based tests for accepted programs, parse errors, type errors, runtime
   errors, ownership errors, and ownership-ok cases
 
@@ -41,21 +47,25 @@ larger infrastructure work that may or may not ever be part of this project.
 
 Language deficiencies:
 
-- no full `comptime` implementation yet; syntax and limited integer value
-  parameters exist, but real compile-time execution is planned next
-- no package/module system beyond parsed imports
-- no real Mojo standard library
-- no full trait system; only a limited structural subset is checked
-- no full parametric polymorphism story comparable to Mojo
-- no complete effect system
+- no complete Mojo standard library; a small self-hosted `stdlib/` exists, but it
+  is a proof of direction, not a compatible replacement
+- no full trait system; structural conformance, common bounds, and self-hosted
+  collection traits exist, but default methods, refinement, and associated
+  compile-time members remain incomplete
+- no full parametric polymorphism story comparable to Mojo; generics and value
+  parameters cover the current library, but not the full language
+- no complete effect system; `raises` is only partially modeled
 - no full exception/unwind model beyond the VM-supported subset
-- no complete lifetime model comparable to Rust's borrow checker
+- no complete model of Mojo's ownership, origins, and lifetime semantics
 - limited nested-function/capture support; Mojo does not support general escaping
   closures, so this is about matching Mojo's supported non-escaping patterns, not
   adding a Python-style closure system
-- no complete support for every Mojo expression form, such as slices,
-  t-strings, tuple unpacking, `with`, chained comparisons, or ternary
-  expressions
+- no self-hosted `String`; string literals and runtime strings still rely on VM
+  support while storage, Unicode, slicing, and literal interop are designed
+- `Tuple` remains mostly compiler/runtime-shaped; fully self-hosting arbitrary
+  heterogeneous tuples would need deeper type-level/variadic machinery
+- no complete support for every Mojo expression form; some advanced forms still
+  parse before they are fully checked or executed
 
 Infrastructure and backend deficiencies:
 
@@ -86,6 +96,8 @@ The compiler pipeline is:
 source
   -> lex
   -> parse
+  -> module link
+  -> comptime elaboration
   -> check
   -> HIR CFG
   -> MIR
@@ -98,6 +110,8 @@ The major source directories are:
 
 - `src/lexer.rs`, `src/parser.rs`, `src/ast.rs`: tokens, AST, Pratt parser, and
   statement parsing
+- `src/module.rs`: filesystem-backed module loading/linking
+- `src/comptime.rs`: compile-time elaboration and small CTFE support
 - `src/checker.rs`: type checking, trait checks, call matching, value-parameter
   checks, and borrow checks
 - `src/hir/mod.rs`: control-flow graph lowering
@@ -105,6 +119,7 @@ The major source directories are:
 - `src/analysis/mod.rs`: move analysis, liveness, and drop insertion
 - `src/backend/vm.rs`: register VM execution
 - `src/runtime/mod.rs`: shared runtime values and builtin operations
+- `stdlib/`: self-hosted mojo-lite library types
 - `assets/`: executable and negative test fixtures
 - `tests/`: parser, checker, HIR, MIR, VM, ownership, and drop tests
 
@@ -249,28 +264,61 @@ over a small MIR instead of being scattered through an interpreter.
 
 ## Comptime
 
-`comptime` is the next major planned area.
+`comptime` is implemented as an elaboration phase before runtime checking and
+MIR lowering.
 
-Today, mojo-lite parses comptime syntax and supports a narrow integer constant
-evaluator for value parameters such as SIMD widths and simple value-parameterized
-types. It does not yet implement full compile-time execution.
+Supported pieces include:
 
-Missing pieces include:
-
+- `comptime NAME = expr` constants
 - `comptime if` branch selection
-- `comptime for` unrolling
-- compile-time function execution
-- type values as compile-time values
-- trait comptime members
-- generated declarations
-- a real compile-time value environment distinct from runtime locals
+- `comptime for` over `range` and compile-time tuple/list values
+- richer compile-time values such as integers, booleans, strings, types, tuples,
+  and lists
+- small pure-function CTFE that reuses checked compiler machinery and runs with a
+  fuel quota
+- materialization of compile-time values into ordinary runtime code where the
+  subset supports it
+
+This is intentionally still a small model of Mojo's comptime system. It is
+powerful enough to support the self-hosted library experiments, but not a full
+replacement for Mojo's compile-time evaluation and specialization machinery.
+
+## Self-Hosted Standard Library
+
+mojo-lite includes a small `stdlib/` written in mojo-lite itself. These are
+ordinary `.mojo` modules imported by programs and executed by the VM.
+
+Current self-hosted proof types include:
+
+- `Optional[T]`
+- `List[T]`
+- `Set[T]`
+- `Dict[K, V]`
+
+The point is not that these are production collections. The point is that user
+structs now have enough language hooks to behave like real value types:
+
+- dunder operator and builtin dispatch
+- subscript read/write
+- `__len__`
+- user iteration
+- `__init__(out self)`
+- `__copyinit__`
+- `__moveinit__`
+- `__del__(deinit self)`
+- `UnsafePointer[T]`
+- modules
+- comptime helpers
 
 ## Development Direction
 
 Near-term work:
 
-- implement real `comptime`
 - continue tightening Mojo compatibility within the chosen subset
+- deepen self-hosted `stdlib/` coverage while deleting or shrinking Rust
+  intrinsics where practical
+- design self-hosted `String`
+- clarify what remains compiler-primitive about `Tuple`
 - improve diagnostics and source spans
 - expand trait and generic support
 - document the architecture in `docs/architecture.md`
@@ -284,6 +332,7 @@ Longer-term possible directions:
 - a second backend once MIR semantics are solid
 - richer borrow checking and lifetime diagnostics
 - better specialization of value-parameterized code
+- deeper comptime specialization and generated declarations
 - an explicitly documented unsafe/unsupported boundary
 
 MLIR and GPU support remain north-star topics, not current implementation

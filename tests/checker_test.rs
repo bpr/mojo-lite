@@ -396,7 +396,7 @@ fn rejects_for_over_non_range() {
         TypeError::TypeMismatch {
             expected, found, ..
         } => {
-            assert_eq!(expected, "range or List");
+            assert_eq!(expected, "range, List, or a type with __iter__");
             assert_eq!(found, "Int");
         }
         other => panic!("expected a type mismatch, got {:?}", other),
@@ -785,8 +785,10 @@ fn rejects_wrong_parameter_count() {
 
 #[test]
 fn rejects_non_comptime_constant_definition() {
-    let e = err("var x: Int = 1\ncomptime N = x\n");
-    assert!(matches!(e, TypeError::NotComptime(_)), "got {:?}", e);
+    // A `comptime NAME = <runtime value>` is now rejected by the compile-time
+    // elaborator (the comptime validator), not the checker directly.
+    let program = mojo_lite::parse("var x: Int = 1\ncomptime N = x\n").unwrap();
+    assert!(mojo_lite::elaborate(program).is_err());
 }
 
 #[test]
@@ -1652,19 +1654,35 @@ fn plain_signatures_are_unaffected() {
 
 #[test]
 fn flags_deferred_expression_syntax_as_unsupported() {
-    // These parse into the AST but the checker defers their semantics.
-    for src in [
-        "var m: Int = 1 if True else 2\n", // conditional expression
-        "var t: Bool = 0 < 1 < 2\n",       // chained comparison
-        "var s: Int = xs[1:2]\n",          // slice subscript
-    ] {
-        assert!(
-            matches!(err(src), TypeError::Unsupported(_)),
-            "expected Unsupported for: {src}"
-        );
-    }
+    // t-strings and the walrus `:=` still parse but defer their semantics.
+    assert!(matches!(
+        err("var s: String = t\"x{1}\"\n"),
+        TypeError::Unsupported(_)
+    ));
+    // Ternary, chained comparison, and slices are now implemented (were deferred).
+    ok("var m: Int = 1 if True else 2\nprint(m)\n");
+    ok("var t: Bool = 0 < 1 < 2\nprint(t)\n");
+    ok("var xs: List[Int] = [1, 2, 3]\nvar ys: List[Int] = xs[0:2]\nprint(ys)\n");
     // A lone comparison is unaffected (still type-checks).
     ok("var b: Bool = 1 < 2\n");
+}
+
+#[test]
+fn ternary_chained_comparison_and_unpacking_type_check() {
+    // Ternary branches must unify; the condition must be Bool.
+    ok("def f(n: Int) -> Int:\n    return 1 if n > 0 else -1\n");
+    assert!(matches!(
+        err("var m: Int = 1 if 5 else 2\n"),
+        TypeError::TypeMismatch { .. }
+    ));
+    // Chained comparison → Bool.
+    ok("def g(i: Int, n: Int) -> Bool:\n    return 0 <= i < n\n");
+    // Tuple unpacking: arity + element types.
+    ok("var t: Tuple[Int, String] = (1, \"a\")\nvar x: Int = 0\nvar s: String = \"\"\nx, s = t\n");
+    assert!(matches!(
+        err("var t: Tuple[Int, Int] = (1, 2)\nvar a: Int = 0\nvar b: Int = 0\nvar c: Int = 0\na, b, c = t\n"),
+        TypeError::TypeMismatch { .. }
+    ));
 }
 
 // --- Decorators + dunder / receiver conventions (parse-only; semantics deferred) ---
@@ -1682,10 +1700,11 @@ fn accepts_decorators_and_plain_dunders() {
 
 #[test]
 fn flags_out_self_and_static_methods_as_unsupported() {
-    // Hand-written __init__ with `out self`.
+    // `out self` on a non-__init__ method is still unsupported (only `__init__`
+    // may initialize the receiver).
     assert!(matches!(
         err(
-            "@fieldwise_init\nstruct W:\n    var x: Int\n\n    def __init__(out self, x: Int):\n        self.x = x\n"
+            "struct W:\n    var x: Int\n\n    def reset(out self):\n        self.x = 0\n"
         ),
         TypeError::Unsupported(_)
     ));
@@ -1695,6 +1714,27 @@ fn flags_out_self_and_static_methods_as_unsupported() {
             "struct S:\n    var n: Int\n\n    @staticmethod\n    def make(x: Int) -> Int:\n        return x\n"
         ),
         TypeError::Unsupported(_)
+    ));
+}
+
+#[test]
+fn hand_written_init_out_self() {
+    // `def __init__(out self, …)` constructs a struct without `@fieldwise_init`.
+    ok("struct P:\n    var x: Int\n    var y: Int\n    def __init__(out self, x: Int, y: Int):\n        self.x = x\n        self.y = y\n\ndef main():\n    var p: P = P(1, 2)\n    print(p.x)\n");
+    // Definite initialization: every field must be assigned in the body.
+    assert!(matches!(
+        err("struct P:\n    var x: Int\n    var y: Int\n    def __init__(out self, x: Int):\n        self.x = x\n"),
+        TypeError::UninitializedField { .. }
+    ));
+    // A struct cannot have both `@fieldwise_init` and a hand-written `__init__`.
+    assert!(matches!(
+        err("@fieldwise_init\nstruct W:\n    var x: Int\n    def __init__(out self, x: Int):\n        self.x = x\n"),
+        TypeError::ConflictingConstructor(_)
+    ));
+    // Neither a constructor nor `@fieldwise_init` → no constructor.
+    assert!(matches!(
+        err("struct P:\n    var x: Int\n    def get(self) -> Int:\n        return self.x\n\ndef main():\n    var p: P = P(1)\n"),
+        TypeError::NoConstructor(_)
     ));
 }
 
@@ -1833,4 +1873,113 @@ fn borrow_check_is_place_sensitive() {
 
     let whole_vs_field = format!("{common}def g(mut x: P, y: Int):\n    y = y\n\ndef main():\n    var p: P = P(1, 2)\n    g(p, p.a)\n    print(p.a)\n");
     assert!(matches!(check_source(&whole_vs_field), Err(TypeError::AliasingViolation { .. })));
+}
+
+// --- Operator overloading (dunder dispatch) ---
+
+const VEC2: &str = "@fieldwise_init\nstruct Vec2:\n    var x: Int\n    def __add__(self, o: Vec2) -> Vec2:\n        return Vec2(self.x + o.x)\n    def __eq__(self, o: Vec2) -> Bool:\n        return self.x == o.x\n    def __getitem__(self, i: Int) -> Int:\n        return self.x\n    def __len__(self) -> Int:\n        return 1\n    def __str__(self) -> String:\n        return String(self.x)\n    def __contains__(self, v: Int) -> Bool:\n        return self.x == v\n\n";
+
+#[test]
+fn dunder_dispatch_type_checks_operators_and_builtins() {
+    // A struct with the right dunders participates in `+`, `==`, subscript, `len`,
+    // `String`, and `in` — each typed by the dunder's signature.
+    ok(&format!("{VEC2}def main():\n    var a: Vec2 = Vec2(1)\n    var b: Vec2 = a + a\n    var e: Bool = a == b\n    var i: Int = a[0]\n    var n: Int = len(a)\n    var s: String = String(a)\n    var m: Bool = 3 in a\n"));
+}
+
+#[test]
+fn operator_without_dunder_is_rejected() {
+    // A struct that doesn't define the operator's dunder still fails to type-check.
+    let e = err("@fieldwise_init\nstruct P:\n    var x: Int\n\ndef main():\n    var a: P = P(1)\n    var b: P = a + a\n");
+    assert!(matches!(e, TypeError::BadOperator { .. }), "got {e:?}");
+    // `!=` is NOT auto-derived from `__eq__` (strict subset — Mojo requires `__ne__`).
+    let e = err("@fieldwise_init\nstruct Q:\n    var x: Int\n    def __eq__(self, o: Q) -> Bool:\n        return self.x == o.x\n\ndef main():\n    var m: Bool = Q(1) != Q(2)\n");
+    assert!(matches!(e, TypeError::BadOperator { .. }), "got {e:?}");
+}
+
+#[test]
+fn len_dunder_must_return_int() {
+    // `len(x)` requires `__len__ -> Int`; a wrong return type is a type error.
+    let e = err("@fieldwise_init\nstruct Bad:\n    var x: Int\n    def __len__(self) -> String:\n        return \"nope\"\n\ndef main():\n    var n: Int = len(Bad(1))\n");
+    assert!(matches!(e, TypeError::TypeMismatch { .. }), "got {e:?}");
+}
+
+#[test]
+fn setitem_dunder_typing_and_errors() {
+    // `c[i] = e` needs `__setitem__`; a struct with only `__getitem__` can't be
+    // assigned into.
+    let e = err("@fieldwise_init\nstruct P:\n    var a: Int\n    def __getitem__(self, i: Int) -> Int:\n        return self.a\n\ndef main():\n    var p: P = P(1)\n    p[0] = 9\n");
+    assert!(matches!(e, TypeError::NotIndexable(_)), "got {e:?}");
+    // `__setitem__` must take `mut self` (else the write couldn't persist).
+    let e = err("@fieldwise_init\nstruct P:\n    var a: Int\n    def __setitem__(self, i: Int, v: Int):\n        pass\n\ndef main():\n    var p: P = P(1)\n    p[0] = 9\n");
+    assert!(matches!(e, TypeError::TypeMismatch { .. }), "got {e:?}");
+    // A well-formed `__setitem__` type-checks (value coerces to the 2nd parameter).
+    ok("@fieldwise_init\nstruct P:\n    var a: Int\n    def __setitem__(mut self, i: Int, v: Int):\n        self.a = v\n\ndef main():\n    var p: P = P(1)\n    p[0] = 9\n");
+}
+
+#[test]
+fn user_iterator_protocol_typing() {
+    // A struct with a valid `__iter__` → iterator (`__next__`/`__len__`) is iterable.
+    ok("@fieldwise_init\nstruct I:\n    var c: Int\n    var s: Int\n    def __len__(self) -> Int:\n        return self.s - self.c\n    def __next__(mut self) -> Int:\n        var v: Int = self.c\n        self.c = self.c + 1\n        return v\n\n@fieldwise_init\nstruct C:\n    var n: Int\n    def __iter__(self) -> I:\n        return I(0, self.n)\n\ndef main():\n    for x in C(3):\n        print(x)\n");
+    // No `__iter__` → not iterable.
+    assert!(matches!(
+        err("@fieldwise_init\nstruct P:\n    var x: Int\n\ndef main():\n    for i in P(1):\n        print(i)\n"),
+        TypeError::NoSuchMethod { .. }
+    ));
+    // The iterator's `__next__` must be `mut self` (it advances).
+    assert!(matches!(
+        err("@fieldwise_init\nstruct I:\n    var c: Int\n    def __len__(self) -> Int:\n        return 0\n    def __next__(self) -> Int:\n        return 0\n@fieldwise_init\nstruct C:\n    var n: Int\n    def __iter__(self) -> I:\n        return I(0)\n\ndef main():\n    for x in C(1):\n        print(x)\n"),
+        TypeError::TypeMismatch { .. }
+    ));
+}
+
+#[test]
+fn unsafe_pointer_typing() {
+    // alloc + index read/write + free type-check.
+    ok("def main():\n    var p: UnsafePointer[Int] = UnsafePointer[Int].alloc(4)\n    p[0] = 1\n    var x: Int = p[0]\n    p.free()\n");
+    // `alloc` needs an Int count.
+    assert!(matches!(
+        err("def main():\n    var p: UnsafePointer[Int] = UnsafePointer[Int].alloc(\"x\")\n"),
+        TypeError::TypeMismatch { .. }
+    ));
+    // A bare parameterized type is not a value.
+    assert!(matches!(
+        err("def main():\n    var x = UnsafePointer[Int]\n    print(1)\n"),
+        TypeError::TypeMismatch { .. }
+    ));
+    // A store must match the pointee type.
+    assert!(matches!(
+        err("def main():\n    var p: UnsafePointer[Int] = UnsafePointer[Int].alloc(1)\n    p[0] = \"no\"\n"),
+        TypeError::TypeMismatch { .. }
+    ));
+}
+
+#[test]
+fn copyinit_makes_type_copyable_and_checks_di() {
+    // Defining `__copyinit__` makes a struct Copyable, so `var q = p` is allowed.
+    ok("struct P:\n    var a: Int\n    def __init__(out self):\n        self.a = 1\n    def __copyinit__(out self, e: P):\n        self.a = e.a\n\ndef main():\n    var p: P = P()\n    var q: P = p\n    print(q.a)\n");
+    // A struct without `__copyinit__`/Copyable is move-only: `var q = p` is rejected.
+    assert!(matches!(
+        err("struct P:\n    var a: Int\n    def __init__(out self):\n        self.a = 1\n\ndef main():\n    var p: P = P()\n    var q: P = p\n"),
+        TypeError::NonCopyable { .. }
+    ));
+    // Definite-init applies to `__copyinit__` too (must set every field).
+    assert!(matches!(
+        err("struct P:\n    var a: Int\n    var b: Int\n    def __init__(out self):\n        self.a = 0\n        self.b = 0\n    def __copyinit__(out self, e: P):\n        self.a = e.a\n\ndef main():\n    var p: P = P()\n    var q: P = p\n"),
+        TypeError::UninitializedField { .. }
+    ));
+}
+
+#[test]
+fn generic_hand_written_init() {
+    // A hand-written `__init__` on a *generic* struct: the type parameter is solved
+    // by unifying the constructor's parameters against the arguments (inferred), or
+    // supplied explicitly (`Box[Int](5)`).
+    ok("struct Box[T: Copyable & Movable]:\n    var v: Self.T\n    def __init__(out self, v: Self.T):\n        self.v = v\n    def get(self) -> Self.T:\n        return self.v\n\ndef main():\n    var a: Box[Int] = Box(5)\n    var b: Box[Int] = Box[Int](6)\n    print(a.get(), b.get())\n");
+    // A UnsafePointer field of the type parameter, allocated with `Self.T`.
+    ok("struct Buf[T: Copyable & Movable]:\n    var data: UnsafePointer[Self.T]\n    def __init__(out self):\n        self.data = UnsafePointer[Self.T].alloc(4)\n    def set0(mut self, v: Self.T):\n        self.data[0] = v\n    def get0(self) -> Self.T:\n        return self.data[0]\n\ndef main():\n    var b: Buf[Int] = Buf[Int]()\n    b.set0(9)\n    print(b.get0())\n");
+    // A wrong-typed constructor argument is still rejected (solved T = Int here).
+    assert!(matches!(
+        err("struct Box[T: Copyable & Movable]:\n    var v: Self.T\n    def __init__(out self, v: Self.T):\n        self.v = v\n\ndef main():\n    var a: Box[Int] = Box[Int](\"no\")\n"),
+        TypeError::TypeMismatch { .. }
+    ));
 }

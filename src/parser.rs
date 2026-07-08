@@ -1522,22 +1522,38 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
                     start,
                 ));
             }
-            let index = match <[_; 1]>::try_from(param_args) {
-                Ok([crate::ast::ParamArg::Value(expr)]) => expr,
-                _ => {
-                    return Err(ParseError::UnexpectedToken(
-                        Token::RBracket,
-                        "a subscript takes a single index expression".into(),
+            // A single value entry is an ordinary subscript `obj[i]`; anything with a
+            // type argument (`UnsafePointer[Int]`) is a parameterized-type reference
+            // (`TypeApply`) — valid as a static-method receiver, e.g. `.alloc(n)`.
+            match <[_; 1]>::try_from(param_args) {
+                Ok([crate::ast::ParamArg::Value(expr)]) => {
+                    return Ok(self.node(
+                        ExprKind::Index {
+                            object: Box::new(left),
+                            index: Box::new(expr),
+                        },
+                        start,
                     ));
                 }
-            };
-            return Ok(self.node(
-                ExprKind::Index {
-                    object: Box::new(left),
-                    index: Box::new(index),
-                },
-                start,
-            ));
+                Ok([other]) => {
+                    return Ok(self.node(
+                        ExprKind::TypeApply {
+                            name: call_name(left)?,
+                            args: vec![other],
+                        },
+                        start,
+                    ));
+                }
+                Err(param_args) => {
+                    return Ok(self.node(
+                        ExprKind::TypeApply {
+                            name: call_name(left)?,
+                            args: param_args,
+                        },
+                        start,
+                    ));
+                }
+            }
         }
 
         // Postfix call without explicit parameters: `IDENT '(' args ')'`.

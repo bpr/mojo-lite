@@ -1,6 +1,23 @@
-use mojo_lite::{BackendKind, check, lex, parse};
+use mojo_lite::{BackendKind, Stmt, check, lex, parse};
 use std::io::Read;
+use std::path::Path;
 use std::process::ExitCode;
+
+/// Obtain the program to check/run: when a real file path is given, **link** it
+/// with its imported modules (`from module import …`); for stdin (or `-`), parse
+/// the source alone (imports left unresolved — there is no base directory). Either
+/// way, **compile-time elaboration** resolves `comptime if`/`comptime for` before
+/// the program is handed to the checker.
+fn load_program(file: Option<&str>) -> Result<Vec<Stmt>, String> {
+    let program = match file {
+        Some(path) if path != "-" => mojo_lite::link(Path::new(path)).map_err(|e| e.to_string())?,
+        _ => {
+            let source = read_source(file).map_err(|e| format!("cannot read input: {e}"))?;
+            parse(&source).map_err(|e| e.to_string())?
+        }
+    };
+    mojo_lite::elaborate(program).map_err(|e| e.to_string())
+}
 
 /// mojo-lite doubles as a small **syntax-analysis tool**. With no arguments it
 /// runs the built-in demo; otherwise the first argument selects a pipeline stage
@@ -44,8 +61,8 @@ fn main() -> ExitCode {
         None => ExitCode::SUCCESS,
         Some("lex") => stage("lex", file, run_lex),
         Some("parse") => stage("parse", file, run_parse),
-        Some("check") => stage("check", file, run_check),
-        Some("own") => stage("own", file, run_own),
+        Some("check") => program_stage("check", file, run_check),
+        Some("own") => program_stage("own", file, run_own),
         Some("run") => stage_run(file, backend), // ← now backend-aware
         Some("-h" | "--help" | "help") => {
             print_usage();
@@ -59,16 +76,28 @@ fn main() -> ExitCode {
     }
 }
 
-/// `run`, routed through the selected backend.
-fn stage_run(file: Option<&str>, backend: BackendKind) -> ExitCode {
-    let source = match read_source(file) {
-        Ok(s) => s,
+/// Run a stage that operates on the **linked program** (so `from module import …`
+/// is resolved when a file path is given). Used by `check`/`own`.
+fn program_stage(name: &str, file: Option<&str>, f: fn(&[Stmt]) -> Result<(), String>) -> ExitCode {
+    let program = match load_program(file) {
+        Ok(p) => p,
         Err(e) => {
-            eprintln!("run: cannot read input: {e}");
+            eprintln!("{name} error: {e}");
             return ExitCode::FAILURE;
         }
     };
-    match run_source(&source, backend) {
+    match f(&program) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{name} error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `run`, routed through the selected backend (over the linked program).
+fn stage_run(file: Option<&str>, backend: BackendKind) -> ExitCode {
+    match run_program(file, backend) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("run error: {e}");
@@ -77,8 +106,8 @@ fn stage_run(file: Option<&str>, backend: BackendKind) -> ExitCode {
     }
 }
 
-fn run_source(source: &str, backend: BackendKind) -> Result<(), String> {
-    let program = parse(source).map_err(|e| e.to_string())?;
+fn run_program(file: Option<&str>, backend: BackendKind) -> Result<(), String> {
+    let program = load_program(file)?;
     check(&program).map_err(|e| e.to_string())?;
     // Ownership (move) analysis is a real compile stage: reject use-after-move.
     mojo_lite::check_ownership(&program).map_err(|e| e.to_string())?;
@@ -155,22 +184,20 @@ fn run_parse(source: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `check`: lex + parse + type-check; report success or the first error.
-fn run_check(source: &str) -> Result<(), String> {
-    let program = parse(source).map_err(|e| e.to_string())?;
-    check(&program).map_err(|e| e.to_string())?;
+/// `check`: type-check the linked program; report success or the first error.
+fn run_check(program: &[Stmt]) -> Result<(), String> {
+    check(program).map_err(|e| e.to_string())?;
     // The ownership analysis is part of a full check.
-    mojo_lite::check_ownership(&program).map_err(|e| e.to_string())?;
+    mojo_lite::check_ownership(program).map_err(|e| e.to_string())?;
     println!("ok");
     Ok(())
 }
 
 /// `own` — type-check, then run the ownership (move) analysis. Reports `ok`, or the
 /// first move violation with its source byte range.
-fn run_own(source: &str) -> Result<(), String> {
-    let program = parse(source).map_err(|e| e.to_string())?;
-    check(&program).map_err(|e| e.to_string())?;
-    match mojo_lite::check_ownership(&program) {
+fn run_own(program: &[Stmt]) -> Result<(), String> {
+    check(program).map_err(|e| e.to_string())?;
+    match mojo_lite::check_ownership(program) {
         Ok(()) => {
             println!("ok");
             Ok(())

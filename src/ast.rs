@@ -598,6 +598,13 @@ pub enum ExprKind {
         object: Box<Expr>,
         index: Box<Expr>,
     },
+    /// A parameterized type in expression position — `Name[param_args]` — used as
+    /// the receiver of a static method call, e.g. `UnsafePointer[T].alloc(n)`.
+    /// Only meaningful there; a bare `TypeApply` is a type, not a runtime value.
+    TypeApply {
+        name: String,
+        args: Vec<ParamArg>,
+    },
     /// The transfer sigil `expr^` (ownership move). Parsed for completeness but
     /// not modeled — evaluates to its operand (value semantics unchanged).
     Transfer(Box<Expr>),
@@ -682,4 +689,30 @@ pub enum InfixOp {
     In,
     /// Non-membership: `x not in container` → `Bool`.
     NotIn,
+}
+
+impl InfixOp {
+    /// The dunder method a binary operator dispatches to on a user `struct` left
+    /// operand (`a + b` → `a.__add__(b)`), or `None` for operators that don't
+    /// dispatch this way (`and`/`or` short-circuit; `in`/`not in` dispatch to
+    /// `__contains__` on the *right* operand — see the checker/VM). Shared by the
+    /// checker (typing) and the VM (runtime dispatch) so they agree.
+    pub fn dunder(self) -> Option<&'static str> {
+        Some(match self {
+            InfixOp::Add => "__add__",
+            InfixOp::Sub => "__sub__",
+            InfixOp::Mul => "__mul__",
+            InfixOp::Div => "__truediv__",
+            InfixOp::FloorDiv => "__floordiv__",
+            InfixOp::Mod => "__mod__",
+            InfixOp::Pow => "__pow__",
+            InfixOp::Eq => "__eq__",
+            InfixOp::Ne => "__ne__",
+            InfixOp::Lt => "__lt__",
+            InfixOp::Gt => "__gt__",
+            InfixOp::Le => "__le__",
+            InfixOp::Ge => "__ge__",
+            InfixOp::And | InfixOp::Or | InfixOp::In | InfixOp::NotIn => return None,
+        })
+    }
 }

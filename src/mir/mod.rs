@@ -189,6 +189,15 @@ pub enum MirInstr {
     GetField { dest: Reg, base: Reg, field: String },
     /// Subscript *read* `base[index]` (List/Tuple/SIMD lane) inside an rvalue.
     Index { dest: Reg, base: Reg, index: Reg },
+    /// Slice `object[lower:upper:step]` (List/String) → a new value. Each bound is
+    /// optional (absent = a direction-aware default).
+    Slice {
+        dest: Reg,
+        object: Reg,
+        lower: Option<Reg>,
+        upper: Option<Reg>,
+        step: Option<Reg>,
+    },
     /// `place = src` — a write through a place (`p.x = e`, `xs[i] = e`, nested).
     Store { place: MirPlace, src: Reg },
     /// Read a place into a register — for a read-modify-write (`place OP= e`),
@@ -232,6 +241,9 @@ pub enum MirInstr {
     /// lowering-time `panic!` — so a backend can report a clean error instead of
     /// crashing on an otherwise-valid program.
     Unsupported(String),
+    /// Iterator protocol: normalize `iter` to an iterator (a user struct's
+    /// `__iter__()`); a no-op for a built-in `range`/`List`.
+    GetIter { iter: VarId },
     /// Iterator protocol (`for` loops): read whether the iterator variable `iter`
     /// yields another element into `dest` (a `Bool`) — a pure read.
     HasNext { dest: Reg, iter: VarId },
@@ -449,6 +461,67 @@ impl Flatten<'_> {
         d
     }
 
+    /// Lower a ternary `then_e if cond else else_e` to a value: branch on `cond`,
+    /// each arm writing the result variable, then read it at the merge.
+    fn ternary(&mut self, cond: &Expr, then_e: &Expr, else_e: &Expr, sp: Span) -> Reg {
+        let rc = self.expr(cond);
+        let result = self.fresh_var();
+        let then_blk = self.new_block();
+        let else_blk = self.new_block();
+        let merge_blk = self.new_block();
+        self.f.blocks[self.cur].term = MirTerm::Branch {
+            cond: rc,
+            then_b: then_blk,
+            else_b: else_blk,
+        };
+        self.cur = then_blk;
+        let rt = self.expr(then_e);
+        self.emit(MirInstr::DefVar { var: result, src: rt, ty: None });
+        self.f.blocks[self.cur].term = MirTerm::Jump(merge_blk);
+        self.cur = else_blk;
+        let re = self.expr(else_e);
+        self.emit(MirInstr::DefVar { var: result, src: re, ty: None });
+        self.f.blocks[self.cur].term = MirTerm::Jump(merge_blk);
+        self.cur = merge_blk;
+        let d = self.fresh(sp, None);
+        self.emit(MirInstr::UseVar { dest: d, var: result, mode: UseMode::Copy });
+        d
+    }
+
+    /// Lower a chained comparison `a op1 b op2 c …` to a `Bool`. Each operand is
+    /// evaluated **once**, left to right; a false link short-circuits the rest (the
+    /// remaining operands are not evaluated). The result variable holds the last
+    /// comparison evaluated (which is `false` on the link that failed).
+    fn compare_chain(&mut self, first: &Expr, rest: &[(InfixOp, Expr)], sp: Span) -> Reg {
+        let result = self.fresh_var();
+        let merge_blk = self.new_block();
+        let mut prev = self.expr(first);
+        for (i, (op, operand)) in rest.iter().enumerate() {
+            let cur = self.expr(operand);
+            let cmp = self.fresh(sp, None);
+            self.emit(MirInstr::BinOp { op: *op, dest: cmp, a: prev, b: cur });
+            self.emit(MirInstr::DefVar { var: result, src: cmp, ty: None });
+            if i + 1 == rest.len() {
+                self.f.blocks[self.cur].term = MirTerm::Jump(merge_blk);
+            } else {
+                // A false link is the answer (result is already it); a true link
+                // continues to the next comparison.
+                let next_blk = self.new_block();
+                self.f.blocks[self.cur].term = MirTerm::Branch {
+                    cond: cmp,
+                    then_b: next_blk,
+                    else_b: merge_blk,
+                };
+                self.cur = next_blk;
+                prev = cur;
+            }
+        }
+        self.cur = merge_blk;
+        let d = self.fresh(sp, None);
+        self.emit(MirInstr::UseVar { dest: d, var: result, mode: UseMode::Copy });
+        d
+    }
+
     /// Post-order: each subexpression emits one instruction and yields its result
     /// `Reg`, so `foo(bar(x))` → `t0 = bar(x); t1 = foo(t0)`. Total over `Expr`.
     fn expr(&mut self, e: &Expr) -> Reg {
@@ -555,6 +628,22 @@ impl Flatten<'_> {
                 d
             }
             ExprKind::MethodCall { object, method, args, .. } => {
+                // A **static** method on a parameterized built-in type — the receiver
+                // is a type, not a value (`UnsafePointer[T].alloc(n)`). Lower to a
+                // builtin call `Type.method(args)`; the element type is erased.
+                if let ExprKind::TypeApply { name, .. } = &object.kind {
+                    let regs = self.args(args);
+                    let d = self.fresh(span(e), None);
+                    self.emit(MirInstr::Call {
+                        dest: d,
+                        func: FuncRef::named(&format!("{name}.{method}")),
+                        args: regs,
+                        kwargs: Vec::new(),
+                        arg_places: vec![None; args.len()],
+                        param_arg_regs: Vec::new(),
+                    });
+                    return d;
+                }
                 // If the receiver is a place, load it through that place (indices
                 // evaluated once) and keep the place for write-back; otherwise it is
                 // a temporary evaluated for its value only.
@@ -630,12 +719,42 @@ impl Flatten<'_> {
                 self.emit(MirInstr::Unsupported("the walrus operator ':='".into()));
                 d
             }
-            // These are flagged `Unsupported` by the *checker*, so a checked program
-            // never reaches MIR lowering with them.
-            ExprKind::IfExpr { .. }
-            | ExprKind::Compare { .. }
-            | ExprKind::Slice { .. }
-            | ExprKind::TString { .. } => {
+            // Ternary `a if cond else b` — a value-producing branch (like the
+            // short-circuit lowering, but both arms assign the result).
+            ExprKind::IfExpr {
+                cond,
+                then_branch,
+                else_branch,
+            } => self.ternary(cond, then_branch, else_branch, span(e)),
+            // Chained comparison `a < b < c` — each operand evaluated once, folded
+            // into short-circuiting `and`s.
+            ExprKind::Compare { first, rest } => self.compare_chain(first, rest, span(e)),
+            // Slice `object[lower:upper:step]` → a new List/String.
+            ExprKind::Slice {
+                object,
+                lower,
+                upper,
+                step,
+            } => {
+                let obj = self.expr(object);
+                let lower = lower.as_ref().map(|b| self.expr(b));
+                let upper = upper.as_ref().map(|b| self.expr(b));
+                let step = step.as_ref().map(|b| self.expr(b));
+                let d = self.fresh(span(e), None);
+                self.emit(MirInstr::Slice {
+                    dest: d,
+                    object: obj,
+                    lower,
+                    upper,
+                    step,
+                });
+                d
+            }
+            // These are flagged `Unsupported`/rejected by the *checker*, so a checked
+            // program never reaches MIR lowering with them. A bare `TypeApply` is a
+            // type used as a value (only valid as a static-method receiver, handled
+            // in the `MethodCall` arm above).
+            ExprKind::TypeApply { .. } | ExprKind::TString { .. } => {
                 unreachable!("parse-only expression rejected by the checker before MIR: {e:?}")
             }
         }
@@ -735,6 +854,9 @@ impl Flatten<'_> {
             // Iterator protocol: compute into a register, then store to the target
             // variable (so the header's branch can read `has_next` as a `UseVar`,
             // and the body binds the loop variable).
+            HirInstr::GetIter { iter } => {
+                self.emit(MirInstr::GetIter { iter: *iter });
+            }
             HirInstr::HasNext { iter, dest } => {
                 let r = self.fresh(DUMMY_SPAN, None);
                 self.emit(MirInstr::HasNext { dest: r, iter: *iter });
@@ -1006,11 +1128,32 @@ impl Flatten<'_> {
                 self.emit(MirInstr::Unsupported("nested def/struct/trait declaration".into()))
             }
 
+            // Tuple unpacking `a, b = t`: evaluate the tuple once, then bind each
+            // target from its element (a NAME → `DefVar`; a place → `Store`).
+            StmtKind::Unpack { targets, value } => {
+                let tuple = self.expr(value);
+                for (i, target) in targets.iter().enumerate() {
+                    let idx = self.fresh(span(target), None);
+                    self.emit(MirInstr::Const { dest: idx, k: Const::Int(i as i64) });
+                    let elem = self.fresh(span(target), None);
+                    self.emit(MirInstr::Index { dest: elem, base: tuple, index: idx });
+                    match &target.kind {
+                        ExprKind::Identifier(name) => {
+                            let var = self.var(name);
+                            self.emit(MirInstr::DefVar { var, src: elem, ty: None });
+                        }
+                        _ => {
+                            let place = self.place(target);
+                            self.emit(MirInstr::Store { place, src: elem });
+                        }
+                    }
+                }
+            }
+
             // --- Unreachable after the checker ---------------------------------
             // Parse-only statements are flagged `Unsupported`, so a checked program
             // never reaches MIR with them.
             StmtKind::With { .. }
-            | StmtKind::Unpack { .. }
             | StmtKind::ComptimeIf { .. }
             | StmtKind::ComptimeFor { .. } => {
                 unreachable!("parse-only statement rejected by the checker before MIR: {s:?}")

@@ -17,12 +17,13 @@
 //! and `vm_refuses_mut_ref_via_non_place_argument`: the VM must error cleanly, never
 //! diverge.
 
-use mojo_lite::{BackendKind, check, parse};
+use mojo_lite::{BackendKind, check, elaborate, parse};
 
 /// Run `src` through the VM backend (the sole executor) and return its captured
 /// output, or a stage error string.
 fn run(src: &str) -> Result<String, String> {
     let program = parse(src).map_err(|e| format!("parse error: {e:?}"))?;
+    let program = elaborate(program).map_err(|e| format!("comptime error: {e}"))?;
     check(&program).map_err(|e| format!("type error: {e:?}"))?;
     let mut backend = BackendKind::Vm.make();
     backend
@@ -349,4 +350,95 @@ fn nested_def_calling_sibling_is_refused_cleanly() {
     let src = "def outer() -> Int:\n    var b: Int = 10\n    def helper(x: Int) -> Int:\n        return x + b\n    def caller(y: Int) -> Int:\n        return helper(y) + 1\n    return caller(5)\n\ndef main():\n    print(outer())\n";
     assert!(checks_ok(src), "the program is statically valid");
     assert!(run(src).is_err());
+}
+
+#[test]
+fn dunder_operator_and_builtin_dispatch() {
+    // Operators + `len`/`String`/subscript/`in` on a user struct dispatch to its
+    // dunder methods (operator overloading), running on the VM.
+    let src = "@fieldwise_init\nstruct Vec2:\n    var x: Int\n    var y: Int\n    def __add__(self, o: Vec2) -> Vec2:\n        return Vec2(self.x + o.x, self.y + o.y)\n    def __eq__(self, o: Vec2) -> Bool:\n        return self.x == o.x and self.y == o.y\n    def __str__(self) -> String:\n        return \"V(\" + String(self.x) + \",\" + String(self.y) + \")\"\n    def __len__(self) -> Int:\n        return 2\n    def __getitem__(self, i: Int) -> Int:\n        if i == 0:\n            return self.x\n        return self.y\n    def __contains__(self, v: Int) -> Bool:\n        return self.x == v or self.y == v\n\ndef main():\n    var a: Vec2 = Vec2(1, 2)\n    print(String(a + Vec2(3, 4)))\n    print(a == Vec2(1, 2))\n    print(len(a), a[0], a[1])\n    print(2 in a, 9 not in a)\n";
+    assert_eq!(parity(src), "V(4,6)\ntrue\n2 1 2\ntrue true\n");
+}
+
+#[test]
+fn dunder_augmented_assignment_uses_add() {
+    // `c += d` expands to `c = c + d`, which dispatches to `__add__`.
+    let src = "@fieldwise_init\nstruct Acc:\n    var n: Int\n    def __add__(self, o: Acc) -> Acc:\n        return Acc(self.n + o.n)\n    def __str__(self) -> String:\n        return String(self.n)\n\ndef main():\n    var c: Acc = Acc(1)\n    c += Acc(10)\n    c += Acc(100)\n    print(String(c))\n";
+    assert_eq!(parity(src), "111\n");
+}
+
+#[test]
+fn dunder_setitem_writes_back() {
+    // `c[i] = e` dispatches to `__setitem__(mut self, …)` and the mutation persists;
+    // `c[i] += e` reads via `__getitem__` and writes via `__setitem__`; a nested
+    // place (`h.p[i] = e`) writes back through the outer struct.
+    let src = "@fieldwise_init\nstruct Pair:\n    var a: Int\n    var b: Int\n    def __getitem__(self, i: Int) -> Int:\n        if i == 0:\n            return self.a\n        return self.b\n    def __setitem__(mut self, i: Int, v: Int):\n        if i == 0:\n            self.a = v\n        else:\n            self.b = v\n\n@fieldwise_init\nstruct Holder:\n    var p: Pair\n\ndef main():\n    var p: Pair = Pair(1, 2)\n    p[0] = 10\n    p[1] = 20\n    p[0] += 5\n    print(p[0], p[1])\n    var h: Holder = Holder(Pair(5, 6))\n    h.p[1] = 99\n    print(h.p[0], h.p[1])\n";
+    assert_eq!(parity(src), "15 20\n5 99\n");
+}
+
+#[test]
+fn hand_written_init_constructs_and_coerces() {
+    // A `def __init__(out self, …)` builds the struct: fields are set in the body,
+    // and arguments are coerced to the parameter types (Int literal → Float64).
+    let src = "struct Point:\n    var x: Int\n    var y: Int\n    def __init__(out self, x: Int, y: Int):\n        self.x = x\n        self.y = y\n    def sum(self) -> Int:\n        return self.x + self.y\n\nstruct Scaled:\n    var v: Float64\n    def __init__(out self, n: Float64):\n        self.v = n * 2.0\n\ndef main():\n    var p: Point = Point(3, 4)\n    print(p.x, p.y, p.sum())\n    var s: Scaled = Scaled(5)\n    print(s.v)\n";
+    assert_eq!(parity(src), "3 4 7\n10.0\n");
+}
+
+#[test]
+fn user_iterator_protocol() {
+    // `for x in c` on a user type dispatches `c.__iter__()` → loop while
+    // `len(iter) > 0` binding `x = iter.__next__()`; break/continue compose.
+    let src = "@fieldwise_init\nstruct It:\n    var cur: Int\n    var stop: Int\n    def __len__(self) -> Int:\n        return self.stop - self.cur\n    def __next__(mut self) -> Int:\n        var v: Int = self.cur\n        self.cur = self.cur + 1\n        return v\n\n@fieldwise_init\nstruct Nums:\n    var n: Int\n    def __iter__(self) -> It:\n        return It(0, self.n)\n\ndef main():\n    for x in Nums(6):\n        if x == 4:\n            break\n        if x == 1:\n            continue\n        print(x)\n";
+    assert_eq!(parity(src), "0\n2\n3\n");
+}
+
+#[test]
+fn unsafe_pointer_alloc_load_store_alias() {
+    // `UnsafePointer[T].alloc`/`ptr[i]` load+store, `ptr[i] += e`, and aliasing (a
+    // copied pointer shares storage), running over the VM heap arena.
+    let src = "def main():\n    var p: UnsafePointer[Int] = UnsafePointer[Int].alloc(3)\n    p[0] = 10\n    p[1] = 20\n    p[1] += 5\n    var q: UnsafePointer[Int] = p\n    q[0] = 99\n    print(p[0], p[1])\n";
+    assert_eq!(parity(src), "99 25\n");
+}
+
+#[test]
+fn self_hosted_vec_over_unsafe_pointer() {
+    // A heap-owning container written in mojo-lite: `push` mutates storage through
+    // the pointer (aliased across the value-type copy); the size is written back.
+    let src = "struct IntVec:\n    var data: UnsafePointer[Int]\n    var size: Int\n    def __init__(out self, cap: Int):\n        self.data = UnsafePointer[Int].alloc(cap)\n        self.size = 0\n    def push(mut self, v: Int):\n        self.data[self.size] = v\n        self.size = self.size + 1\n    def get(self, i: Int) -> Int:\n        return self.data[i]\n\ndef main():\n    var xs: IntVec = IntVec(8)\n    xs.push(7)\n    xs.push(8)\n    xs.push(9)\n    print(xs.size, xs.get(0), xs.get(2))\n";
+    assert_eq!(parity(src), "3 7 9\n");
+}
+
+#[test]
+fn copyinit_gives_value_semantics() {
+    // A pointer-owning struct with `__copyinit__` deep-copies on `var b = a` and on
+    // pass-by-value, so writes through one don't affect the other. `__moveinit__`
+    // relocates on `^`.
+    let src = "struct Buf:\n    var data: UnsafePointer[Int]\n    var n: Int\n    def __init__(out self, n: Int):\n        self.data = UnsafePointer[Int].alloc(n)\n        self.n = n\n    def __copyinit__(out self, e: Buf):\n        self.n = e.n\n        self.data = UnsafePointer[Int].alloc(e.n)\n        var i: Int = 0\n        while i < e.n:\n            self.data[i] = e.data[i]\n            i = i + 1\n    def __moveinit__(out self, owned e: Buf):\n        self.n = e.n\n        self.data = e.data\n    def set(mut self, i: Int, v: Int):\n        self.data[i] = v\n    def get(self, i: Int) -> Int:\n        return self.data[i]\n\ndef main():\n    var a: Buf = Buf(2)\n    a.set(0, 5)\n    var b: Buf = a\n    b.set(0, 9)\n    print(a.get(0), b.get(0))\n    var c: Buf = b^\n    print(c.get(0))\n";
+    assert_eq!(parity(src), "5 9\n9\n");
+}
+
+#[test]
+fn ternary_and_chained_comparison_run() {
+    // Ternary picks a branch; chained comparison evaluates each operand once and
+    // short-circuits (a middle false → the rest is not evaluated).
+    let src = "def loud(n: Int) -> Int:\n    print(\"e\", n)\n    return n\n\ndef main():\n    var x: Int = 5\n    var m: Int = 10 if x > 0 else 20\n    print(m)\n    print(0 <= x < 10)\n    print(0 <= x < 3)\n    print(1 < 0 < loud(99))\n";
+    // loud(99) must NOT run (1 < 0 is false), so no "e 99" line.
+    assert_eq!(parity(src), "10\ntrue\nfalse\nfalse\n");
+}
+
+#[test]
+fn tuple_unpacking_runs() {
+    // Unpack into names; swap through a temporary tuple (RHS built once).
+    let src = "def main():\n    var t: Tuple[Int, Int, Int] = (1, 2, 3)\n    a, b, c = t\n    print(a, b, c)\n    var x: Int = 10\n    var y: Int = 20\n    x, y = (y, x)\n    print(x, y)\n";
+    assert_eq!(parity(src), "1 2 3\n20 10\n");
+}
+
+#[test]
+fn slice_subscript_runs() {
+    // List + String slicing with optional bounds, steps, negative indices, reversal.
+    let src = "def main():\n    var xs: List[Int] = [0, 1, 2, 3, 4, 5]\n    print(xs[1:4])\n    print(xs[::2])\n    print(xs[::-1])\n    print(xs[-2:])\n    var s: String = \"hello\"\n    print(s[1:4])\n    print(s[::-1])\n";
+    assert_eq!(
+        parity(src),
+        "[1, 2, 3]\n[0, 2, 4]\n[5, 4, 3, 2, 1, 0]\n[4, 5]\nell\nolleh\n"
+    );
 }

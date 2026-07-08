@@ -43,6 +43,12 @@ fn classify(source: &str) -> (Outcome, String) {
         Ok(p) => p,
         Err(e) => return (Outcome::ParseError, e.to_string()),
     };
+    // Compile-time elaboration (resolve `comptime if`/`comptime for`) — its errors
+    // are compile-time rejections, classified with the type-error stage.
+    let program = match mojo_lite::elaborate(program) {
+        Ok(p) => p,
+        Err(e) => return (Outcome::TypeError, e.to_string()),
+    };
     if let Err(e) = check(&program) {
         return (Outcome::TypeError, e.to_string());
     }

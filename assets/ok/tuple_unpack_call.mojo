@@ -1,5 +1,4 @@
-# Unpacking a tuple returned from a function — parsed, flagged unsupported.
-# expect: tuple unpacking
+# Unpacking a tuple returned from a function (evaluated once).
 def pair() -> Tuple[Int, String]:
     return (1, "one")
 

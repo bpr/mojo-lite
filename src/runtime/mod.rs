@@ -48,6 +48,10 @@ pub enum Value {
     /// A `Tuple` value — a fixed-size, heterogeneous value type (`Clone`
     /// deep-copies; immutable — no element write).
     Tuple(Vec<Value>),
+    /// An `UnsafePointer[T]` — a base offset into the VM's type-erased heap arena
+    /// (`Option B`: the arena is a `Vec<Value>`). Copying a pointer copies the
+    /// offset, so two copies **alias** the same storage (the point of a pointer).
+    Pointer(usize),
     /// A **tombstone** left when a value is moved out of a variable slot (`b = a^`)
     /// in the VM backend: the source slot holds `Moved` afterward, so a
     /// use-after-move surfaces as a loud runtime error (a defensive check — the
@@ -179,6 +183,7 @@ impl fmt::Display for Value {
                 }
             }
             Value::Error(msg) => write!(f, "Error({:?})", msg),
+            Value::Pointer(base) => write!(f, "UnsafePointer(0x{:x})", base),
             Value::Moved => write!(f, "<moved>"),
             Value::List(items) => {
                 write!(f, "[")?;
@@ -244,6 +249,7 @@ pub(crate) fn type_name(value: &Value) -> String {
             }
         }
         Value::Error(_) => "Error".to_string(),
+        Value::Pointer(_) => "UnsafePointer".to_string(),
         Value::Moved => "<moved>".to_string(),
         Value::List(_) => "List".to_string(),
         Value::Tuple(items) => {
@@ -507,6 +513,77 @@ pub(crate) fn value_as_index(v: &Value) -> Result<i64, RuntimeError> {
         Value::Int(n) => Ok(*n),
         other => Err(RuntimeError::TypeError(format!(
             "index must be Int, got {}",
+            type_name(other)
+        ))),
+    }
+}
+
+/// The concrete indices a slice `[lower:upper:step]` selects from a sequence of
+/// `len` elements, using Python semantics (negative indices wrap; bounds clamp;
+/// `step` may be negative to reverse; `None` bounds take direction-aware defaults).
+/// A zero `step` is a runtime error.
+pub(crate) fn slice_indices(
+    len: i64,
+    lower: Option<i64>,
+    upper: Option<i64>,
+    step: Option<i64>,
+) -> Result<Vec<usize>, RuntimeError> {
+    let step = step.unwrap_or(1);
+    if step == 0 {
+        return Err(RuntimeError::TypeError("slice step cannot be zero".to_string()));
+    }
+    // Clamp an explicit bound to a valid range, wrapping a negative index once.
+    let adjust = |i: i64| -> i64 {
+        let i = if i < 0 { i + len } else { i };
+        if step > 0 {
+            i.clamp(0, len)
+        } else {
+            i.clamp(-1, len - 1)
+        }
+    };
+    let (start, stop) = if step > 0 {
+        (lower.map_or(0, adjust), upper.map_or(len, adjust))
+    } else {
+        (lower.map_or(len - 1, adjust), upper.map_or(-1, adjust))
+    };
+    let mut idxs = Vec::new();
+    let mut i = start;
+    if step > 0 {
+        while i < stop {
+            idxs.push(i as usize);
+            i += step;
+        }
+    } else {
+        while i > stop {
+            idxs.push(i as usize);
+            i += step;
+        }
+    }
+    Ok(idxs)
+}
+
+/// Slice a `List`/`String` value (`a[lower:upper:step]`), returning a new value of
+/// the same kind. `String` is sliced over its **bytes** (consistent with `len`),
+/// rebuilt lossily if a multibyte boundary is split.
+pub(crate) fn slice_value(
+    v: &Value,
+    lower: Option<i64>,
+    upper: Option<i64>,
+    step: Option<i64>,
+) -> Result<Value, RuntimeError> {
+    match v {
+        Value::List(items) => {
+            let idxs = slice_indices(items.len() as i64, lower, upper, step)?;
+            Ok(Value::List(idxs.into_iter().map(|i| items[i].clone()).collect()))
+        }
+        Value::Str(s) => {
+            let bytes = s.as_bytes();
+            let idxs = slice_indices(bytes.len() as i64, lower, upper, step)?;
+            let picked: Vec<u8> = idxs.into_iter().map(|i| bytes[i]).collect();
+            Ok(Value::Str(String::from_utf8_lossy(&picked).into_owned()))
+        }
+        other => Err(RuntimeError::TypeError(format!(
+            "cannot slice {}",
             type_name(other)
         ))),
     }

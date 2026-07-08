@@ -146,9 +146,9 @@ assignment target — a `NAME` or a place — and a trailing comma is allowed
 (`a, = t`). This is the **bare form only**: the `var a, b = e` form is a still-open
 Mojo feature request ([modular/modular#2105](https://github.com/modular/modular/issues/2105)),
 so it is *not* accepted (strict-subset — mojo-lite never invents syntax Mojo lacks).
-The construct is **parsed and grammar-documented, but the checker flags it as an
-unsupported feature** (its element-splitting semantics are deferred) — another
-"parse now, run later" gap.
+The value tuple is evaluated **once**; each element is then bound to its target (a
+`NAME` follows the assignment rules — re-assign if in scope, else a var-less
+introduction).
 
 **Augmented assignment** `target OP= e` means `target = target OP e` for the seven
 arithmetic operators (`+ - * / // % **`; the bitwise/`@` forms Mojo also has are not
@@ -182,10 +182,16 @@ names, `from module import *` imports all (discouraged in Mojo, but valid). The 
 may be **relative** — leading dots give the level (`from .mymodule import X`, `from .
 import X`, `from ..pkg import X`); because the lexer tokenizes `...` as a single
 ellipsis, a 3-dot level (`from ...pkg import X`) is read as one `...` (plus any further
-`.`). **Imports are parsed but not resolved** — mojo-lite has no module system yet, so
-the checker and evaluator treat an import as a no-op (the imported names are *not* made
-available). This is a deliberate parse-now-run-later feature so the parser stays a
-complete Mojo syntax front-end.
+`.`). **`from module import …` is now resolved** by a link pass (`src/module.rs`): when
+a file path is given (`mojo-lite run FILE`), the module is loaded from a `.mojo` file
+relative to the importing file's directory (`collections` → `collections.mojo`, dotted
+`a.b` → `a/b.mojo`, relative dots climb directories) and its **top-level declarations**
+(`def`/`struct`/`trait`/`comptime`, excluding `main`) are hoisted into the program ahead
+of the code that uses them. Imports are resolved transitively (a module may import
+others), deduplicated by path (cycles are broken). Still parse-only / no-op: a plain
+`import module` (qualified `module.Name` access), `as` aliases on imported names, and a
+module's top-level executable code (only declarations are hoisted). From stdin (no base
+directory) imports stay unresolved.
 
 ### function_def
 
@@ -428,7 +434,7 @@ expression:
     | NAME ':=' expression        # named expression (walrus) — parsed, deferred
     | conditional
 conditional:
-    | disjunction 'if' disjunction 'else' expression   # ternary `a if c else b` — parsed, deferred
+    | disjunction 'if' disjunction 'else' expression   # ternary `a if c else b` (implemented)
     | disjunction
 
 disjunction:
@@ -441,7 +447,7 @@ inversion:
     | 'not' inversion
     | comparison
 comparison:
-    | sum (compare_op sum)+       # chained: `a < b < c` — a `Compare` node (parsed, deferred)
+    | sum (compare_op sum)+       # chained: `a < b < c` (implemented — each operand once, short-circuits)
     | sum compare_op sum          # a single comparison stays an `Infix`
     | sum
 compare_op: '==' | '!=' | '<=' | '<' | '>=' | '>' | 'in' | 'not' 'in'
@@ -465,8 +471,9 @@ primary:
     | primary '.' NAME '(' [args] ')'    # method call
     | primary '.' NAME                   # field access / value-parameter read (Self.n)
     | atom [param_args] '(' [args] ')'   # call/construction, optionally with explicit params
-    | primary '[' expression ']'         # subscript: index, v[i]
-    | primary '[' [expression] ':' [expression] [':' [expression]] ']'  # slice `a[i:j:k]` — parsed, deferred
+    | NAME param_args                    # parameterized type in expr position (TypeApply), e.g. UnsafePointer[Int]
+    | primary '[' expression ']'         # subscript: index, v[i], ptr[i]
+    | primary '[' [expression] ':' [expression] [':' [expression]] ']'  # slice `a[i:j:k]` on List/String (implemented)
     | primary '^'                        # transfer sigil (ownership move); parsed, not modeled
     | atom
 atom:
@@ -499,10 +506,9 @@ positional elements.
 
 Notes:
 
-- **`comparison` is ordinary left-associative binary.** `a < b < c` parses as
-  `(a < b) < c`, which the checker then rejects: ordering is defined on the numeric
-  types (`Int` / `UInt` / `Float64`), `a < b` is `Bool`, and `Bool < c` is not defined.
-  There is no chained-comparison special-casing.
+- **A single comparison is an `Infix`; a chain of ≥ 2 (`a < b < c`, `0 <= i < n`) is a
+  `Compare` node** — implemented as `(a < b) and (b < c)` with each operand evaluated
+  **once**, left to right, short-circuiting (a false link stops the rest). Result `Bool`.
 - **Membership `x in c` / `x not in c`** share the comparison level and return `Bool`
   (`not in` is two words). `c` is a `List[T]` (is `x` an element? — `x` must coerce to an
   **equatable** `T`) or a `String` (is `x` a substring? — `x` a `String`). In infix
@@ -596,10 +602,22 @@ comptime_for_stmt: 'comptime' for_stmt     # 'comptime' 'for' NAME 'in' expressi
 unrolled loop** (`comptime for i in range(1, 5):`). These are Mojo's *modern*
 spellings — the older `@parameter if` / `@parameter for` are **deprecated** (mojo-lite
 follows current Mojo, per the strict-subset rule, and does not accept the `@parameter`
-forms). Both are **parsed and grammar-documented, but the checker flags them as an
-unsupported feature** (compile-time branch selection / loop unrolling is deferred) — a
-"parse now, run later" gap. Comptime values of non-`Int` type are likewise not
-implemented.
+forms). Both are **implemented** by a compile-time **elaboration pass** (`src/comptime.rs`,
+run between parsing and checking): `comptime if` evaluates its conditions at compile
+time and keeps only the taken branch — the others are **dropped before type-checking**,
+so an unselected branch may contain code valid only for other specializations; `comptime
+for` unrolls over a compile-time **`range(...)` or a compile-time tuple/list**
+(`comptime for s in ("a", "b"):`), substituting the loop variable with its literal value
+in each body copy, bounded by an iteration **quota**. The evaluator's compile-time values
+are `Int`/`Bool`/`String`/`Tuple`/`List` (integer arithmetic & comparisons, `and`/`or`/
+`not`, `String` `+`/`==`, indexing a comptime tuple/list) and it reads `comptime NAME`
+constants. **CTFE:** a `comptime` context may call a **pure top-level function** — run by a
+small, fuel-bounded AST interpreter (`comptime CAP = next_power_of_two(17)`; supports
+`if`/`while`/`for`/recursion over compile-time values, no I/O or runtime state).
+**Materialization:** module-level `comptime` constants are inlined as literals into runtime
+code (values, value-parameter arguments), so a top-level comptime value is usable inside
+functions. Deferred: compile-time *type* values, CTFE of methods/generic functions, and
+comptime constants of non-`Int`/`Bool` kind as value parameters.
 
 ## Built-ins
 
@@ -715,6 +733,21 @@ is a **value type**: assigning or passing a `List` **copies** it (no aliasing).
   checker error.
 - **Immutable**: no element write (`t[0] = e` is rejected), though the whole `var` can be
   re-assigned. Deferred: tuple unpacking (`var (a, b) = t`) and `for` over a tuple.
+
+`UnsafePointer[T]` is the built-in low-level pointer — a handle to contiguous heap
+storage of element type `T`. Unlike the value-type collections, a pointer **aliases**:
+copying it copies the offset, so two copies refer to the *same* storage (this is what lets
+a value-type struct own mutable heap storage, e.g. a self-hosted `List`).
+
+- **Allocation**: `UnsafePointer[T].alloc(n)` (a static method on the parameterized type —
+  the `Name[T]` receiver is a `TypeApply` expression) reserves `n` uninitialized slots and
+  returns a pointer to the base.
+- **Load / store**: `ptr[i]` reads, `ptr[i] = e` (and `ptr[i] += e`) writes the pointee at
+  offset `i` (an `Int`); `e` must be a `T`.
+- **`free()`**: releases the allocation (a no-op in the model's arena, which never reclaims).
+- Deferred: pointer arithmetic (`ptr + i`), `.load()`/`.store()`, and the pointee-lifecycle
+  methods (`init_pointee_*`, `destroy_pointee`, `take_pointee`). `UnsafePointer` is
+  **unchecked** — an out-of-allocation (but in-arena) access is permitted, matching Mojo.
 
 ## Tokens (lexical structure)
 

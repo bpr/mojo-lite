@@ -37,6 +37,10 @@ pub enum HirInstr {
     /// An ASAP destructor, spliced in by the Phase 4 liveness pass (never by the
     /// Phase 1 lowerer — present so later phases share the type).
     Drop(VarId),
+    /// Iterator protocol: normalize the iterable in `iter` to an *iterator* — for a
+    /// user struct, `iter = iter.__iter__()`; a built-in `range`/`List` iterates in
+    /// place, so this is a no-op. Emitted once before the loop header.
+    GetIter { iter: VarId },
     /// Iterator protocol (`for` loops): `dest = whether `iter` yields another
     /// element` (a `Bool`), a pure read of the iterator's state. `iter`/`dest` are
     /// variable slots so both IRs and the backend address them uniformly.
@@ -317,6 +321,9 @@ impl Lower {
                     expr: iter.clone(),
                     ty: None,
                 });
+                // Normalize the iterable to an iterator (a user struct's `__iter__`;
+                // a no-op for a built-in `range`/`List`).
+                self.push(HirInstr::GetIter { iter: it_var });
 
                 let header = self.new_block();
                 let body_b = self.new_block();
