@@ -1220,19 +1220,25 @@ fn variadic_args_after_regular_params() {
 #[test]
 fn mut_param_writes_back_to_caller() {
     // A `mut` reference parameter mutates the caller's variable.
-    let ev = output("def incr(mut x: Int):\n    x = x + 1\n\ndef main():\n    var n: Int = 5\n    incr(n)\n    print(n)\n");
+    let ev = output(
+        "def incr(mut x: Int):\n    x = x + 1\n\ndef main():\n    var n: Int = 5\n    incr(n)\n    print(n)\n",
+    );
     assert_eq!(ev, "6\n");
 }
 
 #[test]
 fn mut_param_mutates_a_struct_field() {
-    let ev = output("@fieldwise_init\nstruct Counter:\n    var n: Int\n\ndef bump(mut c: Counter, k: Int):\n    c.n = c.n + k\n\ndef main():\n    var c: Counter = Counter(0)\n    bump(c, 5)\n    bump(c, 3)\n    print(c.n)\n");
+    let ev = output(
+        "@fieldwise_init\nstruct Counter:\n    var n: Int\n\ndef bump(mut c: Counter, k: Int):\n    c.n = c.n + k\n\ndef main():\n    var c: Counter = Counter(0)\n    bump(c, 5)\n    bump(c, 3)\n    print(c.n)\n",
+    );
     assert_eq!(ev, "8\n");
 }
 
 #[test]
 fn ref_param_also_writes_back() {
     // `ref` (a reference) is modeled like `mut` for write-back.
-    let ev = output("def set_to(ref x: Int, v: Int):\n    x = v\n\ndef main():\n    var n: Int = 0\n    set_to(n, 42)\n    print(n)\n");
+    let ev = output(
+        "def set_to(ref x: Int, v: Int):\n    x = v\n\ndef main():\n    var n: Int = 0\n    set_to(n, 42)\n    print(n)\n",
+    );
     assert_eq!(ev, "42\n");
 }

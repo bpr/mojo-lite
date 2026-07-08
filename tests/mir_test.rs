@@ -3,13 +3,17 @@
 //! produces one function per `def` / method.
 
 use mojo_lite::hir::Cfg;
-use mojo_lite::mir::{lower_cfg, lower_program, MirInstr, MirPlace, MirTerm, Proj};
+use mojo_lite::mir::{MirInstr, MirPlace, MirTerm, Proj, lower_cfg, lower_program};
 use mojo_lite::parse;
 
 /// Lower a single-block snippet and return that block's instructions.
 fn instrs(src: &str) -> Vec<MirInstr> {
     let mir = lower_cfg(&Cfg::build(&parse(src).expect("parse error")));
-    assert_eq!(mir.blocks.len(), 1, "snippet should be one straight-line block");
+    assert_eq!(
+        mir.blocks.len(),
+        1,
+        "snippet should be one straight-line block"
+    );
     mir.blocks.into_iter().next().unwrap().instrs
 }
 
@@ -19,8 +23,15 @@ fn lowers_a_simple_function_body() {
     let cfg = Cfg::build(&parse("var x: Int = 1 + 2\nreturn x\n").unwrap());
     let mir = lower_cfg(&cfg);
 
-    assert_eq!(mir.blocks.len(), cfg.node_count(), "one MIR block per HIR block");
-    assert!(matches!(mir.blocks[0].term, MirTerm::Return(Some(_))), "returns a value");
+    assert_eq!(
+        mir.blocks.len(),
+        cfg.node_count(),
+        "one MIR block per HIR block"
+    );
+    assert!(
+        matches!(mir.blocks[0].term, MirTerm::Return(Some(_))),
+        "returns a value"
+    );
     // Const(1), Const(2), BinOp(+), DefVar(x), UseVar(x) ⇒ 5 instrs; regs r0..r3.
     assert_eq!(mir.blocks[0].instrs.len(), 5);
     assert_eq!(mir.n_regs, 4);
@@ -34,7 +45,10 @@ fn lowers_a_simple_function_body() {
         MirInstr::UseVar { var, .. } => Some(*var),
         _ => None,
     });
-    assert_eq!(def, used, "def and use must refer to the same VarId (seeded interner)");
+    assert_eq!(
+        def, used,
+        "def and use must refer to the same VarId (seeded interner)"
+    );
 }
 
 #[test]
@@ -89,13 +103,24 @@ fn nested_calls_flatten_to_temps_in_order() {
     assert!(matches!(is[0], MirInstr::UseVar { .. }));
     match (&is[1], &is[2]) {
         (
-            MirInstr::Call { func: g, args: ga, dest: gd, .. },
-            MirInstr::Call { func: f, args: fa, .. },
+            MirInstr::Call {
+                func: g,
+                args: ga,
+                dest: gd,
+                ..
+            },
+            MirInstr::Call {
+                func: f, args: fa, ..
+            },
         ) => {
             assert_eq!(g.0, "g");
             assert_eq!(f.0, "f");
             assert_eq!(ga.len(), 1);
-            assert_eq!(fa, &vec![*gd], "outer call takes the inner call's result register");
+            assert_eq!(
+                fa,
+                &vec![*gd],
+                "outer call takes the inner call's result register"
+            );
         }
         other => panic!("expected two Calls, got {other:?}"),
     }
@@ -107,7 +132,10 @@ fn transfer_lowers_to_a_move_use() {
     let is = instrs("f(x^)\n");
     assert!(is.iter().any(|i| matches!(
         i,
-        MirInstr::UseVar { mode: mojo_lite::mir::UseMode::Move, .. }
+        MirInstr::UseVar {
+            mode: mojo_lite::mir::UseMode::Move,
+            ..
+        }
     )));
 }
 
@@ -135,24 +163,31 @@ fn index_write_lowers_to_a_store_with_an_index_projection() {
         MirInstr::Store { place, .. } => Some(place),
         _ => None,
     });
-    assert!(matches!(
-        store.map(|p| p.proj.as_slice()),
-        Some([Proj::Index(_)])
-    ), "index write should Store through an Index projection, got {is:?}");
+    assert!(
+        matches!(store.map(|p| p.proj.as_slice()), Some([Proj::Index(_)])),
+        "index write should Store through an Index projection, got {is:?}"
+    );
 }
 
 #[test]
 fn nested_place_write_stacks_projections() {
     // `p.items[i].x = 1` ⇒ place proj = [Field(items), Index(i), Field(x)].
     let is = instrs("p.items[0].x = 1\n");
-    let place = is.iter().find_map(|i| match i {
-        MirInstr::Store { place, .. } => Some(place),
-        _ => None,
-    }).expect("a Store");
-    assert!(matches!(
-        place.proj.as_slice(),
-        [Proj::Field(a), Proj::Index(_), Proj::Field(b)] if a == "items" && b == "x"
-    ), "got {:?}", place.proj);
+    let place = is
+        .iter()
+        .find_map(|i| match i {
+            MirInstr::Store { place, .. } => Some(place),
+            _ => None,
+        })
+        .expect("a Store");
+    assert!(
+        matches!(
+            place.proj.as_slice(),
+            [Proj::Field(a), Proj::Index(_), Proj::Field(b)] if a == "items" && b == "x"
+        ),
+        "got {:?}",
+        place.proj
+    );
 }
 
 #[test]
@@ -163,8 +198,14 @@ fn aug_assign_on_a_name_is_read_modify_write() {
     assert!(matches!(is[0], MirInstr::UseVar { .. }));
     assert!(matches!(is[3], MirInstr::DefVar { .. }));
     // The read and the write-back name the same variable.
-    let read = match is[0] { MirInstr::UseVar { var, .. } => var, _ => unreachable!() };
-    let write = match is[3] { MirInstr::DefVar { var, .. } => var, _ => unreachable!() };
+    let read = match is[0] {
+        MirInstr::UseVar { var, .. } => var,
+        _ => unreachable!(),
+    };
+    let write = match is[3] {
+        MirInstr::DefVar { var, .. } => var,
+        _ => unreachable!(),
+    };
     assert_eq!(read, write);
 }
 
@@ -185,7 +226,10 @@ fn aug_assign_through_a_place_loads_and_stores_the_same_place() {
         MirInstr::Store { place, .. } => Some(idx_reg(place)),
         _ => None,
     });
-    assert!(loaded.is_some() && loaded == stored, "load and store share one index reg: {is:?}");
+    assert!(
+        loaded.is_some() && loaded == stored,
+        "load and store share one index reg: {is:?}"
+    );
 }
 
 #[test]
@@ -197,8 +241,14 @@ fn program_driver_makes_a_function_per_def_and_method() {
     let mir = lower_program(&program);
     let names: Vec<&str> = mir.functions.iter().map(|(n, _)| n.as_str()).collect();
     assert!(names.contains(&"f"), "a def becomes a function: {names:?}");
-    assert!(names.contains(&"P.get"), "a method becomes Struct.method: {names:?}");
-    assert!(names.contains(&"__toplevel__"), "top-level stmts collect into __toplevel__: {names:?}");
+    assert!(
+        names.contains(&"P.get"),
+        "a method becomes Struct.method: {names:?}"
+    );
+    assert!(
+        names.contains(&"__toplevel__"),
+        "top-level stmts collect into __toplevel__: {names:?}"
+    );
 }
 
 #[test]
@@ -213,7 +263,10 @@ fn member_read_lowers_to_a_place_load() {
     });
     match place {
         Some(MirPlace { proj, .. }) => {
-            assert!(matches!(proj.as_slice(), [Proj::Field(f)] if f == "a"), "got {proj:?}");
+            assert!(
+                matches!(proj.as_slice(), [Proj::Field(f)] if f == "a"),
+                "got {proj:?}"
+            );
         }
         None => panic!("member read should be a LoadPlace, got {is:?}"),
     }
@@ -234,7 +287,10 @@ fn partial_move_lowers_to_a_move_place() {
     });
     match place {
         Some(MirPlace { proj, .. }) => {
-            assert!(matches!(proj.as_slice(), [Proj::Field(f)] if f == "a"), "got {proj:?}");
+            assert!(
+                matches!(proj.as_slice(), [Proj::Field(f)] if f == "a"),
+                "got {proj:?}"
+            );
         }
         None => panic!("partial move should be a MovePlace, got {is:?}"),
     }
@@ -242,12 +298,16 @@ fn partial_move_lowers_to_a_move_place() {
 
 #[test]
 fn break_crossing_try_lowers_to_escape_jump() {
-    use mojo_lite::mir::{lower_program, MirInstr, MirTerm};
+    use mojo_lite::mir::{MirInstr, MirTerm, lower_program};
     // `break` inside a `try` in a `for` loop lowers to a `MirTerm::EscapeJump` in
     // the try's body region — not a `MirInstr::Unsupported`.
     let src = "def main():\n    for i in range(3):\n        try:\n            break\n        finally:\n            print(i)\n";
     let prog = lower_program(&parse(src).expect("parse"));
-    let (_, main) = prog.functions.iter().find(|(n, _)| n == "main").expect("main");
+    let (_, main) = prog
+        .functions
+        .iter()
+        .find(|(n, _)| n == "main")
+        .expect("main");
 
     let mut found_escape = false;
     let mut found_unsupported = false;
@@ -266,6 +326,12 @@ fn break_crossing_try_lowers_to_escape_jump() {
             }
         }
     }
-    assert!(found_escape, "break in the try body should lower to an EscapeJump");
-    assert!(!found_unsupported, "a function-level try escape must not be Unsupported");
+    assert!(
+        found_escape,
+        "break in the try body should lower to an EscapeJump"
+    );
+    assert!(
+        !found_unsupported,
+        "a function-level try escape must not be Unsupported"
+    );
 }

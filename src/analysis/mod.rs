@@ -51,7 +51,11 @@ pub fn elaborate_drops_program(prog: MirProgram) -> MirProgram {
                 // they are not ASAP-dropped — that also keeps their final values
                 // intact for the CLI/`bindings()` global dump (a `DropVar` would
                 // clear the slot).
-                let elaborated = if name == "__toplevel__" { f } else { elaborate_drops(&f) };
+                let elaborated = if name == "__toplevel__" {
+                    f
+                } else {
+                    elaborate_drops(&f)
+                };
                 (name, elaborated)
             })
             .collect(),
@@ -68,12 +72,22 @@ fn var_uses(i: &MirInstr) -> Vec<(VarId, Reg)> {
         MirInstr::MovePlace { dest, place } => vec![(place.root, *dest)],
         MirInstr::Store { place, src } => vec![(place.root, *src)],
         MirInstr::LoadPlace { dest, place } => vec![(place.root, *dest)],
-        MirInstr::MethodCall { dest, recv_place: Some(p), .. } => vec![(p.root, *dest)],
+        MirInstr::MethodCall {
+            dest,
+            recv_place: Some(p),
+            ..
+        } => vec![(p.root, *dest)],
         MirInstr::HasNext { dest, iter } | MirInstr::Next { dest, iter } => vec![(*iter, *dest)],
         // A `try` reads every variable its sub-regions read: the outer liveness must
         // treat it as one big use, so a value used only inside the `try` is not
         // dropped *before* it.
-        MirInstr::Try { body, handler, orelse, finalbody, .. } => {
+        MirInstr::Try {
+            body,
+            handler,
+            orelse,
+            finalbody,
+            ..
+        } => {
             let mut uses = Vec::new();
             let mut add = |bs: &[MirBlock]| {
                 for b in bs {
@@ -132,7 +146,11 @@ fn var_def(i: &MirInstr) -> Option<VarId> {
 /// variable is *not* dropped here (its value has moved to a new owner).
 fn var_moved(i: &MirInstr) -> Option<VarId> {
     match i {
-        MirInstr::UseVar { var, mode: UseMode::Move, .. } => Some(*var),
+        MirInstr::UseVar {
+            var,
+            mode: UseMode::Move,
+            ..
+        } => Some(*var),
         _ => None,
     }
 }
@@ -213,7 +231,10 @@ fn elaborate_drops(f: &MirFunction) -> MirFunction {
                 // survive the escape edge — exclude it (and the loop var, which the
                 // `finally` typically reads) from the escape cleanup.
                 let fin_used = match instr {
-                    MirInstr::Try { finalbody: Some(fb), .. } => region_uses(fb),
+                    MirInstr::Try {
+                        finalbody: Some(fb),
+                        ..
+                    } => region_uses(fb),
                     _ => HashSet::new(),
                 };
                 let base: HashSet<VarId> = live_before
@@ -230,7 +251,10 @@ fn elaborate_drops(f: &MirFunction) -> MirFunction {
             new_instrs.push(cloned);
             let moved = var_moved(instr);
             let mut dying: Vec<VarId> = Vec::new();
-            let touched = var_uses(instr).into_iter().map(|(v, _)| v).chain(var_def(instr));
+            let touched = var_uses(instr)
+                .into_iter()
+                .map(|(v, _)| v)
+                .chain(var_def(instr));
             for v in touched {
                 if is_droppable_root(f, v)
                     && Some(v) != moved
@@ -242,7 +266,10 @@ fn elaborate_drops(f: &MirFunction) -> MirFunction {
             }
             append_drops(&mut new_instrs, dying);
         }
-        blocks.push(MirBlock { instrs: new_instrs, term: f.blocks[b].term.clone() });
+        blocks.push(MirBlock {
+            instrs: new_instrs,
+            term: f.blocks[b].term.clone(),
+        });
     }
 
     // (2) Edge drops: a variable live out of `p` but dead entering successor `s`
@@ -278,7 +305,10 @@ fn elaborate_drops(f: &MirFunction) -> MirFunction {
                 let new_idx = blocks.len();
                 let mut instrs = Vec::new();
                 append_drops(&mut instrs, dying);
-                blocks.push(MirBlock { instrs, term: MirTerm::Jump(s) });
+                blocks.push(MirBlock {
+                    instrs,
+                    term: MirTerm::Jump(s),
+                });
                 rewire_target(&mut blocks[p].term, s, new_idx);
             }
         }
@@ -319,7 +349,14 @@ fn region_uses(blocks: &[MirBlock]) -> HashSet<VarId> {
 /// (recursively, through nested `try`s). Used to exclude a `try`'s own body-locals
 /// (handled by `Try.cleanup`) and moved-out values from the escape-edge cleanup.
 fn try_region_defs(try_instr: &MirInstr, defs: &mut HashSet<VarId>, moved: &mut HashSet<VarId>) {
-    if let MirInstr::Try { body, handler, orelse, finalbody, .. } = try_instr {
+    if let MirInstr::Try {
+        body,
+        handler,
+        orelse,
+        finalbody,
+        ..
+    } = try_instr
+    {
         let mut regions: Vec<&Vec<MirBlock>> = vec![body];
         if let Some((_, h)) = handler {
             regions.push(h);
@@ -351,8 +388,19 @@ fn try_region_defs(try_instr: &MirInstr, defs: &mut HashSet<VarId>, moved: &mut 
 /// die on the hidden `break`/`continue` edge and must be destroyed there. `base`
 /// already excludes the `try`'s body-locals (dropped by `Try.cleanup`), moved
 /// values, and non-droppable roots.
-fn fill_escape_cleanups(try_instr: &mut MirInstr, base: &HashSet<VarId>, live_in: &[HashSet<VarId>]) {
-    if let MirInstr::Try { body, handler, orelse, finalbody, .. } = try_instr {
+fn fill_escape_cleanups(
+    try_instr: &mut MirInstr,
+    base: &HashSet<VarId>,
+    live_in: &[HashSet<VarId>],
+) {
+    if let MirInstr::Try {
+        body,
+        handler,
+        orelse,
+        finalbody,
+        ..
+    } = try_instr
+    {
         let mut regions: Vec<&mut Vec<MirBlock>> = vec![body];
         if let Some((_, h)) = handler {
             regions.push(h);
@@ -370,8 +418,11 @@ fn fill_escape_cleanups(try_instr: &mut MirInstr, base: &HashSet<VarId>, live_in
                 }
                 if let MirTerm::EscapeJump { target, cleanup } = &mut b.term {
                     let dead_at_target = live_in.get(*target).cloned().unwrap_or_default();
-                    let mut vars: Vec<VarId> =
-                        base.iter().copied().filter(|v| !dead_at_target.contains(v)).collect();
+                    let mut vars: Vec<VarId> = base
+                        .iter()
+                        .copied()
+                        .filter(|v| !dead_at_target.contains(v))
+                        .collect();
                     vars.sort_unstable_by(|a, b| b.cmp(a)); // reverse declaration order
                     *cleanup = vars;
                 }
@@ -385,7 +436,14 @@ fn fill_escape_cleanups(try_instr: &mut MirInstr, base: &HashSet<VarId>, live_in
 fn set_try_cleanups(blocks: &mut [MirBlock]) {
     for b in blocks.iter_mut() {
         for instr in b.instrs.iter_mut() {
-            if let MirInstr::Try { body, handler, orelse, finalbody, cleanup } = instr {
+            if let MirInstr::Try {
+                body,
+                handler,
+                orelse,
+                finalbody,
+                cleanup,
+            } = instr
+            {
                 *cleanup = region_cleanup_vars(body);
                 set_try_cleanups(body);
                 if let Some((_, h)) = handler {
@@ -559,7 +617,10 @@ struct Node {
 
 impl Node {
     fn owned() -> Node {
-        Node { base: Own::Owned, children: BTreeMap::new() }
+        Node {
+            base: Own::Owned,
+            children: BTreeMap::new(),
+        }
     }
 
     /// Severity of *reading the whole subtree* at this node, paired with the
@@ -624,12 +685,20 @@ impl Node {
     /// Mark the place at `path` as wholly moved (clearing its sub-state).
     fn do_move(&mut self, path: &[Key]) {
         match path.split_first() {
-            None => *self = Node { base: Own::Moved, children: BTreeMap::new() },
+            None => {
+                *self = Node {
+                    base: Own::Moved,
+                    children: BTreeMap::new(),
+                }
+            }
             Some((k, rest)) => {
                 let base = self.base;
                 self.children
                     .entry(k.clone())
-                    .or_insert_with(|| Node { base, children: BTreeMap::new() })
+                    .or_insert_with(|| Node {
+                        base,
+                        children: BTreeMap::new(),
+                    })
                     .do_move(rest);
             }
         }
@@ -648,7 +717,10 @@ impl Node {
                 let base = self.base;
                 self.children
                     .entry(k.clone())
-                    .or_insert_with(|| Node { base, children: BTreeMap::new() })
+                    .or_insert_with(|| Node {
+                        base,
+                        children: BTreeMap::new(),
+                    })
                     .do_def(rest);
             }
         }
@@ -664,16 +736,14 @@ fn join_node(a: &Node, b: &Node) -> Node {
     keys.sort_unstable();
     keys.dedup();
     for k in keys {
-        let ca = a
-            .children
-            .get(k)
-            .cloned()
-            .unwrap_or(Node { base: a.base, children: BTreeMap::new() });
-        let cb = b
-            .children
-            .get(k)
-            .cloned()
-            .unwrap_or(Node { base: b.base, children: BTreeMap::new() });
+        let ca = a.children.get(k).cloned().unwrap_or(Node {
+            base: a.base,
+            children: BTreeMap::new(),
+        });
+        let cb = b.children.get(k).cloned().unwrap_or(Node {
+            base: b.base,
+            children: BTreeMap::new(),
+        });
         children.insert(k.clone(), join_node(&ca, &cb));
     }
     Node { base, children }
@@ -737,7 +807,11 @@ fn place_uses(i: &MirInstr) -> Vec<(VarId, Vec<Key>, Touch, Reg)> {
 fn apply_effects(state: &mut [Node], i: &MirInstr) {
     match i {
         MirInstr::DefVar { var, .. } => state[*var as usize].do_def(&[]),
-        MirInstr::UseVar { var, mode: UseMode::Move, .. } => state[*var as usize].do_move(&[]),
+        MirInstr::UseVar {
+            var,
+            mode: UseMode::Move,
+            ..
+        } => state[*var as usize].do_move(&[]),
         MirInstr::MovePlace { place, .. } => {
             state[place.root as usize].do_move(&place_path(place));
         }

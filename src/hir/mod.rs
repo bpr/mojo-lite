@@ -119,13 +119,23 @@ impl Cfg {
     pub fn build_fn(params: &[String], body: &[Stmt]) -> Cfg {
         let mut g = StableGraph::new();
         let entry = g.add_node(BasicBlock::default());
-        let mut lower =
-            Lower { g, cur: entry, loops: Vec::new(), vars: params.to_vec(), is_function: true };
+        let mut lower = Lower {
+            g,
+            cur: entry,
+            loops: Vec::new(),
+            vars: params.to_vec(),
+            is_function: true,
+        };
         for s in body {
             lower.stmt(s);
         }
         lower.seal(Terminator::Return(None)); // implicit `return None` off the end
-        Cfg { g: lower.g, entry, vars: lower.vars, n_params: params.len() }
+        Cfg {
+            g: lower.g,
+            entry,
+            vars: lower.vars,
+            n_params: params.len(),
+        }
     }
 
     /// Lower a statement sequence into a CFG whose variable interner **starts**
@@ -151,14 +161,29 @@ impl Cfg {
         let entry = g.add_node(BasicBlock::default());
         let loops = external_loops
             .iter()
-            .map(|&(header, exit)| LoopFrame { header, exit, escape: true })
+            .map(|&(header, exit)| LoopFrame {
+                header,
+                exit,
+                escape: true,
+            })
             .collect();
-        let mut lower = Lower { g, cur: entry, loops, vars: seed_vars, is_function: false };
+        let mut lower = Lower {
+            g,
+            cur: entry,
+            loops,
+            vars: seed_vars,
+            is_function: false,
+        };
         for s in body {
             lower.stmt(s);
         }
         lower.seal(Terminator::FallOff); // region completed normally (not a return)
-        Cfg { g: lower.g, entry, vars: lower.vars, n_params: 0 }
+        Cfg {
+            g: lower.g,
+            entry,
+            vars: lower.vars,
+            n_params: 0,
+        }
     }
 
     // --- Read-only accessors (so tests/analysis need not import `petgraph`) ---
@@ -299,7 +324,11 @@ impl Lower {
                     else_b: exit,
                 });
                 self.cur = body_b;
-                self.loops.push(LoopFrame { header, exit, escape: false });
+                self.loops.push(LoopFrame {
+                    header,
+                    exit,
+                    escape: false,
+                });
                 self.block(body);
                 self.loops.pop();
                 self.seal(Terminator::Jump(header)); // back-edge (unless body sealed via break/return)
@@ -334,7 +363,10 @@ impl Lower {
                 self.cur = header;
                 let hn_name = format!("$hasnext{}", self.vars.len());
                 let hn_var = self.var(&hn_name);
-                self.push(HirInstr::HasNext { iter: it_var, dest: hn_var });
+                self.push(HirInstr::HasNext {
+                    iter: it_var,
+                    dest: hn_var,
+                });
                 self.seal(Terminator::Branch {
                     cond: Expr::new(ExprKind::Identifier(hn_name), DUMMY_SPAN),
                     then_b: body_b,
@@ -344,8 +376,15 @@ impl Lower {
                 // body: x = next(it); <body>; back-edge to header.
                 self.cur = body_b;
                 let v = self.var(var);
-                self.push(HirInstr::Next { iter: it_var, dest: v });
-                self.loops.push(LoopFrame { header, exit, escape: false });
+                self.push(HirInstr::Next {
+                    iter: it_var,
+                    dest: v,
+                });
+                self.loops.push(LoopFrame {
+                    header,
+                    exit,
+                    escape: false,
+                });
                 self.block(body);
                 self.loops.pop();
                 self.seal(Terminator::Jump(header));
@@ -353,7 +392,10 @@ impl Lower {
             }
 
             StmtKind::Break => {
-                let f = *self.loops.last().expect("break outside a loop (checker guards this)");
+                let f = *self
+                    .loops
+                    .last()
+                    .expect("break outside a loop (checker guards this)");
                 // A loop in this CFG → a plain `Jump` to its exit; an enclosing
                 // function loop (seeded into a `try` region) → an `EscapeJump`.
                 self.seal(if f.escape {
@@ -400,7 +442,10 @@ impl Lower {
                 let escapable = self.is_function || self.loops.iter().all(|f| f.escape);
                 if escapable {
                     let loop_targets = self.loops.iter().map(|f| (f.header, f.exit)).collect();
-                    self.push(HirInstr::Try { stmt: s.clone(), loop_targets });
+                    self.push(HirInstr::Try {
+                        stmt: s.clone(),
+                        loop_targets,
+                    });
                 } else {
                     self.push(HirInstr::Stmt(s.clone()));
                 }

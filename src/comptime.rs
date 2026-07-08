@@ -19,9 +19,11 @@
 //! - **Materialization** — module-level `comptime` constants are inlined as literals
 //!   into runtime code, so a top-level comptime value is usable inside functions.
 //!
-//! Compile-time values are `Int`/`Bool`/`String`/`Tuple`/`List` (`CtValue`).
+//! Compile-time values are `Int`/`Bool`/`String`/`Tuple`/`List` (the shared
+//! [`CtValue`](crate::ct::CtValue)).
 
 use crate::ast::{Expr, ExprKind, InfixOp, PrefixOp, Stmt, StmtKind, WithItem};
+use crate::ct::CtValue;
 use crate::token::Span;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -31,17 +33,8 @@ use std::collections::{HashMap, HashSet};
 /// execution can't hang the compiler (cf. Zig's quota).
 const FUEL: usize = 100_000;
 
-/// A compile-time value. `Int`/`Bool` drive control flow; `Str`/`Tuple`/`List`
-/// let `comptime for` iterate compile-time collections and enable data-driven code.
-#[derive(Debug, Clone, PartialEq)]
-enum CtValue {
-    Int(i64),
-    Bool(bool),
-    Str(String),
-    Tuple(Vec<CtValue>),
-    List(Vec<CtValue>),
-}
-
+/// Comptime-specific accessors on the shared [`CtValue`], reporting a
+/// [`ComptimeError`] when a value is not of the required kind.
 impl CtValue {
     fn as_bool(&self, ctx: &str) -> Result<bool, ComptimeError> {
         match self {
@@ -90,7 +83,9 @@ impl std::fmt::Display for ComptimeError {
             ComptimeError::NotBool(s) => write!(f, "expected a compile-time Bool ({s})"),
             ComptimeError::NotInt(s) => write!(f, "expected a compile-time Int ({s})"),
             ComptimeError::BadArithmetic(s) => write!(f, "compile-time arithmetic error: {s}"),
-            ComptimeError::BadRange(s) => write!(f, "'comptime for' needs a range(...)/tuple/list: {s}"),
+            ComptimeError::BadRange(s) => {
+                write!(f, "'comptime for' needs a range(...)/tuple/list: {s}")
+            }
             ComptimeError::Arity(s) => write!(f, "compile-time call arity: {s}"),
             ComptimeError::QuotaExceeded => {
                 write!(f, "compile-time execution exceeded the step quota ({FUEL})")
@@ -138,7 +133,13 @@ pub fn elaborate(program: Vec<Stmt>) -> Result<Vec<Stmt>, ComptimeError> {
 fn collect_fns(program: &[Stmt]) -> HashMap<String, CtFn<'_>> {
     let mut fns = HashMap::new();
     for s in program {
-        if let StmtKind::Def { name, params, body, type_params, .. } = &s.kind
+        if let StmtKind::Def {
+            name,
+            params,
+            body,
+            type_params,
+            ..
+        } = &s.kind
             && type_params.is_empty()
         {
             fns.insert(
@@ -198,7 +199,10 @@ impl<'a> Elab<'a> {
                 // checker's own folder can't evaluate, becomes usable as a value
                 // parameter and materializes cleanly).
                 let folded = mk(
-                    StmtKind::Comptime { name: name.clone(), value: lit(&v, span) },
+                    StmtKind::Comptime {
+                        name: name.clone(),
+                        value: lit(&v, span),
+                    },
                     span,
                 );
                 env.insert(name.clone(), v);
@@ -219,8 +223,10 @@ impl<'a> Elab<'a> {
                 for v in self.eval_iter(iter, env)? {
                     self.burn()?;
                     let subs: Subs = &|n| (n == var).then(|| v.clone());
-                    let substituted: Vec<Stmt> =
-                        body.iter().map(|s| rewrite_stmt_cloned(s, subs, false)).collect();
+                    let substituted: Vec<Stmt> = body
+                        .iter()
+                        .map(|s| rewrite_stmt_cloned(s, subs, false))
+                        .collect();
                     out.extend(self.block(&substituted, env, in_fn)?);
                 }
             }
@@ -234,16 +240,31 @@ impl<'a> Elab<'a> {
             }
             StmtKind::While { cond, body } => {
                 let body = self.block(body, env, in_fn)?;
-                out.push(mk(StmtKind::While { cond: cond.clone(), body }, span));
+                out.push(mk(
+                    StmtKind::While {
+                        cond: cond.clone(),
+                        body,
+                    },
+                    span,
+                ));
             }
             StmtKind::For { var, iter, body } => {
                 let body = self.block(body, env, in_fn)?;
                 out.push(mk(
-                    StmtKind::For { var: var.clone(), iter: iter.clone(), body },
+                    StmtKind::For {
+                        var: var.clone(),
+                        iter: iter.clone(),
+                        body,
+                    },
                     span,
                 ));
             }
-            StmtKind::Try { body, except, orelse, finalbody } => {
+            StmtKind::Try {
+                body,
+                except,
+                orelse,
+                finalbody,
+            } => {
                 let body = self.block(body, env, in_fn)?;
                 let except = match except {
                     Some((n, b)) => Some((n.clone(), self.block(b, env, in_fn)?)),
@@ -251,14 +272,36 @@ impl<'a> Elab<'a> {
                 };
                 let orelse = self.opt_block(orelse, env, in_fn)?;
                 let finalbody = self.opt_block(finalbody, env, in_fn)?;
-                out.push(mk(StmtKind::Try { body, except, orelse, finalbody }, span));
+                out.push(mk(
+                    StmtKind::Try {
+                        body,
+                        except,
+                        orelse,
+                        finalbody,
+                    },
+                    span,
+                ));
             }
             StmtKind::With { items, body } => {
                 let body = self.block(body, env, in_fn)?;
-                out.push(mk(StmtKind::With { items: items.clone(), body }, span));
+                out.push(mk(
+                    StmtKind::With {
+                        items: items.clone(),
+                        body,
+                    },
+                    span,
+                ));
             }
             StmtKind::Def {
-                name, decorators, type_params, params, positional_only, keyword_only, raises, ret, body,
+                name,
+                decorators,
+                type_params,
+                params,
+                positional_only,
+                keyword_only,
+                raises,
+                ret,
+                body,
             } => {
                 let body = self.block(body, env, true)?;
                 out.push(mk(
@@ -277,7 +320,13 @@ impl<'a> Elab<'a> {
                 ));
             }
             StmtKind::Struct {
-                name, decorators, type_params, conforms, fields, methods, fieldwise_init,
+                name,
+                decorators,
+                type_params,
+                conforms,
+                fields,
+                methods,
+                fieldwise_init,
             } => {
                 let methods = methods
                     .iter()
@@ -333,7 +382,9 @@ impl<'a> Elab<'a> {
             ExprKind::TupleLit(elems) => Ok(CtValue::Tuple(self.eval_all(elems, scope)?)),
             ExprKind::ListLit(elems) => Ok(CtValue::List(self.eval_all(elems, scope)?)),
             ExprKind::Index { object, index } => {
-                let seq = self.eval(object, scope)?.as_sequence("indexing a comptime collection")?;
+                let seq = self
+                    .eval(object, scope)?
+                    .as_sequence("indexing a comptime collection")?;
                 let i = self.eval(index, scope)?.as_int("comptime index")?;
                 seq.get(i as usize).cloned().ok_or_else(|| {
                     ComptimeError::BadArithmetic(format!("comptime index {i} out of range"))
@@ -386,12 +437,14 @@ impl<'a> Elab<'a> {
         match op {
             InfixOp::And => {
                 return Ok(CtValue::Bool(
-                    self.eval(l, scope)?.as_bool("'and'")? && self.eval(r, scope)?.as_bool("'and'")?,
+                    self.eval(l, scope)?.as_bool("'and'")?
+                        && self.eval(r, scope)?.as_bool("'and'")?,
                 ));
             }
             InfixOp::Or => {
                 return Ok(CtValue::Bool(
-                    self.eval(l, scope)?.as_bool("'or'")? || self.eval(r, scope)?.as_bool("'or'")?,
+                    self.eval(l, scope)?.as_bool("'or'")?
+                        || self.eval(r, scope)?.as_bool("'or'")?,
                 ));
             }
             _ => {}
@@ -445,10 +498,16 @@ impl<'a> Elab<'a> {
                 [stop] => (0, *stop, 1),
                 [start, stop] => (*start, *stop, 1),
                 [start, stop, step] => (*start, *stop, *step),
-                _ => return Err(ComptimeError::BadRange("range takes 1-3 arguments".to_string())),
+                _ => {
+                    return Err(ComptimeError::BadRange(
+                        "range takes 1-3 arguments".to_string(),
+                    ));
+                }
             };
             if step == 0 {
-                return Err(ComptimeError::BadRange("range step cannot be zero".to_string()));
+                return Err(ComptimeError::BadRange(
+                    "range step cannot be zero".to_string(),
+                ));
             }
             let mut out = Vec::new();
             let mut i = start;
@@ -458,7 +517,8 @@ impl<'a> Elab<'a> {
             }
             return Ok(out);
         }
-        self.eval(iter, scope)?.as_sequence("a range(...), tuple, or list")
+        self.eval(iter, scope)?
+            .as_sequence("a range(...), tuple, or list")
     }
 
     // --- CTFE: run a pure function at compile time --------------------------
@@ -475,8 +535,7 @@ impl<'a> Elab<'a> {
             )));
         }
         self.burn()?;
-        let mut locals: HashMap<String, CtValue> =
-            f.params.iter().cloned().zip(args).collect();
+        let mut locals: HashMap<String, CtValue> = f.params.iter().cloned().zip(args).collect();
         match self.exec_block(f.body, &mut locals)? {
             CtFlow::Return(v) => Ok(v),
             _ => Err(ComptimeError::NotComptime(format!(
@@ -573,7 +632,9 @@ fn compare_ints(op: InfixOp, a: i64, b: i64) -> Result<bool, ComptimeError> {
         Le => a <= b,
         Ge => a >= b,
         _ => {
-            return Err(ComptimeError::NotComptime("not a comparison operator".to_string()));
+            return Err(ComptimeError::NotComptime(
+                "not a comparison operator".to_string(),
+            ));
         }
     })
 }
@@ -582,16 +643,11 @@ fn mk(kind: StmtKind, span: Span) -> Stmt {
     Stmt { kind, span }
 }
 
-/// Materialize a compile-time value as a literal expression.
+/// Materialize a compile-time value as a literal expression. The elaborator never
+/// produces a symbolic `Param`, so materialization always succeeds here.
 fn lit(val: &CtValue, span: Span) -> Expr {
-    let kind = match val {
-        CtValue::Int(n) => ExprKind::Int(*n),
-        CtValue::Bool(b) => ExprKind::Bool(*b),
-        CtValue::Str(s) => ExprKind::Str(s.clone()),
-        CtValue::Tuple(vs) => ExprKind::TupleLit(vs.iter().map(|v| lit(v, span)).collect()),
-        CtValue::List(vs) => ExprKind::ListLit(vs.iter().map(|v| lit(v, span)).collect()),
-    };
-    Expr { kind, span }
+    val.materialize(span)
+        .expect("comptime elaboration never yields a symbolic Param value")
 }
 
 // --- Substitution / materialization -----------------------------------------
@@ -647,7 +703,12 @@ fn rewrite_expr(e: &mut Expr, subs: Subs) {
                 rewrite_expr(r, subs);
             }
         }
-        ExprKind::Call { param_args, args, kwargs, .. } => {
+        ExprKind::Call {
+            param_args,
+            args,
+            kwargs,
+            ..
+        } => {
             rewrite_param_args(param_args, subs);
             rewrite_exprs(args, subs);
             for k in kwargs {
@@ -655,7 +716,12 @@ fn rewrite_expr(e: &mut Expr, subs: Subs) {
             }
         }
         ExprKind::Member { object, .. } => rewrite_expr(object, subs),
-        ExprKind::MethodCall { object, args, kwargs, .. } => {
+        ExprKind::MethodCall {
+            object,
+            args,
+            kwargs,
+            ..
+        } => {
             rewrite_expr(object, subs);
             rewrite_exprs(args, subs);
             for k in kwargs {
@@ -666,7 +732,12 @@ fn rewrite_expr(e: &mut Expr, subs: Subs) {
             rewrite_expr(object, subs);
             rewrite_expr(index, subs);
         }
-        ExprKind::Slice { object, lower, upper, step } => {
+        ExprKind::Slice {
+            object,
+            lower,
+            upper,
+            step,
+        } => {
             rewrite_expr(object, subs);
             for b in [lower, upper, step].into_iter().flatten() {
                 rewrite_expr(b, subs);
@@ -674,7 +745,11 @@ fn rewrite_expr(e: &mut Expr, subs: Subs) {
         }
         ExprKind::ListLit(elems) | ExprKind::TupleLit(elems) => rewrite_exprs(elems, subs),
         ExprKind::Named { value, .. } => rewrite_expr(value, subs),
-        ExprKind::IfExpr { cond, then_branch, else_branch } => {
+        ExprKind::IfExpr {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
             rewrite_expr(cond, subs);
             rewrite_expr(then_branch, subs);
             rewrite_expr(else_branch, subs);
@@ -737,7 +812,12 @@ fn rewrite_stmt(s: &mut Stmt, subs: Subs, into_defs: bool) {
             rewrite_expr(iter, subs);
             rewrite_block(body, subs, into_defs);
         }
-        StmtKind::Try { body, except, orelse, finalbody } => {
+        StmtKind::Try {
+            body,
+            except,
+            orelse,
+            finalbody,
+        } => {
             rewrite_block(body, subs, into_defs);
             if let Some((_, b)) = except {
                 rewrite_block(b, subs, into_defs);

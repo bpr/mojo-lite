@@ -45,7 +45,12 @@ fn region_crosses_control(body: &[Stmt]) -> bool {
                     || orelse.as_ref().is_some_and(|b| walk(b, loop_depth))
             }
             StmtKind::While { body, .. } | StmtKind::For { body, .. } => walk(body, loop_depth + 1),
-            StmtKind::Try { body, except, orelse, finalbody } => {
+            StmtKind::Try {
+                body,
+                except,
+                orelse,
+                finalbody,
+            } => {
                 walk(body, loop_depth)
                     || except.as_ref().is_some_and(|(_, b)| walk(b, loop_depth))
                     || orelse.as_ref().is_some_and(|b| walk(b, loop_depth))
@@ -126,9 +131,16 @@ pub struct MirPlace {
 /// fresh `dest` register; control flow lives in the block's [`MirTerm`].
 #[derive(Debug, Clone)]
 pub enum MirInstr {
-    Const { dest: Reg, k: Const },
+    Const {
+        dest: Reg,
+        k: Const,
+    },
     /// `x`, `x^`, `borrow x`, … — a use of a variable, tagged with how (`mode`).
-    UseVar { dest: Reg, var: VarId, mode: UseMode },
+    UseVar {
+        dest: Reg,
+        var: VarId,
+        mode: UseMode,
+    },
     /// A **partial move** `p.a^` — transfer one sub-place (a pure field chain,
     /// no dynamic index) out of a variable, reading its value into `dest`. The
     /// ownership analysis tracks this at place granularity (moving `p.a` leaves
@@ -136,16 +148,32 @@ pub enum MirInstr {
     /// drop of the whole struct skips it (no double-drop). Whole-variable moves
     /// stay `UseVar { mode: Move }`; an indexed transfer falls back to a plain
     /// read (the move is not modeled — conservative for dynamic indices).
-    MovePlace { dest: Reg, place: MirPlace },
+    MovePlace {
+        dest: Reg,
+        place: MirPlace,
+    },
     /// `var := <register>` — (re)define a variable slot from a register (lowered
     /// from a HIR `Bind`). The write paired with `UseVar`; Phase 4 reads it as a
     /// dataflow *def* (transitions the var to `Owned`). `ty` is a declaration's
     /// annotation (`var x: T = …`) so a backend can materialize a numeric literal
     /// to `T` (the tree-walker's `coerce`); `None` = inferred `var`/reassignment,
     /// which keeps the binding's existing type (`coerce_like`).
-    DefVar { var: VarId, src: Reg, ty: Option<Type> },
-    UnOp { op: PrefixOp, dest: Reg, a: Reg },
-    BinOp { op: InfixOp, dest: Reg, a: Reg, b: Reg },
+    DefVar {
+        var: VarId,
+        src: Reg,
+        ty: Option<Type>,
+    },
+    UnOp {
+        op: PrefixOp,
+        dest: Reg,
+        a: Reg,
+    },
+    BinOp {
+        op: InfixOp,
+        dest: Reg,
+        a: Reg,
+        b: Reg,
+    },
     /// A free-function / constructor / builtin call. `args` are the flattened
     /// positional arguments; `kwargs` the keyword arguments (`name = value`). The
     /// backend matches them to the callee's parameter slots (filling defaults,
@@ -186,9 +214,17 @@ pub enum MirInstr {
     },
     /// Struct/field *read* `base.field` inside an rvalue (name-based; the backend
     /// resolves layout). Field/index *writes* go through `Store`/a `MirPlace`.
-    GetField { dest: Reg, base: Reg, field: String },
+    GetField {
+        dest: Reg,
+        base: Reg,
+        field: String,
+    },
     /// Subscript *read* `base[index]` (List/Tuple/SIMD lane) inside an rvalue.
-    Index { dest: Reg, base: Reg, index: Reg },
+    Index {
+        dest: Reg,
+        base: Reg,
+        index: Reg,
+    },
     /// Slice `object[lower:upper:step]` (List/String) → a new value. Each bound is
     /// optional (absent = a direction-aware default).
     Slice {
@@ -199,21 +235,40 @@ pub enum MirInstr {
         step: Option<Reg>,
     },
     /// `place = src` — a write through a place (`p.x = e`, `xs[i] = e`, nested).
-    Store { place: MirPlace, src: Reg },
+    Store {
+        place: MirPlace,
+        src: Reg,
+    },
     /// Read a place into a register — for a read-modify-write (`place OP= e`),
     /// where the place (and its indices) must be evaluated exactly once.
-    LoadPlace { dest: Reg, place: MirPlace },
+    LoadPlace {
+        dest: Reg,
+        place: MirPlace,
+    },
     /// Aggregate construction from already-flattened element registers.
-    MakeList { dest: Reg, elems: Vec<Reg> },
-    MakeTuple { dest: Reg, elems: Vec<Reg> },
+    MakeList {
+        dest: Reg,
+        elems: Vec<Reg>,
+    },
+    MakeTuple {
+        dest: Reg,
+        elems: Vec<Reg>,
+    },
     /// SIMD construction `SIMD[DType.<dt>, width](elems)` (or a scalar-alias like
     /// `Int32(x)`). The element `dtype`/`width` — compile-time parameters the MIR
     /// is otherwise untyped about — are resolved here at lowering; `elems` are the
     /// lane values (exactly `width`, or one to splat).
-    MakeSimd { dest: Reg, dtype: Dtype, width: usize, elems: Vec<Reg> },
+    MakeSimd {
+        dest: Reg,
+        dtype: Dtype,
+        width: usize,
+        elems: Vec<Reg>,
+    },
     /// `raise <src>` — raise an error value. Propagates as an exceptional outcome
     /// (the VM unwinds to the nearest enclosing [`MirInstr::Try`] handler).
-    Raise { src: Reg },
+    Raise {
+        src: Reg,
+    },
     /// A `try`/`except`/`else`/`finally` region, lowered structurally (mirroring the
     /// tree-walker's `exec_try`). Each sub-part is a self-contained mini-CFG (a
     /// `Vec<MirBlock>` with local block ids, entry = block 0) that **shares this
@@ -229,13 +284,17 @@ pub enum MirInstr {
         cleanup: Vec<VarId>,
     },
     /// An ASAP destructor on a register (reserved for the future Op/assembler VM).
-    Drop { reg: Reg },
+    Drop {
+        reg: Reg,
+    },
     /// Drop the value in a variable slot — spliced in by the Phase 4 liveness pass
     /// at a variable's last use (ASAP destruction). Runs the value's `__del__` (and
     /// its fields', in reverse order) and leaves the slot empty. A no-op for values
     /// without a destructor, so it never changes observable behaviour except when a
     /// struct defines `__del__`.
-    DropVar { var: VarId },
+    DropVar {
+        var: VarId,
+    },
     /// A construct the MIR/backends don't lower yet (a `try` with its exceptional
     /// edges, a nested declaration). Kept as an explicit node — rather than a
     /// lowering-time `panic!` — so a backend can report a clean error instead of
@@ -243,13 +302,21 @@ pub enum MirInstr {
     Unsupported(String),
     /// Iterator protocol: normalize `iter` to an iterator (a user struct's
     /// `__iter__()`); a no-op for a built-in `range`/`List`.
-    GetIter { iter: VarId },
+    GetIter {
+        iter: VarId,
+    },
     /// Iterator protocol (`for` loops): read whether the iterator variable `iter`
     /// yields another element into `dest` (a `Bool`) — a pure read.
-    HasNext { dest: Reg, iter: VarId },
+    HasNext {
+        dest: Reg,
+        iter: VarId,
+    },
     /// Iterator protocol: bind the current element into `dest` and advance the
     /// iterator variable `iter` in place (a mutating read).
-    Next { dest: Reg, iter: VarId },
+    Next {
+        dest: Reg,
+        iter: VarId,
+    },
 }
 
 /// How a basic block hands off control. Block targets are indices into
@@ -257,7 +324,11 @@ pub enum MirInstr {
 #[derive(Debug, Clone)]
 pub enum MirTerm {
     Jump(MirBlockId),
-    Branch { cond: Reg, then_b: MirBlockId, else_b: MirBlockId },
+    Branch {
+        cond: Reg,
+        then_b: MirBlockId,
+        else_b: MirBlockId,
+    },
     Return(Option<Reg>),
     /// Normal fall-through end of a `try` sub-region (see [`hir::Terminator::FallOff`]).
     /// The VM's region runner reads it as "completed normally". Never appears in a
@@ -269,7 +340,10 @@ pub enum MirTerm {
     /// as a `Flow::Jump(target)` — running each `finally` on the way — until the
     /// function driver jumps there. `cleanup` lists the region-body-local variables
     /// to drop when this escape edge is taken (filled by drop elaboration).
-    EscapeJump { target: MirBlockId, cleanup: Vec<VarId> },
+    EscapeJump {
+        target: MirBlockId,
+        cleanup: Vec<VarId>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -320,7 +394,10 @@ fn span(e: &Expr) -> Span {
 
 /// Resolve a `SIMD` dtype parameter argument (`DType.<name>`) to a [`Dtype`].
 fn dtype_from_param_arg(arg: &ParamArg) -> Option<Dtype> {
-    if let ParamArg::Value(Expr { kind: ExprKind::Member { object, field }, .. }) = arg
+    if let ParamArg::Value(Expr {
+        kind: ExprKind::Member { object, field },
+        ..
+    }) = arg
         && let ExprKind::Identifier(ns) = &object.kind
         && ns == "DType"
     {
@@ -439,7 +516,11 @@ impl Flatten<'_> {
         let result = self.fresh_var();
         // Seed the result with the left operand's value: for `and` a false `ra`
         // is the answer; for `or` a true `ra` is. The rhs block overwrites it.
-        self.emit(MirInstr::DefVar { var: result, src: ra, ty: None });
+        self.emit(MirInstr::DefVar {
+            var: result,
+            src: ra,
+            ty: None,
+        });
 
         let rhs_blk = self.new_block();
         let merge_blk = self.new_block();
@@ -448,16 +529,28 @@ impl Flatten<'_> {
             InfixOp::And => (rhs_blk, merge_blk),
             _ => (merge_blk, rhs_blk),
         };
-        self.f.blocks[self.cur].term = MirTerm::Branch { cond: ra, then_b, else_b };
+        self.f.blocks[self.cur].term = MirTerm::Branch {
+            cond: ra,
+            then_b,
+            else_b,
+        };
 
         self.cur = rhs_blk;
         let rb = self.expr(b); // may itself split blocks (nested and/or)
-        self.emit(MirInstr::DefVar { var: result, src: rb, ty: None });
+        self.emit(MirInstr::DefVar {
+            var: result,
+            src: rb,
+            ty: None,
+        });
         self.f.blocks[self.cur].term = MirTerm::Jump(merge_blk);
 
         self.cur = merge_blk;
         let d = self.fresh(span, None);
-        self.emit(MirInstr::UseVar { dest: d, var: result, mode: UseMode::Copy });
+        self.emit(MirInstr::UseVar {
+            dest: d,
+            var: result,
+            mode: UseMode::Copy,
+        });
         d
     }
 
@@ -476,15 +569,27 @@ impl Flatten<'_> {
         };
         self.cur = then_blk;
         let rt = self.expr(then_e);
-        self.emit(MirInstr::DefVar { var: result, src: rt, ty: None });
+        self.emit(MirInstr::DefVar {
+            var: result,
+            src: rt,
+            ty: None,
+        });
         self.f.blocks[self.cur].term = MirTerm::Jump(merge_blk);
         self.cur = else_blk;
         let re = self.expr(else_e);
-        self.emit(MirInstr::DefVar { var: result, src: re, ty: None });
+        self.emit(MirInstr::DefVar {
+            var: result,
+            src: re,
+            ty: None,
+        });
         self.f.blocks[self.cur].term = MirTerm::Jump(merge_blk);
         self.cur = merge_blk;
         let d = self.fresh(sp, None);
-        self.emit(MirInstr::UseVar { dest: d, var: result, mode: UseMode::Copy });
+        self.emit(MirInstr::UseVar {
+            dest: d,
+            var: result,
+            mode: UseMode::Copy,
+        });
         d
     }
 
@@ -499,8 +604,17 @@ impl Flatten<'_> {
         for (i, (op, operand)) in rest.iter().enumerate() {
             let cur = self.expr(operand);
             let cmp = self.fresh(sp, None);
-            self.emit(MirInstr::BinOp { op: *op, dest: cmp, a: prev, b: cur });
-            self.emit(MirInstr::DefVar { var: result, src: cmp, ty: None });
+            self.emit(MirInstr::BinOp {
+                op: *op,
+                dest: cmp,
+                a: prev,
+                b: cur,
+            });
+            self.emit(MirInstr::DefVar {
+                var: result,
+                src: cmp,
+                ty: None,
+            });
             if i + 1 == rest.len() {
                 self.f.blocks[self.cur].term = MirTerm::Jump(merge_blk);
             } else {
@@ -518,7 +632,11 @@ impl Flatten<'_> {
         }
         self.cur = merge_blk;
         let d = self.fresh(sp, None);
-        self.emit(MirInstr::UseVar { dest: d, var: result, mode: UseMode::Copy });
+        self.emit(MirInstr::UseVar {
+            dest: d,
+            var: result,
+            mode: UseMode::Copy,
+        });
         d
     }
 
@@ -539,7 +657,11 @@ impl Flatten<'_> {
             ExprKind::Identifier(name) => {
                 let var = self.var(name);
                 let d = self.fresh(span(e), Some(var));
-                self.emit(MirInstr::UseVar { dest: d, var, mode: UseMode::Copy });
+                self.emit(MirInstr::UseVar {
+                    dest: d,
+                    var,
+                    mode: UseMode::Copy,
+                });
                 d
             }
             // `x^`: a move out of a variable. `p.a^` (a pure field chain) is a
@@ -549,7 +671,11 @@ impl Flatten<'_> {
                 if let ExprKind::Identifier(name) = &inner.kind {
                     let var = self.var(name);
                     let d = self.fresh(span(e), Some(var));
-                    self.emit(MirInstr::UseVar { dest: d, var, mode: UseMode::Move });
+                    self.emit(MirInstr::UseVar {
+                        dest: d,
+                        var,
+                        mode: UseMode::Move,
+                    });
                     d
                 } else if let Some(place) = self.pure_field_place(inner) {
                     let d = self.fresh(span(e), Some(place.root));
@@ -564,7 +690,11 @@ impl Flatten<'_> {
             ExprKind::Prefix(op, a) => {
                 let ra = self.expr(a);
                 let d = self.fresh(span(e), None);
-                self.emit(MirInstr::UnOp { op: *op, dest: d, a: ra });
+                self.emit(MirInstr::UnOp {
+                    op: *op,
+                    dest: d,
+                    a: ra,
+                });
                 d
             }
             // `and`/`or` short-circuit — lowered to CFG blocks, not an eager BinOp.
@@ -575,7 +705,12 @@ impl Flatten<'_> {
                 let ra = self.expr(a); // operands left-to-right (evaluation order is explicit)
                 let rb = self.expr(b);
                 let d = self.fresh(span(e), None);
-                self.emit(MirInstr::BinOp { op: *op, dest: d, a: ra, b: rb });
+                self.emit(MirInstr::BinOp {
+                    op: *op,
+                    dest: d,
+                    a: ra,
+                    b: rb,
+                });
                 d
             }
 
@@ -583,7 +718,12 @@ impl Flatten<'_> {
             // NOTE: keyword args + default-slot matching (checker::match_call_slots)
             // are a follow-up; the checker has already validated them, so only the
             // positional `args` are flattened here.
-            ExprKind::Call { name, param_args, args, kwargs } => {
+            ExprKind::Call {
+                name,
+                param_args,
+                args,
+                kwargs,
+            } => {
                 // SIMD construction resolves its `[DType.<dt>, width]` parameters
                 // here (the MIR is otherwise untyped about them).
                 if let Some(r) = self.try_simd_call(e, name, param_args, args) {
@@ -627,7 +767,12 @@ impl Flatten<'_> {
                 });
                 d
             }
-            ExprKind::MethodCall { object, method, args, .. } => {
+            ExprKind::MethodCall {
+                object,
+                method,
+                args,
+                ..
+            } => {
                 // A **static** method on a parameterized built-in type — the receiver
                 // is a type, not a value (`UnsafePointer[T].alloc(n)`). Lower to a
                 // builtin call `Type.method(args)`; the element type is erased.
@@ -650,7 +795,10 @@ impl Flatten<'_> {
                 let (recv, recv_place) = match self.try_place(object) {
                     Some(place) => {
                         let recv = self.fresh(span(e), None);
-                        self.emit(MirInstr::LoadPlace { dest: recv, place: place.clone() });
+                        self.emit(MirInstr::LoadPlace {
+                            dest: recv,
+                            place: place.clone(),
+                        });
                         (recv, Some(place))
                     }
                     None => (self.expr(object), None),
@@ -684,7 +832,11 @@ impl Flatten<'_> {
                 } else {
                     let base = self.expr(object);
                     let d = self.fresh(span(e), None);
-                    self.emit(MirInstr::GetField { dest: d, base, field: field.clone() });
+                    self.emit(MirInstr::GetField {
+                        dest: d,
+                        base,
+                        field: field.clone(),
+                    });
                     d
                 }
             }
@@ -692,7 +844,11 @@ impl Flatten<'_> {
                 let base = self.expr(object);
                 let idx = self.expr(index);
                 let d = self.fresh(span(e), None);
-                self.emit(MirInstr::Index { dest: d, base, index: idx });
+                self.emit(MirInstr::Index {
+                    dest: d,
+                    base,
+                    index: idx,
+                });
                 d
             }
 
@@ -700,13 +856,19 @@ impl Flatten<'_> {
             ExprKind::ListLit(elems) => {
                 let regs = self.args(elems);
                 let d = self.fresh(span(e), None);
-                self.emit(MirInstr::MakeList { dest: d, elems: regs });
+                self.emit(MirInstr::MakeList {
+                    dest: d,
+                    elems: regs,
+                });
                 d
             }
             ExprKind::TupleLit(elems) => {
                 let regs = self.args(elems);
                 let d = self.fresh(span(e), None);
-                self.emit(MirInstr::MakeTuple { dest: d, elems: regs });
+                self.emit(MirInstr::MakeTuple {
+                    dest: d,
+                    elems: regs,
+                });
                 d
             }
 
@@ -780,7 +942,12 @@ impl Flatten<'_> {
         };
         let elems = self.args(args);
         let d = self.fresh(span(e), None);
-        self.emit(MirInstr::MakeSimd { dest: d, dtype, width, elems });
+        self.emit(MirInstr::MakeSimd {
+            dest: d,
+            dtype,
+            width,
+            elems,
+        });
         Some(d)
     }
 
@@ -795,9 +962,16 @@ impl Flatten<'_> {
         for cap in &info.captures {
             let var = self.var(cap);
             let r = self.fresh(span(e), Some(var));
-            self.emit(MirInstr::UseVar { dest: r, var, mode: UseMode::Copy });
+            self.emit(MirInstr::UseVar {
+                dest: r,
+                var,
+                mode: UseMode::Copy,
+            });
             arg_regs.push(r);
-            arg_places.push(Some(MirPlace { root: var, proj: Vec::new() }));
+            arg_places.push(Some(MirPlace {
+                root: var,
+                proj: Vec::new(),
+            }));
         }
         for a in args {
             arg_regs.push(self.expr(a));
@@ -831,7 +1005,11 @@ impl Flatten<'_> {
         match i {
             HirInstr::Bind { dest, expr, ty } => {
                 let src = self.expr(expr);
-                self.emit(MirInstr::DefVar { var: *dest, src, ty: ty.clone() });
+                self.emit(MirInstr::DefVar {
+                    var: *dest,
+                    src,
+                    ty: ty.clone(),
+                });
             }
             HirInstr::Eval(e) => {
                 let _ = self.expr(e); // evaluated for its effect; result discarded
@@ -842,7 +1020,13 @@ impl Flatten<'_> {
             // outward `break`/`continue` becomes an `EscapeJump` resolved via
             // `outer_map`.
             HirInstr::Try { stmt, loop_targets } => {
-                if let StmtKind::Try { body, except, orelse, finalbody } = &stmt.kind {
+                if let StmtKind::Try {
+                    body,
+                    except,
+                    orelse,
+                    finalbody,
+                } = &stmt.kind
+                {
                     self.emit_try(body, except, orelse, finalbody, loop_targets, outer_map);
                 } else {
                     unreachable!("HirInstr::Try always wraps a `try` statement");
@@ -859,13 +1043,27 @@ impl Flatten<'_> {
             }
             HirInstr::HasNext { iter, dest } => {
                 let r = self.fresh(DUMMY_SPAN, None);
-                self.emit(MirInstr::HasNext { dest: r, iter: *iter });
-                self.emit(MirInstr::DefVar { var: *dest, src: r, ty: None });
+                self.emit(MirInstr::HasNext {
+                    dest: r,
+                    iter: *iter,
+                });
+                self.emit(MirInstr::DefVar {
+                    var: *dest,
+                    src: r,
+                    ty: None,
+                });
             }
             HirInstr::Next { iter, dest } => {
                 let r = self.fresh(DUMMY_SPAN, Some(*iter));
-                self.emit(MirInstr::Next { dest: r, iter: *iter });
-                self.emit(MirInstr::DefVar { var: *dest, src: r, ty: None });
+                self.emit(MirInstr::Next {
+                    dest: r,
+                    iter: *iter,
+                });
+                self.emit(MirInstr::DefVar {
+                    var: *dest,
+                    src: r,
+                    ty: None,
+                });
             }
         }
     }
@@ -876,7 +1074,10 @@ impl Flatten<'_> {
     /// is a variable (or `self`), so a non-variable root is unreachable.
     fn place(&mut self, e: &Expr) -> MirPlace {
         match &e.kind {
-            ExprKind::Identifier(name) => MirPlace { root: self.var(name), proj: Vec::new() },
+            ExprKind::Identifier(name) => MirPlace {
+                root: self.var(name),
+                proj: Vec::new(),
+            },
             ExprKind::Member { object, field } => {
                 let mut p = self.place(object);
                 p.proj.push(Proj::Field(field.clone()));
@@ -922,7 +1123,10 @@ impl Flatten<'_> {
         let mut map: HashMap<hir::BlockId, MirBlockId> = HashMap::new();
         for hb in region_cfg.g.node_indices() {
             map.insert(hb, region.blocks.len());
-            region.blocks.push(MirBlock { instrs: Vec::new(), term: MirTerm::Return(None) });
+            region.blocks.push(MirBlock {
+                instrs: Vec::new(),
+                term: MirTerm::Return(None),
+            });
         }
         {
             let mut fl = Flatten {
@@ -937,7 +1141,10 @@ impl Flatten<'_> {
                 for instr in &region_cfg.g[hb].instrs {
                     fl.lower_instr(instr, outer_map);
                 }
-                let term = region_cfg.g[hb].term.as_ref().expect("Phase 1 seals every block");
+                let term = region_cfg.g[hb]
+                    .term
+                    .as_ref()
+                    .expect("Phase 1 seals every block");
                 // Region terminators resolve local jumps via the region's own `map`;
                 // an `EscapeJump` resolves its outer-loop target via `outer_map`.
                 let mterm = fl.lower_term(term, &map, outer_map);
@@ -973,8 +1180,12 @@ impl Flatten<'_> {
             }
             None => None,
         };
-        let orelse_blocks = orelse.as_ref().map(|b| self.lower_region(b, ext_loops, outer_map));
-        let finalbody_blocks = finalbody.as_ref().map(|b| self.lower_region(b, ext_loops, outer_map));
+        let orelse_blocks = orelse
+            .as_ref()
+            .map(|b| self.lower_region(b, ext_loops, outer_map));
+        let finalbody_blocks = finalbody
+            .as_ref()
+            .map(|b| self.lower_region(b, ext_loops, outer_map));
         self.emit(MirInstr::Try {
             body: body_blocks,
             handler,
@@ -991,9 +1202,10 @@ impl Flatten<'_> {
     /// the VM). Distinct from [`Self::try_place`], which emits index evaluations.
     fn simple_place(&mut self, e: &Expr) -> Option<MirPlace> {
         match &e.kind {
-            ExprKind::Identifier(name) => {
-                Some(MirPlace { root: self.var(name), proj: Vec::new() })
-            }
+            ExprKind::Identifier(name) => Some(MirPlace {
+                root: self.var(name),
+                proj: Vec::new(),
+            }),
             ExprKind::Member { object, field } => {
                 let mut p = self.simple_place(object)?;
                 p.proj.push(Proj::Field(field.clone()));
@@ -1016,7 +1228,10 @@ impl Flatten<'_> {
                 // searches a struct's `value_params`. `Self` never appears bare in an
                 // expression (only `Self.field`), so this alias is safe.
                 let root = if name == "Self" { "self" } else { name };
-                Some(MirPlace { root: self.var(root), proj: Vec::new() })
+                Some(MirPlace {
+                    root: self.var(root),
+                    proj: Vec::new(),
+                })
             }
             ExprKind::Member { object, field } => {
                 let mut p = self.pure_field_place(object)?;
@@ -1029,7 +1244,10 @@ impl Flatten<'_> {
 
     fn try_place(&mut self, e: &Expr) -> Option<MirPlace> {
         match &e.kind {
-            ExprKind::Identifier(name) => Some(MirPlace { root: self.var(name), proj: Vec::new() }),
+            ExprKind::Identifier(name) => Some(MirPlace {
+                root: self.var(name),
+                proj: Vec::new(),
+            }),
             ExprKind::Member { object, field } => {
                 let mut p = self.try_place(object)?;
                 p.proj.push(Proj::Field(field.clone()));
@@ -1064,18 +1282,39 @@ impl Flatten<'_> {
                 if let ExprKind::Identifier(name) = &place.kind {
                     let var = self.var(name);
                     let cur = self.fresh(span(place), Some(var));
-                    self.emit(MirInstr::UseVar { dest: cur, var, mode: UseMode::Copy });
+                    self.emit(MirInstr::UseVar {
+                        dest: cur,
+                        var,
+                        mode: UseMode::Copy,
+                    });
                     let rhs = self.expr(value);
                     let res = self.fresh(span(place), None);
-                    self.emit(MirInstr::BinOp { op: *op, dest: res, a: cur, b: rhs });
-                    self.emit(MirInstr::DefVar { var, src: res, ty: None });
+                    self.emit(MirInstr::BinOp {
+                        op: *op,
+                        dest: res,
+                        a: cur,
+                        b: rhs,
+                    });
+                    self.emit(MirInstr::DefVar {
+                        var,
+                        src: res,
+                        ty: None,
+                    });
                 } else {
                     let p = self.place(place);
                     let cur = self.fresh(span(place), None);
-                    self.emit(MirInstr::LoadPlace { dest: cur, place: p.clone() });
+                    self.emit(MirInstr::LoadPlace {
+                        dest: cur,
+                        place: p.clone(),
+                    });
                     let rhs = self.expr(value);
                     let res = self.fresh(span(place), None);
-                    self.emit(MirInstr::BinOp { op: *op, dest: res, a: cur, b: rhs });
+                    self.emit(MirInstr::BinOp {
+                        op: *op,
+                        dest: res,
+                        a: cur,
+                        b: rhs,
+                    });
                     self.emit(MirInstr::Store { place: p, src: res });
                 }
             }
@@ -1099,16 +1338,25 @@ impl Flatten<'_> {
             // shares this function's slots; the VM runs them with `exec_try`
             // semantics. `cleanup` (the exceptional-edge drops) is filled by the
             // drop-elaboration pass.
-            StmtKind::Try { body, except, orelse, finalbody } => {
+            StmtKind::Try {
+                body,
+                except,
+                orelse,
+                finalbody,
+            } => {
                 // A `break`/`continue` that leaves the `try` (targeting an enclosing
                 // loop) needs the outer loop's target block, which the self-contained
                 // mini-CFG region can't name — refuse cleanly rather than build an
                 // ill-formed region. (A `return` crossing out is fine: it surfaces as
                 // a `Flow::Return` the block driver handles.)
                 let crosses = region_crosses_control(body)
-                    || except.as_ref().is_some_and(|(_, b)| region_crosses_control(b))
+                    || except
+                        .as_ref()
+                        .is_some_and(|(_, b)| region_crosses_control(b))
                     || orelse.as_ref().is_some_and(|b| region_crosses_control(b))
-                    || finalbody.as_ref().is_some_and(|b| region_crosses_control(b));
+                    || finalbody
+                        .as_ref()
+                        .is_some_and(|b| region_crosses_control(b));
                 if crosses {
                     self.emit(MirInstr::Unsupported(
                         "try with break/continue crossing the try boundary".into(),
@@ -1124,9 +1372,9 @@ impl Flatten<'_> {
             StmtKind::Def { name, .. } if self.nested.contains_key(name) => {}
             // A nested `def` we couldn't lift (generic, calls a sibling, or nests
             // deeper), or a nested `struct`/`trait`, stays a clean `Unsupported`.
-            StmtKind::Def { .. } | StmtKind::Struct { .. } | StmtKind::Trait { .. } => {
-                self.emit(MirInstr::Unsupported("nested def/struct/trait declaration".into()))
-            }
+            StmtKind::Def { .. } | StmtKind::Struct { .. } | StmtKind::Trait { .. } => self.emit(
+                MirInstr::Unsupported("nested def/struct/trait declaration".into()),
+            ),
 
             // Tuple unpacking `a, b = t`: evaluate the tuple once, then bind each
             // target from its element (a NAME → `DefVar`; a place → `Store`).
@@ -1134,13 +1382,24 @@ impl Flatten<'_> {
                 let tuple = self.expr(value);
                 for (i, target) in targets.iter().enumerate() {
                     let idx = self.fresh(span(target), None);
-                    self.emit(MirInstr::Const { dest: idx, k: Const::Int(i as i64) });
+                    self.emit(MirInstr::Const {
+                        dest: idx,
+                        k: Const::Int(i as i64),
+                    });
                     let elem = self.fresh(span(target), None);
-                    self.emit(MirInstr::Index { dest: elem, base: tuple, index: idx });
+                    self.emit(MirInstr::Index {
+                        dest: elem,
+                        base: tuple,
+                        index: idx,
+                    });
                     match &target.kind {
                         ExprKind::Identifier(name) => {
                             let var = self.var(name);
-                            self.emit(MirInstr::DefVar { var, src: elem, ty: None });
+                            self.emit(MirInstr::DefVar {
+                                var,
+                                src: elem,
+                                ty: None,
+                            });
                         }
                         _ => {
                             let place = self.place(target);
@@ -1153,9 +1412,7 @@ impl Flatten<'_> {
             // --- Unreachable after the checker ---------------------------------
             // Parse-only statements are flagged `Unsupported`, so a checked program
             // never reaches MIR with them.
-            StmtKind::With { .. }
-            | StmtKind::ComptimeIf { .. }
-            | StmtKind::ComptimeFor { .. } => {
+            StmtKind::With { .. } | StmtKind::ComptimeIf { .. } | StmtKind::ComptimeFor { .. } => {
                 unreachable!("parse-only statement rejected by the checker before MIR: {s:?}")
             }
             // These are lowered by `hir::Lower` directly (to instrs/terminators), so
@@ -1184,17 +1441,26 @@ impl Flatten<'_> {
     ) -> MirTerm {
         match t {
             Terminator::Jump(b) => MirTerm::Jump(map[b]),
-            Terminator::Branch { cond, then_b, else_b } => {
+            Terminator::Branch {
+                cond,
+                then_b,
+                else_b,
+            } => {
                 let c = self.expr(cond); // the condition is evaluated at the end of this block
-                MirTerm::Branch { cond: c, then_b: map[then_b], else_b: map[else_b] }
+                MirTerm::Branch {
+                    cond: c,
+                    then_b: map[then_b],
+                    else_b: map[else_b],
+                }
             }
             Terminator::Return(e) => MirTerm::Return(e.as_ref().map(|e| self.expr(e))),
             Terminator::FallOff => MirTerm::FallOff,
             // An outward `break`/`continue`: the target is an enclosing-function
             // block, resolved via `outer_map` (`cleanup` filled by drop elaboration).
-            Terminator::EscapeJump(b) => {
-                MirTerm::EscapeJump { target: outer_map[b], cleanup: Vec::new() }
-            }
+            Terminator::EscapeJump(b) => MirTerm::EscapeJump {
+                target: outer_map[b],
+                cleanup: Vec::new(),
+            },
         }
     }
 }
@@ -1228,7 +1494,10 @@ fn lower_cfg_nested(cfg: &Cfg, nested: &HashMap<String, NestedInfo>) -> MirFunct
     let mut map: HashMap<hir::BlockId, MirBlockId> = HashMap::new();
     for hb in cfg.g.node_indices() {
         map.insert(hb, mir.blocks.len());
-        mir.blocks.push(MirBlock { instrs: Vec::new(), term: MirTerm::Return(None) }); // placeholder term
+        mir.blocks.push(MirBlock {
+            instrs: Vec::new(),
+            term: MirTerm::Return(None),
+        }); // placeholder term
     }
 
     {
@@ -1285,8 +1554,15 @@ fn find_nested_defs<'a>(body: &'a [Stmt], out: &mut Vec<&'a Stmt>) {
                     find_nested_defs(e, out);
                 }
             }
-            StmtKind::While { body, .. } | StmtKind::For { body, .. } => find_nested_defs(body, out),
-            StmtKind::Try { body, except, orelse, finalbody } => {
+            StmtKind::While { body, .. } | StmtKind::For { body, .. } => {
+                find_nested_defs(body, out)
+            }
+            StmtKind::Try {
+                body,
+                except,
+                orelse,
+                finalbody,
+            } => {
                 find_nested_defs(body, out);
                 if let Some((_, b)) = except {
                     find_nested_defs(b, out);
@@ -1309,7 +1585,9 @@ fn find_nested_defs<'a>(body: &'a [Stmt], out: &mut Vec<&'a Stmt>) {
 fn binds(body: &[Stmt], out: &mut HashSet<String>) {
     for s in body {
         match &s.kind {
-            StmtKind::VarDecl { name, .. } | StmtKind::Comptime { name, .. } | StmtKind::Def { name, .. } => {
+            StmtKind::VarDecl { name, .. }
+            | StmtKind::Comptime { name, .. }
+            | StmtKind::Def { name, .. } => {
                 out.insert(name.clone());
             }
             StmtKind::For { var, body, .. } => {
@@ -1325,7 +1603,12 @@ fn binds(body: &[Stmt], out: &mut HashSet<String>) {
                 }
             }
             StmtKind::While { body, .. } => binds(body, out),
-            StmtKind::Try { body, except, orelse, finalbody } => {
+            StmtKind::Try {
+                body,
+                except,
+                orelse,
+                finalbody,
+            } => {
                 binds(body, out);
                 if let Some((n, b)) = except {
                     if let Some(n) = n {
@@ -1364,7 +1647,12 @@ fn refs_expr(e: &Expr, out: &mut HashSet<String>) {
             refs_expr(a, out);
             refs_expr(b, out);
         }
-        ExprKind::Call { name, param_args, args, kwargs } => {
+        ExprKind::Call {
+            name,
+            param_args,
+            args,
+            kwargs,
+        } => {
             out.insert(name.clone());
             for pa in param_args {
                 if let ParamArg::Value(x) = pa {
@@ -1379,7 +1667,12 @@ fn refs_expr(e: &Expr, out: &mut HashSet<String>) {
             }
         }
         ExprKind::Member { object, .. } => refs_expr(object, out),
-        ExprKind::MethodCall { object, args, kwargs, .. } => {
+        ExprKind::MethodCall {
+            object,
+            args,
+            kwargs,
+            ..
+        } => {
             refs_expr(object, out);
             for a in args {
                 refs_expr(a, out);
@@ -1398,7 +1691,11 @@ fn refs_expr(e: &Expr, out: &mut HashSet<String>) {
             }
         }
         ExprKind::Named { value, .. } => refs_expr(value, out),
-        ExprKind::IfExpr { cond, then_branch, else_branch } => {
+        ExprKind::IfExpr {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
             refs_expr(cond, out);
             refs_expr(then_branch, out);
             refs_expr(else_branch, out);
@@ -1409,7 +1706,12 @@ fn refs_expr(e: &Expr, out: &mut HashSet<String>) {
                 refs_expr(x, out);
             }
         }
-        ExprKind::Slice { object, lower, upper, step } => {
+        ExprKind::Slice {
+            object,
+            lower,
+            upper,
+            step,
+        } => {
             refs_expr(object, out);
             for x in [lower, upper, step].into_iter().flatten() {
                 refs_expr(x, out);
@@ -1434,7 +1736,9 @@ fn refs_stmts(body: &[Stmt], out: &mut HashSet<String>) -> bool {
     for s in body {
         match &s.kind {
             StmtKind::Def { .. } | StmtKind::Struct { .. } | StmtKind::Trait { .. } => ok = false,
-            StmtKind::VarDecl { value, .. } | StmtKind::Comptime { value, .. } => refs_expr(value, out),
+            StmtKind::VarDecl { value, .. } | StmtKind::Comptime { value, .. } => {
+                refs_expr(value, out)
+            }
             StmtKind::Assign { name, value } => {
                 out.insert(name.clone());
                 refs_expr(value, out);
@@ -1465,7 +1769,12 @@ fn refs_stmts(body: &[Stmt], out: &mut HashSet<String>) -> bool {
                 ok &= refs_stmts(body, out);
             }
             StmtKind::Return(Some(e)) | StmtKind::Raise(e) | StmtKind::Expr(e) => refs_expr(e, out),
-            StmtKind::Try { body, except, orelse, finalbody } => {
+            StmtKind::Try {
+                body,
+                except,
+                orelse,
+                finalbody,
+            } => {
                 ok &= refs_stmts(body, out);
                 if let Some((_, b)) = except {
                     ok &= refs_stmts(b, out);
@@ -1510,7 +1819,10 @@ fn analyze_captures(
         .into_iter()
         .filter(|n| !d_bound.contains(n) && f_bound.contains(n))
         .collect();
-    if captures.iter().any(|n| nested_names.contains(n) && n != self_name) {
+    if captures
+        .iter()
+        .any(|n| nested_names.contains(n) && n != self_name)
+    {
         return None; // references a sibling nested `def`
     }
     captures.retain(|n| !nested_names.contains(n)); // drop a self-reference
@@ -1548,14 +1860,27 @@ fn lower_fn_nested(
     let mut registry: HashMap<String, NestedInfo> = HashMap::new();
     let mut liftable: Vec<(&Stmt, Vec<String>, String)> = Vec::new();
     for ds in &nested_defs {
-        if let StmtKind::Def { name: dname, type_params, params: dparams, body: dbody, .. } = &ds.kind
+        if let StmtKind::Def {
+            name: dname,
+            type_params,
+            params: dparams,
+            body: dbody,
+            ..
+        } = &ds.kind
         {
             if !type_params.is_empty() {
                 continue; // a generic nested `def` is refused (stays Unsupported)
             }
-            if let Some(captures) = analyze_captures(dparams, dbody, &f_bound, &nested_names, dname) {
+            if let Some(captures) = analyze_captures(dparams, dbody, &f_bound, &nested_names, dname)
+            {
                 let mangled = format!("{name}${dname}");
-                registry.insert(dname.clone(), NestedInfo { mangled: mangled.clone(), captures: captures.clone() });
+                registry.insert(
+                    dname.clone(),
+                    NestedInfo {
+                        mangled: mangled.clone(),
+                        captures: captures.clone(),
+                    },
+                );
                 liftable.push((ds, captures, mangled));
             }
         }
@@ -1570,7 +1895,12 @@ fn lower_fn_nested(
 
     let cap_ty = Type::Named("$capture".to_string(), Vec::new());
     for (ds, captures, mangled) in liftable {
-        if let StmtKind::Def { params: dparams, body: dbody, .. } = &ds.kind {
+        if let StmtKind::Def {
+            params: dparams,
+            body: dbody,
+            ..
+        } = &ds.kind
+        {
             let mut names: Vec<String> = captures.clone();
             names.extend(dparams.iter().map(|p| p.name.clone()));
             let mut ptys: Vec<Type> = vec![cap_ty.clone(); captures.len()];
@@ -1604,7 +1934,9 @@ pub fn lower_program(program: &[Stmt]) -> MirProgram {
 
     for s in program {
         match &s.kind {
-            StmtKind::Def { name, params, body, .. } => {
+            StmtKind::Def {
+                name, params, body, ..
+            } => {
                 let names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
                 let ptys = params.iter().map(|p| p.ty.clone()).collect();
                 let owned = params.iter().map(|p| is_owned(&p.convention)).collect();
@@ -1641,6 +1973,9 @@ pub fn lower_program(program: &[Stmt]) -> MirProgram {
         }
     }
 
-    functions.push(("__toplevel__".to_string(), lower_cfg(&Cfg::build(&toplevel))));
+    functions.push((
+        "__toplevel__".to_string(),
+        lower_cfg(&Cfg::build(&toplevel)),
+    ));
     MirProgram { functions }
 }

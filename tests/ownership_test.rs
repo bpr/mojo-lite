@@ -21,14 +21,18 @@ const THING: &str = "@fieldwise_init\nstruct Thing:\n    var x: Int\n\n";
 #[test]
 fn move_without_later_use_is_ok() {
     // Transferring a value is fine as long as the source isn't used afterward.
-    let src = format!("{THING}def main():\n    var a: Thing = Thing(1)\n    var b: Thing = a^\n    print(b.x)\n");
+    let src = format!(
+        "{THING}def main():\n    var a: Thing = Thing(1)\n    var b: Thing = a^\n    print(b.x)\n"
+    );
     assert!(own(&src).is_ok());
 }
 
 #[test]
 fn reassign_after_move_is_ok() {
     // A moved variable reinitialized before its next use is fine ("reinit").
-    let src = format!("{THING}def main():\n    var a: Thing = Thing(1)\n    var b: Thing = a^\n    a = Thing(2)\n    print(a.x)\n");
+    let src = format!(
+        "{THING}def main():\n    var a: Thing = Thing(1)\n    var b: Thing = a^\n    a = Thing(2)\n    print(a.x)\n"
+    );
     assert!(own(&src).is_ok());
 }
 
@@ -41,7 +45,9 @@ fn no_transfer_never_errors() {
 
 #[test]
 fn use_after_move_is_rejected() {
-    let src = format!("{THING}def main():\n    var a: Thing = Thing(1)\n    var b: Thing = a^\n    print(a.x)\n");
+    let src = format!(
+        "{THING}def main():\n    var a: Thing = Thing(1)\n    var b: Thing = a^\n    print(a.x)\n"
+    );
     match own(&src) {
         Err(OwnershipError::UseAfterMove { var, span }) => {
             assert_eq!(var, "a");
@@ -55,14 +61,21 @@ fn use_after_move_is_rejected() {
 
 #[test]
 fn double_transfer_is_use_after_move() {
-    let src = format!("{THING}def main():\n    var a: Thing = Thing(1)\n    var b: Thing = a^\n    var c: Thing = a^\n    print(b.x)\n");
-    assert!(matches!(own(&src), Err(OwnershipError::UseAfterMove { .. })));
+    let src = format!(
+        "{THING}def main():\n    var a: Thing = Thing(1)\n    var b: Thing = a^\n    var c: Thing = a^\n    print(b.x)\n"
+    );
+    assert!(matches!(
+        own(&src),
+        Err(OwnershipError::UseAfterMove { .. })
+    ));
 }
 
 #[test]
 fn conditional_move_is_rejected() {
     // Moved on one branch of an `if`, then used after the merge.
-    let src = format!("{THING}def main():\n    var flag: Bool = True\n    var a: Thing = Thing(1)\n    if flag:\n        var b: Thing = a^\n    print(a.x)\n");
+    let src = format!(
+        "{THING}def main():\n    var flag: Bool = True\n    var a: Thing = Thing(1)\n    if flag:\n        var b: Thing = a^\n    print(a.x)\n"
+    );
     match own(&src) {
         Err(OwnershipError::ConditionallyMoved { var, .. }) => assert_eq!(var, "a"),
         other => panic!("expected ConditionallyMoved, got {other:?}"),
@@ -73,7 +86,9 @@ fn conditional_move_is_rejected() {
 fn move_in_loop_is_rejected() {
     // The first iteration moves `a`; the back-edge makes it (maybe-)moved on entry
     // to the second, so the transfer is flagged.
-    let src = format!("{THING}def main():\n    var a: Thing = Thing(1)\n    for i in range(3):\n        var b: Thing = a^\n        print(b.x)\n");
+    let src = format!(
+        "{THING}def main():\n    var a: Thing = Thing(1)\n    for i in range(3):\n        var b: Thing = a^\n        print(b.x)\n"
+    );
     assert!(own(&src).is_err());
 }
 
@@ -137,8 +152,13 @@ fn expect_substring(src: &str) -> &str {
 fn use_after_move_through_a_place_write() {
     // Writing a field of a moved value is a use-after-move (caught via the place
     // root, not just a plain read).
-    let src = format!("{THING}def main():\n    var a: Thing = Thing(1)\n    var b: Thing = a^\n    a.x = 5\n");
-    assert!(matches!(own(&src), Err(OwnershipError::UseAfterMove { .. })));
+    let src = format!(
+        "{THING}def main():\n    var a: Thing = Thing(1)\n    var b: Thing = a^\n    a.x = 5\n"
+    );
+    assert!(matches!(
+        own(&src),
+        Err(OwnershipError::UseAfterMove { .. })
+    ));
 }
 
 // Two non-copyable struct fields, so a partial move of one is unambiguous.
@@ -150,7 +170,11 @@ fn partial_move_leaves_sibling_usable() {
     let src = format!(
         "{PAIR}def main():\n    var p: Pair = Pair(Inner(1), Inner(2))\n    var x: Inner = p.a^\n    print(x.id)\n    print(p.b.id)\n"
     );
-    assert!(own(&src).is_ok(), "sibling use after partial move: {:?}", own(&src));
+    assert!(
+        own(&src).is_ok(),
+        "sibling use after partial move: {:?}",
+        own(&src)
+    );
 }
 
 #[test]
@@ -184,7 +208,11 @@ fn reinitializing_a_moved_field_is_ok() {
     let src = format!(
         "{PAIR}def main():\n    var p: Pair = Pair(Inner(1), Inner(2))\n    var x: Inner = p.a^\n    p.a = Inner(9)\n    print(p.a.id)\n    var q: Pair = p^\n    print(q.a.id)\n"
     );
-    assert!(own(&src).is_ok(), "reinit after partial move: {:?}", own(&src));
+    assert!(
+        own(&src).is_ok(),
+        "reinit after partial move: {:?}",
+        own(&src)
+    );
 }
 
 #[test]
@@ -204,7 +232,10 @@ fn moving_a_field_twice_is_use_after_move() {
     let src = format!(
         "{PAIR}def main():\n    var p: Pair = Pair(Inner(1), Inner(2))\n    var x: Inner = p.a^\n    var y: Inner = p.a^\n    print(x.id)\n    print(y.id)\n"
     );
-    assert!(matches!(own(&src), Err(OwnershipError::UseAfterMove { .. })));
+    assert!(matches!(
+        own(&src),
+        Err(OwnershipError::UseAfterMove { .. })
+    ));
 }
 
 #[test]

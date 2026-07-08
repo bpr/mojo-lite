@@ -1,6 +1,6 @@
 //! Self-hosting proof (Phase 6, first installment): the `stdlib/` collection types
 //! are written **in mojo-lite itself** — ordinary *generic* structs (`List[T]`,
-//! `Optional[T]`), no compiler intrinsic. Each test copies the real `stdlib/*.mojo`
+//! `Optional[T]`, `Set[T]`, `Dict[K, V]`), no compiler intrinsic. Each test copies the real `stdlib/*.mojo`
 //! files into a temp directory alongside a small entry program, links them
 //! (`from module import …`), and runs on the VM.
 
@@ -21,7 +21,9 @@ impl TempDir {
     }
     /// Copy a real `stdlib/<name>` file into the temp dir (so imports resolve there).
     fn add_stdlib(&self, name: &str) {
-        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("stdlib").join(name);
+        let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("stdlib")
+            .join(name);
         std::fs::copy(&src, self.0.join(name))
             .unwrap_or_else(|e| panic!("copy {}: {e}", src.display()));
     }
@@ -81,4 +83,28 @@ fn self_hosted_generic_list_has_value_semantics() {
     );
     // `var b = a` deep-copies via __copyinit__ — b's mutations don't touch a.
     assert_eq!(run(&main).unwrap(), "2 3\n1 555\n");
+}
+
+#[test]
+fn self_hosted_generic_set_deduplicates_contains_iterates() {
+    let d = TempDir::new();
+    d.add_stdlib("list.mojo");
+    d.add_stdlib("set.mojo");
+    let main = d.write(
+        "main.mojo",
+        "from set import Set\n\ndef main():\n    var s: Set[Int] = Set[Int]()\n    s.add(3)\n    s.add(3)\n    s.add(5)\n    print(len(s))\n    print(3 in s, 4 in s)\n    var total: Int = 0\n    for x in s:\n        total = total + x\n    print(total)\n",
+    );
+    assert_eq!(run(&main).unwrap(), "2\ntrue false\n8\n");
+}
+
+#[test]
+fn self_hosted_generic_dict_sets_gets_updates_iterates() {
+    let d = TempDir::new();
+    d.add_stdlib("list.mojo");
+    d.add_stdlib("dict.mojo");
+    let main = d.write(
+        "main.mojo",
+        "from dict import Dict\n\ndef main():\n    var d: Dict[String, Int] = Dict[String, Int]()\n    d[\"a\"] = 10\n    d[\"b\"] = 20\n    d[\"a\"] = 15\n    print(len(d))\n    print(\"a\" in d, \"z\" in d)\n    print(d[\"a\"], d.get_or(\"z\", -1))\n    var total: Int = 0\n    for entry in d:\n        total = total + entry.value\n    print(total)\n",
+    );
+    assert_eq!(run(&main).unwrap(), "2\ntrue false\n15 -1\n35\n");
 }

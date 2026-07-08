@@ -530,7 +530,9 @@ pub(crate) fn slice_indices(
 ) -> Result<Vec<usize>, RuntimeError> {
     let step = step.unwrap_or(1);
     if step == 0 {
-        return Err(RuntimeError::TypeError("slice step cannot be zero".to_string()));
+        return Err(RuntimeError::TypeError(
+            "slice step cannot be zero".to_string(),
+        ));
     }
     // Clamp an explicit bound to a valid range, wrapping a negative index once.
     let adjust = |i: i64| -> i64 {
@@ -574,7 +576,9 @@ pub(crate) fn slice_value(
     match v {
         Value::List(items) => {
             let idxs = slice_indices(items.len() as i64, lower, upper, step)?;
-            Ok(Value::List(idxs.into_iter().map(|i| items[i].clone()).collect()))
+            Ok(Value::List(
+                idxs.into_iter().map(|i| items[i].clone()).collect(),
+            ))
         }
         Value::Str(s) => {
             let bytes = s.as_bytes();
@@ -683,7 +687,11 @@ pub(crate) fn apply_list_method(
 
 /// A read-only `List` query: `count(x)` → the number of equal elements;
 /// `index(x)` → the first equal element's index (a runtime error if absent).
-pub(crate) fn list_query(items: &[Value], method: &str, args: &[Value]) -> Result<Value, RuntimeError> {
+pub(crate) fn list_query(
+    items: &[Value],
+    method: &str,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
     let target = match items.first() {
         Some(f) => coerce_like(args[0].clone(), f),
         None => args[0].clone(),
@@ -973,7 +981,11 @@ pub(crate) fn simd_from_values(
     Ok(simd_value(dtype, lanes))
 }
 
-pub(crate) fn read_simd_lane(dtype: Dtype, lanes: &SimdLanes, i: i64) -> Result<Value, RuntimeError> {
+pub(crate) fn read_simd_lane(
+    dtype: Dtype,
+    lanes: &SimdLanes,
+    i: i64,
+) -> Result<Value, RuntimeError> {
     let idx = bounds_check(i, lanes.width(), "SIMD lane")?;
     let lane = match lanes {
         SimdLanes::Int(v) => SimdLanes::Int(vec![v[idx]]),
@@ -1187,9 +1199,10 @@ pub(crate) fn coerce(value: Value, ty: &Type) -> Value {
                     .enumerate()
                     .map(|(i, v)| match args.get(i) {
                         Some(ParamArg::Type(t)) => coerce(v, t),
-                        Some(ParamArg::Value(Expr { kind: ExprKind::Identifier(id), .. })) => {
-                            coerce(v, &Type::Named(id.clone(), Vec::new()))
-                        }
+                        Some(ParamArg::Value(Expr {
+                            kind: ExprKind::Identifier(id),
+                            ..
+                        })) => coerce(v, &Type::Named(id.clone(), Vec::new())),
                         _ => v,
                     })
                     .collect(),

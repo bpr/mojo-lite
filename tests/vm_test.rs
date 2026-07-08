@@ -147,10 +147,19 @@ fn for_range_iterator_protocol() {
         parity("var t: Int = 0\nfor i in range(5):\n    t = t + i\nprint(t)\n"),
         "10\n"
     );
-    assert_eq!(parity("for j in range(2, 8, 2):\n    print(j)\n"), "2\n4\n6\n");
-    assert_eq!(parity("for k in range(3, 0, -1):\n    print(k)\n"), "3\n2\n1\n");
+    assert_eq!(
+        parity("for j in range(2, 8, 2):\n    print(j)\n"),
+        "2\n4\n6\n"
+    );
+    assert_eq!(
+        parity("for k in range(3, 0, -1):\n    print(k)\n"),
+        "3\n2\n1\n"
+    );
     // An empty range runs the body zero times.
-    assert_eq!(parity("for x in range(0):\n    print(x)\nprint(99)\n"), "99\n");
+    assert_eq!(
+        parity("for x in range(0):\n    print(x)\nprint(99)\n"),
+        "99\n"
+    );
     // break/continue.
     let bc = "def main():\n    for m in range(10):\n        if m == 3:\n            break\n        if m == 1:\n            continue\n        print(m)\n";
     assert_eq!(parity(bc), "0\n2\n");
@@ -243,7 +252,9 @@ fn lists_tuples_and_indexing() {
 #[test]
 fn argument_matching_default_keyword_variadic() {
     assert_eq!(
-        parity("def p(b: Int, e: Int = 2) -> Int:\n    return b ** e\n\ndef main():\n    print(p(3))\n    print(p(3, 3))\n    print(p(e=4, b=2))\n"),
+        parity(
+            "def p(b: Int, e: Int = 2) -> Int:\n    return b ** e\n\ndef main():\n    print(p(3))\n    print(p(3, 3))\n    print(p(e=4, b=2))\n"
+        ),
         "9\n27\n16\n"
     );
     let variadic = "def total(*xs: Int) -> Int:\n    var s: Int = 0\n    for x in xs:\n        s = s + x\n    return s\n\ndef main():\n    print(total())\n    print(total(1, 2, 3))\n";
@@ -262,12 +273,16 @@ fn vm_mut_ref_params_write_back() {
     // writes each one's final value back to the caller's argument place after the
     // call (matching the tree-walker).
     assert_eq!(
-        parity("def incr(mut x: Int):\n    x = x + 1\n\ndef main():\n    var n: Int = 5\n    incr(n)\n    incr(n)\n    print(n)\n"),
+        parity(
+            "def incr(mut x: Int):\n    x = x + 1\n\ndef main():\n    var n: Int = 5\n    incr(n)\n    incr(n)\n    print(n)\n"
+        ),
         "7\n"
     );
     // `ref` writes back too; write-back through a struct field place persists.
     assert_eq!(
-        parity("def set_to(ref x: Int, v: Int):\n    x = v\n\ndef main():\n    var n: Int = 0\n    set_to(n, 42)\n    print(n)\n"),
+        parity(
+            "def set_to(ref x: Int, v: Int):\n    x = v\n\ndef main():\n    var n: Int = 0\n    set_to(n, 42)\n    print(n)\n"
+        ),
         "42\n"
     );
     let field = "@fieldwise_init\nstruct Counter:\n    var n: Int\n\ndef bump(mut c: Counter, k: Int):\n    c.n = c.n + k\n\ndef main():\n    var c: Counter = Counter(0)\n    bump(c, 5)\n    bump(c, 3)\n    print(c.n)\n";

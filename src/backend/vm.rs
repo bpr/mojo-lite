@@ -30,13 +30,13 @@ use super::Backend;
 use crate::ast::{ArgConvention, Expr, ExprKind, ParamKind, PrefixOp, Stmt, StmtKind, Type};
 use crate::checker::{ArgSlot, match_call_slots};
 use crate::error::RuntimeError;
+use crate::hir::VarId;
+use crate::mir::{Const, MirBlock, MirInstr, MirPlace, MirProgram, MirTerm, Proj, Reg};
 use crate::runtime::{
     Value, apply_infix, apply_list_method, apply_prefix, builtin_abs, builtin_convert,
     builtin_error, builtin_min_max, builtin_round, coerce, is_list_mutator, list_query,
     promote_numeric_elems, read_simd_lane, simd_from_values, value_as_index,
 };
-use crate::hir::VarId;
-use crate::mir::{Const, MirBlock, MirInstr, MirPlace, MirProgram, MirTerm, Proj, Reg};
 use std::collections::HashMap;
 
 /// The control-flow outcome of executing an instruction or a `try` sub-region.
@@ -214,7 +214,11 @@ impl VmBackend {
             }
             match &b.term {
                 MirTerm::Jump(t) => block = *t,
-                MirTerm::Branch { cond, then_b, else_b } => {
+                MirTerm::Branch {
+                    cond,
+                    then_b,
+                    else_b,
+                } => {
                     block = if is_true(&regs[cond.0 as usize]) {
                         *then_b
                     } else {
@@ -347,7 +351,11 @@ impl VmBackend {
             .filter(|((_, is_value), _)| *is_value)
             .map(|((pname, _), val)| (pname.clone(), val.clone().unwrap_or(Value::None)))
             .collect();
-        let skeleton = Value::Struct { name: name.to_string(), fields, value_params };
+        let skeleton = Value::Struct {
+            name: name.to_string(),
+            fields,
+            value_params,
+        };
         let fidx = prog
             .index_of(&format!("{name}.__init__"))
             .expect("caller checked __init__ is present");
@@ -365,7 +373,11 @@ impl VmBackend {
     /// `List`/`Tuple` recurse element-wise. Only reached when `has_copyinit` is set.
     fn clone_value(&mut self, prog: &Prog, v: &Value) -> Result<Value, RuntimeError> {
         match v {
-            Value::Struct { name, fields, value_params } => {
+            Value::Struct {
+                name,
+                fields,
+                value_params,
+            } => {
                 if let Some(fidx) = prog.index_of(&format!("{name}.__copyinit__")) {
                     let skeleton = self.struct_skeleton(prog, name, value_params.clone());
                     let (_, frame_vars) =
@@ -408,7 +420,9 @@ impl VmBackend {
     /// default move — the value's slot was already tombstoned — suffices. Only
     /// reached when `has_moveinit` is set.
     fn move_value(&mut self, prog: &Prog, v: Value) -> Result<Value, RuntimeError> {
-        if let Value::Struct { name, value_params, .. } = &v
+        if let Value::Struct {
+            name, value_params, ..
+        } = &v
             && let Some(fidx) = prog.index_of(&format!("{name}.__moveinit__"))
         {
             let skeleton = self.struct_skeleton(prog, name, value_params.clone());
@@ -432,7 +446,11 @@ impl VmBackend {
             .iter()
             .map(|(f, _)| (f.clone(), Value::None))
             .collect();
-        Value::Struct { name: name.to_string(), fields, value_params }
+        Value::Struct {
+            name: name.to_string(),
+            fields,
+            value_params,
+        }
     }
 
     /// If `place` is `c[i]` with `c` a user struct or an `UnsafePointer`, read it via
@@ -449,13 +467,21 @@ impl VmBackend {
         let Some((Proj::Index(ireg), prefix)) = place.proj.split_last() else {
             return Ok(None);
         };
-        let parent = MirPlace { root: place.root, proj: prefix.to_vec() };
+        let parent = MirPlace {
+            root: place.root,
+            proj: prefix.to_vec(),
+        };
         let recv = nav_mut(vars, regs, &parent)?.clone();
         match &recv {
             Value::Struct { name, .. } => {
                 let sname = name.clone();
                 let idx = regs[ireg.0 as usize].clone();
-                Ok(Some(self.call_dunder(prog, &sname, "__getitem__", vec![recv, idx])?))
+                Ok(Some(self.call_dunder(
+                    prog,
+                    &sname,
+                    "__getitem__",
+                    vec![recv, idx],
+                )?))
             }
             Value::Pointer(b) => {
                 let off = value_as_index(&regs[ireg.0 as usize])?;
@@ -573,7 +599,14 @@ impl VmBackend {
                 let r = regs[b.0 as usize].clone();
                 regs[dest.0 as usize] = self.apply_binop(prog, *op, l, r)?;
             }
-            MirInstr::Call { dest, func, args, kwargs, arg_places, param_arg_regs } => {
+            MirInstr::Call {
+                dest,
+                func,
+                args,
+                kwargs,
+                arg_places,
+                param_arg_regs,
+            } => {
                 let argv: Vec<Value> = args.iter().map(|r| regs[r.0 as usize].clone()).collect();
                 let kw: Vec<(String, Value)> = kwargs
                     .iter()
@@ -582,26 +615,36 @@ impl VmBackend {
                 // The supplied compile-time value-parameter arguments (a type
                 // parameter is `None`), used to reify a constructed struct's
                 // `value_params`.
-                let pvals: Vec<Option<Value>> =
-                    param_arg_regs.iter().map(|o| o.map(|r| regs[r.0 as usize].clone())).collect();
+                let pvals: Vec<Option<Value>> = param_arg_regs
+                    .iter()
+                    .map(|o| o.map(|r| regs[r.0 as usize].clone()))
+                    .collect();
                 // A free function with `mut`/`ref` parameters writes each one's final
                 // value back to the caller's argument place after the call.
                 let writeback = prog
                     .index_of(&func.0)
                     .filter(|&idx| prog.mir.functions[idx].1.ref_params.iter().any(|&r| r));
                 let result = match writeback {
-                    Some(idx) => {
-                        self.call_with_writeback(prog, &func.0, idx, argv, kw, arg_places, regs, vars)?
-                    }
+                    Some(idx) => self.call_with_writeback(
+                        prog, &func.0, idx, argv, kw, arg_places, regs, vars,
+                    )?,
                     None => self.call_named(prog, &func.0, argv, kw, &pvals)?,
                 };
                 regs[dest.0 as usize] = result;
             }
-            MirInstr::MethodCall { dest, recv, method, args, recv_place, arg_places } => {
+            MirInstr::MethodCall {
+                dest,
+                recv,
+                method,
+                args,
+                recv_place,
+                arg_places,
+            } => {
                 let recv_val = regs[recv.0 as usize].clone();
                 let argv: Vec<Value> = args.iter().map(|r| regs[r.0 as usize].clone()).collect();
-                regs[dest.0 as usize] =
-                    self.method_call(prog, recv_val, method, argv, recv_place, arg_places, regs, vars)?;
+                regs[dest.0 as usize] = self.method_call(
+                    prog, recv_val, method, argv, recv_place, arg_places, regs, vars,
+                )?;
             }
             MirInstr::GetField { dest, base, field } => {
                 regs[dest.0 as usize] = get_field(&regs[base.0 as usize], field)?;
@@ -630,7 +673,13 @@ impl VmBackend {
                     }
                 }
             }
-            MirInstr::Slice { dest, object, lower, upper, step } => {
+            MirInstr::Slice {
+                dest,
+                object,
+                lower,
+                upper,
+                step,
+            } => {
                 let bound = |b: &Option<Reg>| -> Result<Option<i64>, RuntimeError> {
                     match b {
                         Some(r) => Ok(Some(value_as_index(&regs[r.0 as usize])?)),
@@ -642,7 +691,8 @@ impl VmBackend {
                     crate::runtime::slice_value(&regs[object.0 as usize], lo, hi, st)?;
             }
             MirInstr::MakeList { dest, elems } => {
-                let mut items: Vec<Value> = elems.iter().map(|r| regs[r.0 as usize].clone()).collect();
+                let mut items: Vec<Value> =
+                    elems.iter().map(|r| regs[r.0 as usize].clone()).collect();
                 promote_numeric_elems(&mut items); // unify literal element kinds
                 regs[dest.0 as usize] = Value::List(items);
             }
@@ -650,7 +700,12 @@ impl VmBackend {
                 let items = elems.iter().map(|r| regs[r.0 as usize].clone()).collect();
                 regs[dest.0 as usize] = Value::Tuple(items);
             }
-            MirInstr::MakeSimd { dest, dtype, width, elems } => {
+            MirInstr::MakeSimd {
+                dest,
+                dtype,
+                width,
+                elems,
+            } => {
                 let vals: Vec<Value> = elems.iter().map(|r| regs[r.0 as usize].clone()).collect();
                 regs[dest.0 as usize] = simd_from_values(*dtype, *width, &vals)?;
             }
@@ -665,7 +720,10 @@ impl VmBackend {
                     StructIdx(MirPlace, Reg),
                 }
                 let target = if let Some((Proj::Index(ireg), prefix)) = place.proj.split_last() {
-                    let parent = MirPlace { root: place.root, proj: prefix.to_vec() };
+                    let parent = MirPlace {
+                        root: place.root,
+                        proj: prefix.to_vec(),
+                    };
                     let ireg = *ireg;
                     match nav_mut(vars, regs, &parent)? {
                         Value::Pointer(b) => Some(StoreTarget::Ptr(*b, ireg)),
@@ -774,7 +832,11 @@ impl VmBackend {
                         Value::Range { start, stop, step } => {
                             let (cur, st, sp) = (*start, *stop, *step);
                             regs[dest.0 as usize] = Value::Int(cur);
-                            vars[slot] = Value::Range { start: cur + sp, stop: st, step: sp };
+                            vars[slot] = Value::Range {
+                                start: cur + sp,
+                                stop: st,
+                                step: sp,
+                            };
                         }
                         Value::List(items) => {
                             regs[dest.0 as usize] = items.remove(0);
@@ -809,7 +871,13 @@ impl VmBackend {
                 };
                 return Err(RuntimeError::Raised(msg));
             }
-            MirInstr::Try { body, handler, orelse, finalbody, cleanup } => {
+            MirInstr::Try {
+                body,
+                handler,
+                orelse,
+                finalbody,
+                cleanup,
+            } => {
                 // A `try` may complete with a `return` that crossed its boundary;
                 // propagate that outcome to the block driver.
                 return self.exec_try(prog, body, handler, orelse, finalbody, cleanup, regs, vars);
@@ -925,11 +993,22 @@ impl VmBackend {
             }
             match &b.term {
                 MirTerm::Jump(t) => block = *t,
-                MirTerm::Branch { cond, then_b, else_b } => {
-                    block = if is_true(&regs[cond.0 as usize]) { *then_b } else { *else_b };
+                MirTerm::Branch {
+                    cond,
+                    then_b,
+                    else_b,
+                } => {
+                    block = if is_true(&regs[cond.0 as usize]) {
+                        *then_b
+                    } else {
+                        *else_b
+                    };
                 }
                 MirTerm::Return(r) => {
-                    let v = r.as_ref().map(|r| regs[r.0 as usize].clone()).unwrap_or(Value::None);
+                    let v = r
+                        .as_ref()
+                        .map(|r| regs[r.0 as usize].clone())
+                        .unwrap_or(Value::None);
                     return Ok(Flow::Return(v));
                 }
                 MirTerm::FallOff => return Ok(Flow::Normal),
@@ -1089,8 +1168,16 @@ impl VmBackend {
             // `String(c)` on a user struct dispatches to `c.__str__()`; a primitive
             // value uses its `Display`.
             "String" => match args.into_iter().next() {
-                Some(Value::Struct { name, fields, value_params }) => {
-                    let recv = Value::Struct { name: name.clone(), fields, value_params };
+                Some(Value::Struct {
+                    name,
+                    fields,
+                    value_params,
+                }) => {
+                    let recv = Value::Struct {
+                        name: name.clone(),
+                        fields,
+                        value_params,
+                    };
                     self.call_dunder(prog, &name, "__str__", vec![recv])
                 }
                 other => Ok(Value::Str(other.map(|v| v.to_string()).unwrap_or_default())),
@@ -1099,8 +1186,16 @@ impl VmBackend {
             "len" => match args.into_iter().next() {
                 Some(Value::Str(s)) => Ok(Value::Int(s.len() as i64)),
                 Some(Value::List(items)) => Ok(Value::Int(items.len() as i64)),
-                Some(Value::Struct { name, fields, value_params }) => {
-                    let recv = Value::Struct { name: name.clone(), fields, value_params };
+                Some(Value::Struct {
+                    name,
+                    fields,
+                    value_params,
+                }) => {
+                    let recv = Value::Struct {
+                        name: name.clone(),
+                        fields,
+                        value_params,
+                    };
                     self.call_dunder(prog, &name, "__len__", vec![recv])
                 }
                 _ => Err(RuntimeError::Unsupported(
@@ -1171,7 +1266,9 @@ impl VmBackend {
                             .iter()
                             .zip(param_vals)
                             .filter(|((_, is_value), _)| *is_value)
-                            .map(|((pname, _), val)| (pname.clone(), val.clone().unwrap_or(Value::None)))
+                            .map(|((pname, _), val)| {
+                                (pname.clone(), val.clone().unwrap_or(Value::None))
+                            })
                             .collect(),
                         None => Vec::new(),
                     };
@@ -1231,7 +1328,14 @@ impl Backend for VmBackend {
 fn build_structs(program: &[Stmt]) -> HashMap<String, StructDef> {
     let mut map = HashMap::new();
     for s in program {
-        if let StmtKind::Struct { name, type_params, fields, methods, fieldwise_init, .. } = &s.kind
+        if let StmtKind::Struct {
+            name,
+            type_params,
+            fields,
+            methods,
+            fieldwise_init,
+            ..
+        } = &s.kind
         {
             let mut_self_methods = methods
                 .iter()
@@ -1241,7 +1345,10 @@ fn build_structs(program: &[Stmt]) -> HashMap<String, StructDef> {
             map.insert(
                 name.clone(),
                 StructDef {
-                    fields: fields.iter().map(|f| (f.name.clone(), f.ty.clone())).collect(),
+                    fields: fields
+                        .iter()
+                        .map(|f| (f.name.clone(), f.ty.clone()))
+                        .collect(),
                     mut_self_methods,
                     fieldwise_init: *fieldwise_init,
                     param_decls: crate::runtime::classify_param_decls(type_params),
@@ -1256,7 +1363,13 @@ fn build_structs(program: &[Stmt]) -> HashMap<String, StructDef> {
 fn build_sigs(program: &[Stmt]) -> HashMap<String, FnSig> {
     let mut map = HashMap::new();
     for s in program {
-        if let StmtKind::Def { name, type_params, params, .. } = &s.kind {
+        if let StmtKind::Def {
+            name,
+            type_params,
+            params,
+            ..
+        } = &s.kind
+        {
             // Split the regular parameters from a trailing `*args` (mirrors the
             // checker / evaluator).
             let nreg = params
@@ -1384,13 +1497,21 @@ fn construct(
         .filter(|((_, is_value), _)| *is_value)
         .map(|((pname, _), val)| (pname.clone(), val.clone().unwrap_or(Value::None)))
         .collect();
-    Ok(Value::Struct { name: name.to_string(), fields, value_params })
+    Ok(Value::Struct {
+        name: name.to_string(),
+        fields,
+        value_params,
+    })
 }
 
 /// Read a struct field (or a reified value parameter, e.g. `Self.n`) by name.
 fn get_field(base: &Value, field: &str) -> Result<Value, RuntimeError> {
     match base {
-        Value::Struct { fields, value_params, .. } => fields
+        Value::Struct {
+            fields,
+            value_params,
+            ..
+        } => fields
             .iter()
             .chain(value_params.iter())
             .find(|(f, _)| f == field)
@@ -1430,7 +1551,11 @@ fn index_value(base: &Value, idx: i64) -> Result<Value, RuntimeError> {
 fn arg1(name: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
     let mut args = args;
     if args.len() != 1 {
-        return Err(RuntimeError::ArityMismatch { name: name.to_string(), expected: 1, got: args.len() });
+        return Err(RuntimeError::ArityMismatch {
+            name: name.to_string(),
+            expected: 1,
+            got: args.len(),
+        });
     }
     Ok(args.pop().unwrap())
 }
@@ -1438,7 +1563,11 @@ fn arg1(name: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
 /// Take the two arguments of a two-arg built-in (`min`/`max`).
 fn arg2(name: &str, args: Vec<Value>) -> Result<(Value, Value), RuntimeError> {
     if args.len() != 2 {
-        return Err(RuntimeError::ArityMismatch { name: name.to_string(), expected: 2, got: args.len() });
+        return Err(RuntimeError::ArityMismatch {
+            name: name.to_string(),
+            expected: 2,
+            got: args.len(),
+        });
     }
     let mut it = args.into_iter();
     Ok((it.next().unwrap(), it.next().unwrap()))
@@ -1490,7 +1619,11 @@ fn nav_step<'a>(
             // Search declared fields first, then value parameters (a `Self.n`
             // read) — mirroring `get_field`, so a place read through this matches
             // the register-based `GetField`.
-            Value::Struct { fields, value_params, .. } => {
+            Value::Struct {
+                fields,
+                value_params,
+                ..
+            } => {
                 if let Some(pos) = fields.iter().position(|(f, _)| f == name) {
                     Ok(&mut fields[pos].1)
                 } else if let Some(pos) = value_params.iter().position(|(f, _)| f == name) {

@@ -19,136 +19,13 @@
 //! the checker simple; hoisting `def` signatures per block is future work.
 
 use std::collections::HashMap;
-use std::fmt;
 
 use crate::ast::{
     ArgConvention, Dtype, Expr, ExprKind, InfixOp, Method, PrefixOp, Stmt, StmtKind, Type,
 };
+use crate::ct::CtValue;
 use crate::error::TypeError;
-
-/// A type in the checker's lattice. Scalars mirror `ast::Type`; `Func` is
-/// synthesized from a `def` signature. The annotation grammar has no function
-/// types yet, so `Func` only ever arises from a `def`, never from an annotation.
-#[derive(Debug, Clone, PartialEq)]
-enum Ty {
-    Int,
-    UInt,
-    Bool,
-    String,
-    Float64,
-    None,
-    /// The flexible type of an integer literal: coerces to `Int`, `UInt`, or
-    /// `Float64` (materializing to `Int` if nothing forces a choice).
-    IntLiteral,
-    /// The flexible type of a float literal: coerces to `Float64`.
-    FloatLiteral,
-    /// A non-generic function. `params`/`names` describe the **regular** (non-
-    /// variadic) parameters; `required` is the number of leading regular params
-    /// without a default (defaults must be trailing), so a call may supply
-    /// `required..=params.len()` regular arguments. `variadic`, if present, is the
-    /// **element type** of a trailing `*args` parameter, which collects any extra
-    /// positional arguments into a `List[element]`.
-    Func {
-        params: Vec<Ty>,
-        names: Vec<String>,
-        ret: Box<Ty>,
-        required: usize,
-        variadic: Option<Box<Ty>>,
-        /// The argument convention of each regular parameter (same order as
-        /// `params`). A `mut`/`ref` parameter *borrows* its argument (so passing a
-        /// non-Copyable value to it is fine); a `read`/`owned`/default parameter
-        /// *consumes* by value (requiring a Copyable value or a `^` transfer).
-        conventions: Vec<Option<ArgConvention>>,
-    },
-    /// A *generic* function synthesized from a `def` with a `[params]` list. Kept
-    /// distinct from `Func` because a call site infers/supplies its parameters.
-    /// `params`/`ret` may mention type parameters as `Ty::Param`.
-    GenericFunc {
-        decls: Vec<ParamDecl>,
-        params: Vec<Ty>,
-        ret: Box<Ty>,
-    },
-    /// A type parameter (`T`) inside a generic `def`/`struct` body, carrying its
-    /// trait `bounds`. It supports no operators, and only the methods required by
-    /// its bound traits (you can otherwise just store, pass, and return it).
-    Param {
-        name: String,
-        bounds: Vec<String>,
-    },
-    /// `Self` inside a trait method requirement — the (abstract) conforming type.
-    /// Substituted for the concrete/parameter type when a struct's method is
-    /// checked against the requirement, or when a bounded `T`'s method is typed.
-    SelfType,
-    /// The iterable produced by the built-in `range(...)`. Has no annotation
-    /// syntax, so it only ever arises from a `range` call (used by `for`).
-    Range,
-    /// A nominal struct type, named, with its parameter arguments (empty for a
-    /// non-parameterized struct). Its layout/methods live in the registry.
-    Struct(String, Vec<TyArg>),
-    /// A SIMD vector type `SIMD[DType.<dtype>, width]` (built-in). The scalar
-    /// aliases (`Int32`, `Float32`, …) are `Simd` with `width == 1`.
-    Simd {
-        dtype: Dtype,
-        width: i64,
-    },
-    /// The built-in `Error` type (what `raise` raises and `except` binds).
-    Error,
-    /// The built-in `List[T]` collection type (a value type; element type `T`).
-    List(Box<Ty>),
-    /// The built-in `Tuple[T1, …, Tn]` — a fixed-size heterogeneous value type.
-    Tuple(Vec<Ty>),
-    /// The built-in `UnsafePointer[T]` — a low-level, *aliasing* handle to
-    /// contiguous storage of element type `T` (unlike value types, copying a
-    /// pointer shares the storage). Allocated with `UnsafePointer[T].alloc(n)`.
-    Pointer(Box<Ty>),
-}
-
-/// A declared compile-time parameter of a generic `struct`/`def`, classified from
-/// the source `[name: X]` form by whether `X` is a trait or a type.
-#[derive(Debug, Clone, PartialEq)]
-enum ParamDecl {
-    /// A type parameter `T: Trait & ...` — carries its trait bounds.
-    Type { name: String, bounds: Vec<String> },
-    /// A value parameter `n: Int` — an `Int` compile-time value (the only value
-    /// parameter type supported).
-    Value { name: String },
-}
-
-impl ParamDecl {
-    fn name(&self) -> &str {
-        match self {
-            ParamDecl::Type { name, .. } | ParamDecl::Value { name } => name,
-        }
-    }
-}
-
-/// A compile-time value (a value parameter's argument). `Param` is a symbolic
-/// placeholder for a value parameter while a generic body is being checked (its
-/// concrete value is only known at a use site).
-#[derive(Debug, Clone, PartialEq)]
-enum CtVal {
-    Int(i64),
-    Param(String),
-}
-
-/// One argument in a struct type's parameter list — a type or a comptime value.
-/// `Pair[Int]` is `[Ty(Int)]`; `FixedBuffer[8]` is `[Val(Int(8))]`. Part of a
-/// struct type's identity, so `FixedBuffer[8] != FixedBuffer[9]`.
-#[derive(Debug, Clone, PartialEq)]
-enum TyArg {
-    Ty(Ty),
-    Val(CtVal),
-}
-
-impl fmt::Display for TyArg {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TyArg::Ty(t) => write!(f, "{}", t),
-            TyArg::Val(CtVal::Int(n)) => write!(f, "{}", n),
-            TyArg::Val(CtVal::Param(name)) => write!(f, "{}", name),
-        }
-    }
-}
+use crate::types::{ParamDecl, Ty, TyArg};
 
 /// The checked signature of a struct, kept in the checker's registry.
 struct StructInfo {
@@ -175,65 +52,6 @@ struct MethodSig {
     /// `mut self` — the method may mutate `self`, so a call site must have a
     /// mutable variable receiver (the mutation is written back to it).
     mut_self: bool,
-}
-
-impl fmt::Display for Ty {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Ty::Int | Ty::IntLiteral => write!(f, "Int"),
-            Ty::UInt => write!(f, "UInt"),
-            Ty::Bool => write!(f, "Bool"),
-            Ty::String => write!(f, "String"),
-            Ty::Float64 | Ty::FloatLiteral => write!(f, "Float64"),
-            Ty::None => write!(f, "None"),
-            Ty::Func { params, ret, .. } | Ty::GenericFunc { params, ret, .. } => {
-                write!(f, "def(")?;
-                for (i, p) in params.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{}", p)?;
-                }
-                write!(f, ") -> {}", ret)
-            }
-            Ty::Param { name, .. } => write!(f, "{}", name),
-            Ty::SelfType => write!(f, "Self"),
-            // A width-1 SIMD prints as its scalar alias (`Int32`); wider as
-            // `SIMD[DType.<dt>, width]`.
-            Ty::Simd { dtype, width: 1 } if dtype.scalar_alias().is_some() => {
-                write!(f, "{}", dtype.scalar_alias().unwrap())
-            }
-            Ty::Simd { dtype, width } => write!(f, "SIMD[DType.{}, {}]", dtype.name(), width),
-            Ty::Error => write!(f, "Error"),
-            Ty::Pointer(elem) => write!(f, "UnsafePointer[{}]", elem),
-            Ty::List(elem) => write!(f, "List[{}]", elem),
-            Ty::Tuple(elems) => {
-                write!(f, "Tuple[")?;
-                for (i, t) in elems.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{}", t)?;
-                }
-                write!(f, "]")
-            }
-            Ty::Range => write!(f, "range"),
-            Ty::Struct(name, args) => {
-                write!(f, "{}", name)?;
-                if !args.is_empty() {
-                    write!(f, "[")?;
-                    for (i, a) in args.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{}", a)?;
-                    }
-                    write!(f, "]")?;
-                }
-                Ok(())
-            }
-        }
-    }
 }
 
 /// Type-check a whole program. Convenience wrapper over [`Checker`].
@@ -395,9 +213,10 @@ impl Checker {
             ParamDecl::Type { name, bounds } => {
                 let ty = match arg {
                     ParamArg::Type(t) => self.ty_from_anno(t)?,
-                    ParamArg::Value(Expr { kind: ExprKind::Identifier(id), .. }) => {
-                        self.ty_from_anno(&Type::Named(id.clone(), vec![]))?
-                    }
+                    ParamArg::Value(Expr {
+                        kind: ExprKind::Identifier(id),
+                        ..
+                    }) => self.ty_from_anno(&Type::Named(id.clone(), vec![]))?,
                     ParamArg::Value(_) => {
                         return Err(TypeError::TypeMismatch {
                             expected: "a type".to_string(),
@@ -418,7 +237,7 @@ impl Checker {
                 Ok(TyArg::Ty(ty))
             }
             ParamDecl::Value { name } => match arg {
-                ParamArg::Value(expr) => Ok(TyArg::Val(CtVal::Int(self.eval_ct(expr)?))),
+                ParamArg::Value(expr) => Ok(TyArg::Val(CtValue::Int(self.eval_ct(expr)?))),
                 ParamArg::Type(_) => Err(TypeError::TypeMismatch {
                     expected: "a value".to_string(),
                     found: "a type".to_string(),
@@ -440,7 +259,10 @@ impl Checker {
         match &args[0] {
             crate::ast::ParamArg::Type(t) => Ok(Ty::List(Box::new(self.ty_from_anno(t)?))),
             // A bare-identifier arg is reinterpreted as a type (as elsewhere).
-            crate::ast::ParamArg::Value(Expr { kind: ExprKind::Identifier(id), .. }) => Ok(Ty::List(Box::new(
+            crate::ast::ParamArg::Value(Expr {
+                kind: ExprKind::Identifier(id),
+                ..
+            }) => Ok(Ty::List(Box::new(
                 self.ty_from_anno(&Type::Named(id.clone(), vec![]))?,
             ))),
             crate::ast::ParamArg::Value(_) => Err(TypeError::TypeMismatch {
@@ -462,9 +284,10 @@ impl Checker {
         }
         let elem = match &args[0] {
             crate::ast::ParamArg::Type(t) => self.ty_from_anno(t)?,
-            crate::ast::ParamArg::Value(Expr { kind: ExprKind::Identifier(id), .. }) => {
-                self.ty_from_anno(&Type::Named(id.clone(), vec![]))?
-            }
+            crate::ast::ParamArg::Value(Expr {
+                kind: ExprKind::Identifier(id),
+                ..
+            }) => self.ty_from_anno(&Type::Named(id.clone(), vec![]))?,
             crate::ast::ParamArg::Value(_) => {
                 return Err(TypeError::TypeMismatch {
                     expected: "a type".to_string(),
@@ -483,9 +306,10 @@ impl Checker {
             elems.push(match arg {
                 crate::ast::ParamArg::Type(t) => self.ty_from_anno(t)?,
                 // A bare-identifier arg is reinterpreted as a type (as elsewhere).
-                crate::ast::ParamArg::Value(Expr { kind: ExprKind::Identifier(id), .. }) => {
-                    self.ty_from_anno(&Type::Named(id.clone(), vec![]))?
-                }
+                crate::ast::ParamArg::Value(Expr {
+                    kind: ExprKind::Identifier(id),
+                    ..
+                }) => self.ty_from_anno(&Type::Named(id.clone(), vec![]))?,
                 crate::ast::ParamArg::Value(_) => {
                     return Err(TypeError::TypeMismatch {
                         expected: "a type".to_string(),
@@ -1148,7 +972,10 @@ impl Checker {
         // are written back to the caller (modeled — see `eval_call`). Only `out`
         // (an uninitialized out-parameter, i.e. a hand-written `__init__`) still
         // has semantics we don't model.
-        if params.iter().any(|p| matches!(p.convention, Some(ArgConvention::Out))) {
+        if params
+            .iter()
+            .any(|p| matches!(p.convention, Some(ArgConvention::Out)))
+        {
             return Some("the 'out' argument convention");
         }
         if positional_only.is_some() {
@@ -1289,7 +1116,7 @@ impl Checker {
 
         // The struct's parameters are in scope as `Self.T` / `Self.n`, and bare
         // `Self` is the struct type, while checking its members. Type parameters
-        // appear as `Ty::Param`, value parameters as symbolic `CtVal::Param`.
+        // appear as `Ty::Param`, value parameters as symbolic `CtValue::Param`.
         let self_ty = Ty::Struct(name.to_string(), decls.iter().map(param_as_arg).collect());
         let saved_self_decls = std::mem::replace(&mut self.self_decls, decls.clone());
         let saved_self_ty = self.self_ty.replace(self_ty.clone());
@@ -1442,10 +1269,12 @@ impl Checker {
         // `__init__` (constructor), `__copyinit__` (copy), and `__moveinit__` (move),
         // whose bodies assign `self`'s fields. `ref self`, and `out self` elsewhere,
         // stay flagged.
-        let is_lifecycle_init =
-            matches!(m.name.as_str(), "__init__" | "__copyinit__" | "__moveinit__");
-        let out_init = matches!(m.self_convention, Some(crate::ast::ArgConvention::Out))
-            && is_lifecycle_init;
+        let is_lifecycle_init = matches!(
+            m.name.as_str(),
+            "__init__" | "__copyinit__" | "__moveinit__"
+        );
+        let out_init =
+            matches!(m.self_convention, Some(crate::ast::ArgConvention::Out)) && is_lifecycle_init;
         if matches!(m.self_convention, Some(crate::ast::ArgConvention::Ref))
             || (matches!(m.self_convention, Some(crate::ast::ArgConvention::Out)) && !out_init)
         {
@@ -1463,7 +1292,10 @@ impl Checker {
         // `__init__` must assign every declared field somewhere in its body, so a
         // constructed value has no unset fields. Path-sensitive DI (assign exactly
         // once, before any read, on every path) is left for a later refinement.
-        if result.is_ok() && out_init && let Ty::Struct(sname, _) = self_ty {
+        if result.is_ok()
+            && out_init
+            && let Ty::Struct(sname, _) = self_ty
+        {
             result = self.check_definite_init(sname, &m.name, &m.body);
         }
         self.scopes.pop();
@@ -1481,7 +1313,10 @@ impl Checker {
     ) -> Result<(), TypeError> {
         let mut assigned = std::collections::HashSet::new();
         collect_self_assigned_fields(body, &mut assigned);
-        let info = self.structs.get(sname).expect("struct types are registered");
+        let info = self
+            .structs
+            .get(sname)
+            .expect("struct types are registered");
         for (field, _) in &info.fields {
             if !assigned.contains(field.as_str()) {
                 return Err(TypeError::UninitializedField {
@@ -1990,7 +1825,10 @@ impl Checker {
                 // `c[i] = e` → `c.__setitem__(i, e)`. The index must coerce to the
                 // first parameter; the *target* type (what `e` must be) is the second.
                 if let Ty::Struct(sname, targs) = &obj_ty {
-                    let info = self.structs.get(sname).expect("struct types are registered");
+                    let info = self
+                        .structs
+                        .get(sname)
+                        .expect("struct types are registered");
                     let sig = info
                         .methods
                         .get("__setitem__")
@@ -2309,11 +2147,11 @@ impl Checker {
         Some(Ok(substitute(&sig.ret, &subst)))
     }
 
-    /// The `for`-loop element type of a user struct iterable, validating the stable
-    /// Mojo iterator protocol: the struct defines `__iter__(self) -> Iter`, where
-    /// `Iter` is a struct with `__next__(mut self) -> Element` (advances) and
-    /// `__len__(self) -> Int` (remaining count — bounded iteration). Returns
-    /// `Element`.
+    /// The `for`-loop element type of a user struct iterable, validating the
+    /// stable Mojo iterator protocol. A struct defines `__iter__(self) -> Iter`,
+    /// where `Iter` is either a built-in `List[Element]` or a struct with
+    /// `__next__(mut self) -> Element` (advances) and `__len__(self) -> Int`
+    /// (remaining count — bounded iteration).
     fn iter_element_ty(&self, c_ty: &Ty) -> Result<Ty, TypeError> {
         let no_method = |ty: &Ty, m: &str| TypeError::NoSuchMethod {
             object_type: ty.to_string(),
@@ -2322,7 +2160,10 @@ impl Checker {
         let Ty::Struct(cname, ctargs) = c_ty else {
             return Err(no_method(c_ty, "__iter__"));
         };
-        let cinfo = self.structs.get(cname).expect("struct types are registered");
+        let cinfo = self
+            .structs
+            .get(cname)
+            .expect("struct types are registered");
         let iter_sig = cinfo
             .methods
             .get("__iter__")
@@ -2335,9 +2176,12 @@ impl Checker {
             });
         }
         let it_ty = substitute(&iter_sig.ret, &struct_subst(&cinfo.decls, ctargs));
+        if let Ty::List(elem) = &it_ty {
+            return Ok((**elem).clone());
+        }
         // The iterator must itself be a struct with `__next__` and `__len__`.
         let bad_iter = || TypeError::TypeMismatch {
-            expected: "an iterator struct (with __next__ and __len__)".to_string(),
+            expected: "List or an iterator struct (with __next__ and __len__)".to_string(),
             found: it_ty.to_string(),
             context: "__iter__ return type".to_string(),
         };
@@ -2547,7 +2391,12 @@ impl Checker {
             Lt | Gt | Le | Ge if common.is_some() => Some(Ty::Bool),
             // Equality: between numbers (any common type), or equal non-numeric
             // scalars (Bool/String/None).
-            Eq | Ne if common.is_some() || (lt == rt && is_scalar(&lt)) => Some(Ty::Bool),
+            Eq | Ne
+                if common.is_some()
+                    || (lt == rt && (is_scalar(&lt) || has_equality_bound(&lt))) =>
+            {
+                Some(Ty::Bool)
+            }
             _ => None,
         };
         if let Some(ty) = result {
@@ -2825,7 +2674,11 @@ impl Checker {
                 conventions.get(i),
                 Some(Some(ArgConvention::Owned | ArgConvention::Deinit))
             ) {
-                self.check_consuming(arg, &arg_ty, &format!("argument '{}' to '{}'", names[i], name))?;
+                self.check_consuming(
+                    arg,
+                    &arg_ty,
+                    &format!("argument '{}' to '{}'", names[i], name),
+                )?;
             }
         }
         // Each overflow argument must coerce to the `*args` element type.
@@ -3051,22 +2904,39 @@ impl Checker {
 /// must name one of these. `AnyType` is the least restrictive.
 const BUILTIN_TRAITS: &[&str] = &[
     "AnyType",
-    "Copyable",
+    "ImplicitlyDeletable",
     "Movable",
+    "Copyable",
+    "ImplicitlyCopyable",
+    "RegisterPassable",
+    "TrivialRegisterPassable",
     "Defaultable",
-    "Stringable",
     "Representable",
     "Writable",
+    "Writer",
     "Boolable",
     "Intable",
+    "Floatable",
     "Indexer",
     "Equatable",
     "Comparable",
     "Hashable",
+    "Hasher",
+    "Identifiable",
     "Sized",
+    "SizedRaising",
+    "Iterable",
+    "IterableOwned",
+    "Iterator",
     "Absable",
     "Powable",
     "Roundable",
+    "Ceilable",
+    "Floorable",
+    "Truncable",
+    "CeilDivable",
+    "CeilDivableRaising",
+    "Divmodable",
 ];
 
 /// Solve a type parameter against an actual type, recording it in `subst`. A
@@ -3134,7 +3004,9 @@ fn check_call_aliasing(
             let (ra, pa, ea) = &accesses[i];
             let (rb, pb, eb) = &accesses[j];
             if ra == rb && (*ea || *eb) && places_overlap(pa, pb) {
-                return Err(TypeError::AliasingViolation { var: ra.to_string() });
+                return Err(TypeError::AliasingViolation {
+                    var: ra.to_string(),
+                });
             }
         }
     }
@@ -3236,6 +3108,9 @@ fn substitute(ty: &Ty, subst: &HashMap<String, Ty>) -> Ty {
         Ty::Struct(name, args) => {
             Ty::Struct(name.clone(), map_tyargs(args, |t| substitute(t, subst)))
         }
+        Ty::List(elem) => Ty::List(Box::new(substitute(elem, subst))),
+        Ty::Tuple(elems) => Ty::Tuple(elems.iter().map(|t| substitute(t, subst)).collect()),
+        Ty::Pointer(elem) => Ty::Pointer(Box::new(substitute(elem, subst))),
         Ty::Func {
             params,
             names,
@@ -3264,6 +3139,14 @@ fn substitute_self(ty: &Ty, replacement: &Ty) -> Ty {
             name.clone(),
             map_tyargs(args, |t| substitute_self(t, replacement)),
         ),
+        Ty::List(elem) => Ty::List(Box::new(substitute_self(elem, replacement))),
+        Ty::Tuple(elems) => Ty::Tuple(
+            elems
+                .iter()
+                .map(|t| substitute_self(t, replacement))
+                .collect(),
+        ),
+        Ty::Pointer(elem) => Ty::Pointer(Box::new(substitute_self(elem, replacement))),
         Ty::Func {
             params,
             names,
@@ -3324,7 +3207,12 @@ fn stmt_returns(stmt: &Stmt) -> bool {
         // body may complete, the `else`) *and* the **exceptional** path does (every
         // `except` handler diverges; with no handler, an uncaught raise itself
         // exits, so only the normal path can fall through).
-        StmtKind::Try { body, except, orelse, finalbody } => {
+        StmtKind::Try {
+            body,
+            except,
+            orelse,
+            finalbody,
+        } => {
             if finalbody.as_ref().is_some_and(|fb| definitely_returns(fb)) {
                 return true;
             }
@@ -3344,7 +3232,10 @@ fn stmt_returns(stmt: &Stmt) -> bool {
 
 /// Extract a dtype from a `SIMD` first argument, which must be `DType.<name>`.
 fn dtype_from_arg(arg: &crate::ast::ParamArg) -> Result<Dtype, TypeError> {
-    if let crate::ast::ParamArg::Value(Expr { kind: ExprKind::Member { object, field }, .. }) = arg
+    if let crate::ast::ParamArg::Value(Expr {
+        kind: ExprKind::Member { object, field },
+        ..
+    }) = arg
         && let ExprKind::Identifier(ns) = &object.kind
         && ns == "DType"
         && let Some(dtype) = Dtype::from_name(field)
@@ -3352,7 +3243,10 @@ fn dtype_from_arg(arg: &crate::ast::ParamArg) -> Result<Dtype, TypeError> {
         return Ok(dtype);
     }
     Err(TypeError::BadDtype(match arg {
-        crate::ast::ParamArg::Value(Expr { kind: ExprKind::Member { field, .. }, .. }) => format!("DType.{}", field),
+        crate::ast::ParamArg::Value(Expr {
+            kind: ExprKind::Member { field, .. },
+            ..
+        }) => format!("DType.{}", field),
         _ => "a non-DType argument".to_string(),
     }))
 }
@@ -3411,14 +3305,14 @@ fn type_scope(decls: &[ParamDecl]) -> HashMap<String, Vec<String>> {
 
 /// A struct's own parameter, as the `TyArg` it contributes to the struct's `Self`
 /// type while its body is checked: a type parameter as `Ty::Param`, a value
-/// parameter as a symbolic `CtVal::Param`.
+/// parameter as a symbolic `CtValue::Param`.
 fn param_as_arg(decl: &ParamDecl) -> TyArg {
     match decl {
         ParamDecl::Type { name, bounds } => TyArg::Ty(Ty::Param {
             name: name.clone(),
             bounds: bounds.clone(),
         }),
-        ParamDecl::Value { name } => TyArg::Val(CtVal::Param(name.clone())),
+        ParamDecl::Value { name } => TyArg::Val(CtValue::Param(name.clone())),
     }
 }
 
@@ -3598,6 +3492,21 @@ fn is_scalar(ty: &Ty) -> bool {
     matches!(ty, Ty::Bool | Ty::String | Ty::None)
 }
 
+/// Whether an opaque type parameter carries a bound that promises equality.
+/// Built-in bounds are intentionally shallow today, but `T: Equatable` should at
+/// least let generic library code type-check `T == T`.
+fn has_equality_bound(ty: &Ty) -> bool {
+    match ty {
+        Ty::Param { bounds, .. } => bounds.iter().any(|b| {
+            matches!(
+                b.as_str(),
+                "Equatable" | "Comparable" | "Hashable" | "EqualityComparable"
+            )
+        }),
+        _ => false,
+    }
+}
+
 /// Collect the field names assigned via `self.FIELD = …` anywhere in a body
 /// (recursing into nested `if`/`while`/`for`/`try` blocks) — the flow-insensitive
 /// basis of the `__init__` definite-initialization check. A nested write like
@@ -3623,7 +3532,12 @@ fn collect_self_assigned_fields(body: &[Stmt], out: &mut std::collections::HashS
             StmtKind::While { body, .. } | StmtKind::For { body, .. } => {
                 collect_self_assigned_fields(body, out);
             }
-            StmtKind::Try { body, except, orelse, finalbody } => {
+            StmtKind::Try {
+                body,
+                except,
+                orelse,
+                finalbody,
+            } => {
                 collect_self_assigned_fields(body, out);
                 if let Some((_, b)) = except {
                     collect_self_assigned_fields(b, out);
@@ -3658,7 +3572,7 @@ fn require_dunder_ret(ret: Ty, expected: &Ty, name: &str) -> Result<Ty, TypeErro
 /// Whether list elements of type `ty` can be compared for equality (needed by
 /// `List.remove`/`count`/`index`) — the same scalar set `==`/`!=` accept.
 fn is_list_equatable(ty: &Ty) -> bool {
-    is_numeric(ty) || matches!(ty, Ty::Bool | Ty::String | Ty::None)
+    is_numeric(ty) || matches!(ty, Ty::Bool | Ty::String | Ty::None) || has_equality_bound(ty)
 }
 
 /// Whether a value of type `ty` can be `print`ed (has a user-facing display).

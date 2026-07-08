@@ -320,7 +320,11 @@ impl fmt::Display for TypeError {
                     name
                 )
             }
-            TypeError::UninitializedField { struct_name, method, field } => {
+            TypeError::UninitializedField {
+                struct_name,
+                method,
+                field,
+            } => {
                 write!(
                     f,
                     "'{struct_name}.{method}' does not initialize field '{field}'"
@@ -469,7 +473,10 @@ impl fmt::Display for OwnershipError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             OwnershipError::UseAfterMove { var, .. } => {
-                write!(f, "use of '{var}' after it was transferred (moved) with '^'")
+                write!(
+                    f,
+                    "use of '{var}' after it was transferred (moved) with '^'"
+                )
             }
             OwnershipError::ConditionallyMoved { var, .. } => write!(
                 f,

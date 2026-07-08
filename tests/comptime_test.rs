@@ -3,7 +3,7 @@
 //! the phase-distinction semantics: unselected branches are dropped before checking,
 //! and `comptime for` unrolls with the loop variable substituted as a literal.
 
-use mojo_lite::{BackendKind, check, elaborate, parse};
+use mojo_lite::{BackendKind, CtValue, Ty, check, elaborate, parse};
 
 fn run(src: &str) -> Result<String, String> {
     let program = parse(src).map_err(|e| format!("parse: {e}"))?;
@@ -12,6 +12,15 @@ fn run(src: &str) -> Result<String, String> {
     let mut backend = BackendKind::Vm.make();
     backend.run(&program).map_err(|e| format!("run: {e:?}"))?;
     Ok(backend.output())
+}
+
+#[test]
+fn ct_value_can_carry_a_type_without_runtime_materialization() {
+    let ty = Ty::List(Box::new(Ty::Int));
+    let value = CtValue::Type(Box::new(ty));
+
+    assert_eq!(value.to_string(), "List[Int]");
+    assert!(value.materialize((0, 0)).is_none());
 }
 
 #[test]
@@ -38,10 +47,7 @@ fn comptime_for_unrolls_with_substitution() {
 #[test]
 fn comptime_for_over_a_const_with_nested_comptime_if() {
     let src = "comptime COUNT = 5\n\ndef main():\n    comptime for i in range(COUNT):\n        comptime if i % 2 == 0:\n            print(i, \"even\")\n        else:\n            print(i, \"odd\")\n";
-    assert_eq!(
-        run(src).unwrap(),
-        "0 even\n1 odd\n2 even\n3 odd\n4 even\n"
-    );
+    assert_eq!(run(src).unwrap(), "0 even\n1 odd\n2 even\n3 odd\n4 even\n");
 }
 
 #[test]
@@ -52,7 +58,8 @@ fn comptime_for_range_variants_and_reverse() {
 
 #[test]
 fn comptime_for_quota_rejects_a_huge_unroll() {
-    let err = run("def main():\n    comptime for i in range(1000000):\n        print(i)\n").unwrap_err();
+    let err =
+        run("def main():\n    comptime for i in range(1000000):\n        print(i)\n").unwrap_err();
     assert!(err.contains("quota"), "got {err}");
 }
 
@@ -121,4 +128,14 @@ fn module_comptime_constants_materialize_into_functions() {
     // a function, and as a value-parameter argument (`Box[N]`).
     let src = "comptime GREETING = \"hi\"\ncomptime N = 8\n\ndef greet() -> String:\n    return GREETING\n\n@fieldwise_init\nstruct Box[size: Int]:\n    var v: Int\n    def cap(self) -> Int:\n        return Self.size\n\ndef main():\n    print(greet())\n    var b: Box[N] = Box[N](0)\n    print(b.cap())\n";
     assert_eq!(run(src).unwrap(), "hi\n8\n");
+}
+
+#[test]
+fn ctfe_computed_value_parameter_argument() {
+    // Phase 1 regression (comptime.md): a CTFE-computed comptime constant flows
+    // into a value-parameter argument through the shared compile-time value model —
+    // `pow2(3)` runs at compile time to `8`, materializes into `scale[N]`, and the
+    // checker resolves `scale`'s value parameter `n` from it.
+    let src = "def scale[n: Int](x: Int) -> Int:\n    return x * n\n\ndef pow2(k: Int) -> Int:\n    var x: Int = 1\n    for i in range(k):\n        x = x * 2\n    return x\n\ncomptime N = pow2(3)\n\ndef main():\n    print(scale[N](5))\n";
+    assert_eq!(run(src).unwrap(), "40\n");
 }

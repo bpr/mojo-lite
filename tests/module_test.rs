@@ -14,11 +14,7 @@ impl TempDir {
     fn new() -> Self {
         static N: AtomicUsize = AtomicUsize::new(0);
         let id = N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "mojo_lite_mod_{}_{}",
-            std::process::id(),
-            id
-        ));
+        let dir = std::env::temp_dir().join(format!("mojo_lite_mod_{}_{}", std::process::id(), id));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         TempDir(dir)
     }
@@ -43,7 +39,9 @@ fn run(entry: &Path) -> Result<String, String> {
     let program = link(entry).map_err(|e| e.to_string())?;
     check(&program).map_err(|e| format!("type error: {e:?}"))?;
     let mut backend = BackendKind::Vm.make();
-    backend.run(&program).map_err(|e| format!("runtime error: {e:?}"))?;
+    backend
+        .run(&program)
+        .map_err(|e| format!("runtime error: {e:?}"))?;
     Ok(backend.output())
 }
 
@@ -64,7 +62,10 @@ fn selective_import_brings_struct_and_fn_into_scope() {
 #[test]
 fn wildcard_and_relative_import() {
     let d = TempDir::new();
-    d.write("util.mojo", "def triple(x: Int) -> Int:\n    return x * 3\n");
+    d.write(
+        "util.mojo",
+        "def triple(x: Int) -> Int:\n    return x * 3\n",
+    );
     let main = d.write(
         "main.mojo",
         "from .util import *\n\ndef main():\n    print(triple(5))\n",
@@ -94,8 +95,15 @@ fn transitive_and_dotted_imports() {
 fn missing_module_and_missing_name_error() {
     let d = TempDir::new();
     d.write("m.mojo", "def f(x: Int) -> Int:\n    return x\n");
-    let bad_mod = d.write("bad1.mojo", "from nope import f\ndef main():\n    print(1)\n");
-    assert!(run(&bad_mod).unwrap_err().contains("cannot load module 'nope'"));
+    let bad_mod = d.write(
+        "bad1.mojo",
+        "from nope import f\ndef main():\n    print(1)\n",
+    );
+    assert!(
+        run(&bad_mod)
+            .unwrap_err()
+            .contains("cannot load module 'nope'")
+    );
     let bad_name = d.write("bad2.mojo", "from m import g\ndef main():\n    print(1)\n");
     assert!(
         run(&bad_name)

@@ -51,7 +51,10 @@ impl std::fmt::Display for ModuleError {
                 write!(f, "module '{module}' has no declaration named '{name}'")
             }
             ModuleError::EmptyModulePath => {
-                write!(f, "'from . import …' (empty module path) is not supported yet")
+                write!(
+                    f,
+                    "'from . import …' (empty module path) is not supported yet"
+                )
             }
         }
     }
@@ -127,7 +130,10 @@ impl Linker {
         // Resolve this module's imports first, so a dependency's declarations are
         // spliced in ahead of this module's (the checker binds names in order).
         for stmt in &program {
-            if let StmtKind::FromImport { level, path: mpath, .. } = &stmt.kind {
+            if let StmtKind::FromImport {
+                level, path: mpath, ..
+            } = &stmt.kind
+            {
                 let (dep_path, dep_name) = module_file(dir, *level, mpath)?;
                 self.load_module(&dep_path, &dep_name)?;
             }
@@ -186,7 +192,11 @@ fn declared_name(stmt: &Stmt) -> Option<&str> {
 /// Resolve an import's module to a file path, returning `(path, display_name)`.
 /// `level` is the leading-dot count (0 = relative to `from_dir`; 1 = same package,
 /// i.e. also `from_dir`; each extra level climbs one directory).
-fn module_file(from_dir: &Path, level: usize, path: &[String]) -> Result<(PathBuf, String), ModuleError> {
+fn module_file(
+    from_dir: &Path,
+    level: usize,
+    path: &[String],
+) -> Result<(PathBuf, String), ModuleError> {
     if path.is_empty() {
         return Err(ModuleError::EmptyModulePath);
     }

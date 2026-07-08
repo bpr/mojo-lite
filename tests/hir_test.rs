@@ -221,7 +221,10 @@ fn seeded_region_break_continue_escape_to_external_loops() {
             _ => None,
         })
         .expect("continue should escape as EscapeJump");
-    assert_eq!(esc2, header, "continue escapes to the enclosing loop header");
+    assert_eq!(
+        esc2, header,
+        "continue escapes to the enclosing loop header"
+    );
 }
 
 #[test]
@@ -236,5 +239,8 @@ fn nested_loop_in_region_absorbs_its_own_break() {
         .g
         .node_indices()
         .any(|b| matches!(region.term(b), Some(Terminator::EscapeJump(_))));
-    assert!(!has_escape, "a break of the region's own loop stays a local Jump");
+    assert!(
+        !has_escape,
+        "a break of the region's own loop stays a local Jump"
+    );
 }
