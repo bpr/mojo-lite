@@ -17,7 +17,7 @@
 //! and `vm_refuses_mut_ref_via_non_place_argument`: the VM must error cleanly, never
 //! diverge.
 
-use mojo_lite::{BackendKind, check, elaborate, parse};
+use mojo_lite::{BackendKind, check, elaborate, link, parse};
 
 /// Run `src` through the VM backend (the sole executor) and return its captured
 /// output, or a stage error string.
@@ -223,8 +223,16 @@ fn vm_runs_every_ok_fixture() {
         if path.extension().and_then(|e| e.to_str()) != Some("mojo") {
             continue;
         }
-        let src = std::fs::read_to_string(&path).unwrap();
-        run(&src).unwrap_or_else(|e| panic!("vm failed on ok fixture {}: {e}", path.display()));
+        let program = link(&path)
+            .unwrap_or_else(|e| panic!("link failed on ok fixture {}: {e}", path.display()));
+        let program = elaborate(program)
+            .unwrap_or_else(|e| panic!("comptime failed on ok fixture {}: {e}", path.display()));
+        check(&program)
+            .unwrap_or_else(|e| panic!("check failed on ok fixture {}: {e:?}", path.display()));
+        let mut backend = BackendKind::Vm.make();
+        backend
+            .run(&program)
+            .unwrap_or_else(|e| panic!("vm failed on ok fixture {}: {e:?}", path.display()));
         ran += 1;
     }
     assert!(ran > 0, "expected some ok fixtures");
@@ -430,6 +438,12 @@ fn copyinit_gives_value_semantics() {
     // relocates on `^`.
     let src = "struct Buf:\n    var data: UnsafePointer[Int]\n    var n: Int\n    def __init__(out self, n: Int):\n        self.data = UnsafePointer[Int].alloc(n)\n        self.n = n\n    def __copyinit__(out self, e: Buf):\n        self.n = e.n\n        self.data = UnsafePointer[Int].alloc(e.n)\n        var i: Int = 0\n        while i < e.n:\n            self.data[i] = e.data[i]\n            i = i + 1\n    def __moveinit__(out self, owned e: Buf):\n        self.n = e.n\n        self.data = e.data\n    def set(mut self, i: Int, v: Int):\n        self.data[i] = v\n    def get(self, i: Int) -> Int:\n        return self.data[i]\n\ndef main():\n    var a: Buf = Buf(2)\n    a.set(0, 5)\n    var b: Buf = a\n    b.set(0, 9)\n    print(a.get(0), b.get(0))\n    var c: Buf = b^\n    print(c.get(0))\n";
     assert_eq!(parity(src), "5 9\n9\n");
+}
+
+#[test]
+fn mojo_copy_constructor_gives_value_semantics() {
+    let src = "struct Buf(Copyable):\n    var data: UnsafePointer[Int]\n    var n: Int\n    def __init__(out self, n: Int):\n        self.data = UnsafePointer[Int].alloc(n)\n        self.n = n\n    def __init__(out self, *, copy: Self):\n        self.n = copy.n\n        self.data = UnsafePointer[Int].alloc(copy.n)\n        var i: Int = 0\n        while i < copy.n:\n            self.data[i] = copy.data[i]\n            i = i + 1\n    def set(mut self, i: Int, v: Int):\n        self.data[i] = v\n    def get(self, i: Int) -> Int:\n        return self.data[i]\n\ndef main():\n    var a: Buf = Buf(2)\n    a.set(0, 5)\n    var b: Buf = Buf(copy: a)\n    b.set(0, 9)\n    print(a.get(0), b.get(0))\n    var c: Buf = a\n    c.set(0, 11)\n    print(a.get(0), c.get(0))\n";
+    assert_eq!(parity(src), "5 9\n5 11\n");
 }
 
 #[test]

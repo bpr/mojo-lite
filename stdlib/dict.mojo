@@ -8,11 +8,17 @@ struct DictEntry[K: Equatable & Copyable & Movable, V: Copyable & Movable](Copya
         self.key = key
         self.value = value
 
-struct Dict[K: Equatable & Copyable & Movable, V: Copyable & Movable]:
+struct Dict[K: Equatable & Copyable & Movable, V: Copyable & Movable](Copyable):
     var entries: List[DictEntry[Self.K, Self.V]]
 
     def __init__(out self):
         self.entries = List[DictEntry[Self.K, Self.V]]()
+
+    def __init__(out self, *, copy: Self):
+        self.entries = List[DictEntry[Self.K, Self.V]](copy: copy.entries)
+
+    def copy(self) -> Self:
+        return Dict[Self.K, Self.V](copy: self)
 
     def find_index(self, key: Self.K) -> Int:
         var i: Int = 0
@@ -29,7 +35,7 @@ struct Dict[K: Equatable & Copyable & Movable, V: Copyable & Movable]:
         var i: Int = self.find_index(key)
         if i >= 0:
             return self.entries[i].value
-        raise "missing key"
+        raise Error("missing key")
 
     def __setitem__(mut self, key: Self.K, value: Self.V):
         var i: Int = self.find_index(key)

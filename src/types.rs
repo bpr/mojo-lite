@@ -48,6 +48,13 @@ pub enum Ty {
         name: String,
         bounds: Vec<String>,
     },
+    /// A symbolic associated type lookup such as `C.Element` where `C` is an
+    /// opaque type parameter. It may resolve to a concrete type once `C` is
+    /// substituted at a generic use site.
+    Assoc {
+        base: Box<Ty>,
+        name: String,
+    },
     /// `Self` inside a trait method requirement.
     SelfType,
     /// The iterable produced by the built-in `range(...)`.
@@ -124,6 +131,7 @@ impl fmt::Display for Ty {
                 write!(f, ") -> {}", ret)
             }
             Ty::Param { name, .. } => write!(f, "{}", name),
+            Ty::Assoc { base, name } => write!(f, "{}.{}", base, name),
             Ty::SelfType => write!(f, "Self"),
             Ty::Simd { dtype, width: 1 } if dtype.scalar_alias().is_some() => {
                 write!(f, "{}", dtype.scalar_alias().unwrap())

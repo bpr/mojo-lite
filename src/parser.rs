@@ -748,9 +748,11 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         self.expect(Token::Colon, "Expected ':' after the struct name")?;
         self.expect_stmt_end()?;
 
-        // Body: an indented block of `var` fields and `def` methods.
+        // Body: an indented block of `var` fields, `comptime` associated facts,
+        // and `def` methods.
         self.expect(Token::Indent, "Expected an indented struct body")?;
         let mut fields = Vec::new();
+        let mut associated = Vec::new();
         let mut methods = Vec::new();
         while let Some(token) = self.peek_token()? {
             match token {
@@ -769,6 +771,7 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
                     self.expect_stmt_end()?;
                     fields.push(Param { name: fname, ty });
                 }
+                Token::Comptime => associated.push(self.parse_struct_comptime()?),
                 Token::Def => methods.push(self.parse_method(Vec::new())?),
                 // Decorators before a method (`@staticmethod`, …).
                 Token::At => {
@@ -784,7 +787,7 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
                 other => {
                     return Err(ParseError::UnexpectedToken(
                         other.clone(),
-                        "struct body may only contain 'var' fields and 'def' methods".into(),
+                        "struct body may only contain 'var' fields, 'comptime' associated facts, and 'def' methods".into(),
                     ));
                 }
             }
@@ -796,9 +799,20 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
             type_params,
             conforms,
             fields,
+            associated,
             methods,
             fieldwise_init,
         })
+    }
+
+    /// `comptime NAME = expr` — an associated compile-time fact inside a struct.
+    fn parse_struct_comptime(&mut self) -> Result<crate::ast::StructComptime, ParseError> {
+        self.expect(Token::Comptime, "Expected 'comptime'")?;
+        let name = self.expect_identifier("Expected a name after 'comptime'")?;
+        self.expect(Token::Assign, "Expected '=' after the comptime member name")?;
+        let value = self.parse_expression(Precedence::Lowest)?;
+        self.expect_stmt_end()?;
+        Ok(crate::ast::StructComptime { name, value })
     }
 
     /// Parses an optional trait-conformance list `'(' NAME (',' NAME)* ')'`
@@ -1131,10 +1145,11 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         Ok(body)
     }
 
-    /// Parses a type annotation: a scalar keyword, `Self.T`, or a named type
-    /// optionally applied to type arguments (`Pair[Int]`).
+    /// Parses a type annotation: a scalar keyword, `Self.T`, associated lookups
+    /// like `C.Element`, or a named type optionally applied to type arguments
+    /// (`Pair[Int]`).
     fn parse_type(&mut self) -> Result<Type, ParseError> {
-        match self.next_token()? {
+        let ty = match self.next_token()? {
             // A function type: `def(types) [effects] -> ret`.
             Token::Def => self.parse_function_type_tail(),
             Token::None => Ok(Type::None),
@@ -1180,7 +1195,22 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
                 token,
                 "Expected a type name".into(),
             )),
+        }?;
+
+        self.parse_type_assoc_tail(ty)
+    }
+
+    /// Parse zero or more `.Member` suffixes after a type atom.
+    fn parse_type_assoc_tail(&mut self, mut ty: Type) -> Result<Type, ParseError> {
+        while matches!(self.peek_token()?, Some(Token::Dot)) {
+            self.next_token()?; // consume '.'
+            let name = self.expect_identifier("Expected an associated type name after '.'")?;
+            ty = Type::Assoc {
+                base: Box::new(ty),
+                name,
+            };
         }
+        Ok(ty)
     }
 
     /// Parses a function type after its leading `def` has been consumed:
@@ -1789,10 +1819,10 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         Ok(args)
     }
 
-    /// Parses call arguments: positional expressions and `name=value` **keyword**
-    /// arguments (parsed; the checker flags a call that uses keywords). A `=` (not
-    /// `==`) right after a bare identifier marks a keyword argument; a positional
-    /// argument may not follow a keyword one.
+    /// Parses call arguments: positional expressions and keyword arguments. Both
+    /// the older Python-like `name=value` spelling and Mojo's `name: value`
+    /// spelling are accepted and represented as [`KwArg`]. A positional argument
+    /// may not follow a keyword one.
     fn parse_call_args(&mut self) -> Result<(Vec<Expr>, Vec<KwArg>), ParseError> {
         let mut args = Vec::new();
         let mut kwargs = Vec::new();
@@ -1802,12 +1832,12 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         loop {
             let expr = self.parse_expression(Precedence::Lowest)?;
             if matches!(expr.kind, ExprKind::Identifier(_))
-                && matches!(self.peek_token()?, Some(Token::Assign))
+                && matches!(self.peek_token()?, Some(Token::Assign) | Some(Token::Colon))
             {
                 let ExprKind::Identifier(name) = expr.kind else {
                     unreachable!()
                 };
-                self.next_token()?; // consume '='
+                self.next_token()?; // consume '=' or ':'
                 let value = self.parse_expression(Precedence::Lowest)?;
                 kwargs.push(KwArg { name, value });
             } else {

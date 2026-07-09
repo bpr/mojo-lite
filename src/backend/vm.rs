@@ -124,11 +124,57 @@ pub struct VmBackend {
     /// `move_value`), giving a pointer-owning type correct value semantics.
     has_copyinit: bool,
     has_moveinit: bool,
+    /// Optional compile-time execution budget. Runtime VM execution leaves this
+    /// `None`; VM-backed CTFE sets it and every function/block/instruction burns
+    /// from it so compile-time execution cannot hang the compiler.
+    ctfe_fuel: Option<usize>,
 }
 
 impl VmBackend {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Execute a named top-level function and return its value without running the
+    /// program's top-level block or `main`. This is the narrow API used by
+    /// VM-backed CTFE: the caller has already checked that the function is
+    /// compile-time safe and supplied any reified value parameters.
+    pub fn run_function_value(
+        &mut self,
+        program: &[Stmt],
+        name: &str,
+        args: Vec<Value>,
+        value_params: &[(String, Value)],
+        fuel: usize,
+    ) -> Result<(Value, usize), RuntimeError> {
+        let prog = build_prog(program);
+        self.configure_lifecycle(&prog);
+        let idx = prog.index_of(name).ok_or_else(|| {
+            RuntimeError::Unsupported(format!("vm: unknown compile-time function '{name}'"))
+        })?;
+        self.ctfe_fuel = Some(fuel);
+        let result = self.call_function(&prog, idx, args, value_params);
+        let remaining = self.ctfe_fuel.unwrap_or(0);
+        self.ctfe_fuel = None;
+        result.map(|value| (value, remaining))
+    }
+
+    fn configure_lifecycle(&mut self, prog: &Prog) {
+        // A program with no lifecycle copy/move methods uses the default (raw clone /
+        // slot transfer) path everywhere — so non-lifecycle programs are unchanged.
+        self.has_copyinit = prog.defines(".__copyinit__");
+        self.has_moveinit = prog.defines(".__moveinit__");
+    }
+
+    fn burn_ctfe(&mut self) -> Result<(), RuntimeError> {
+        if let Some(fuel) = &mut self.ctfe_fuel {
+            *fuel = fuel.checked_sub(1).ok_or_else(|| {
+                RuntimeError::Unsupported(
+                    "compile-time execution exceeded the VM CTFE fuel quota".to_string(),
+                )
+            })?;
+        }
+        Ok(())
     }
 
     /// Allocate `n` uninitialized (`None`) slots in the heap arena, returning a
@@ -166,6 +212,7 @@ impl VmBackend {
         args: Vec<Value>,
         value_params: &[(String, Value)],
     ) -> Result<(Value, Vec<Value>), RuntimeError> {
+        self.burn_ctfe()?;
         let f = &prog.mir.functions[fidx].1;
         // The MIR flattens only positional arguments; a mismatched count means a
         // default/keyword/`*args` form (not lowered yet) — refuse rather than
@@ -197,6 +244,7 @@ impl VmBackend {
 
         let mut block = 0usize;
         let ret = 'run: loop {
+            self.burn_ctfe()?;
             let b = &f.blocks[block];
             for instr in &b.instrs {
                 // A `return`/`break`/`continue` that crossed a `try` boundary
@@ -363,6 +411,38 @@ impl VmBackend {
         call_args.push(skeleton);
         call_args.extend(args);
         let (_, frame_vars) = self.call_frame(prog, fidx, call_args, &[])?;
+        Ok(frame_vars.into_iter().next().unwrap_or(Value::None))
+    }
+
+    fn construct_via_copy(
+        &mut self,
+        prog: &Prog,
+        name: &str,
+        args: Vec<Value>,
+        kwargs: Vec<(String, Value)>,
+        param_vals: &[Option<Value>],
+    ) -> Result<Value, RuntimeError> {
+        if !args.is_empty() || kwargs.len() != 1 || kwargs[0].0 != "copy" {
+            return Err(RuntimeError::Unsupported(format!(
+                "vm: keyword arguments to '{name}' are not supported"
+            )));
+        }
+        let fidx = prog
+            .index_of(&format!("{name}.__copyinit__"))
+            .ok_or_else(|| {
+                RuntimeError::Unsupported(format!("vm: struct '{name}' has no copy constructor"))
+            })?;
+        let def = &prog.structs[name];
+        let value_params = def
+            .param_decls
+            .iter()
+            .zip(param_vals)
+            .filter(|((_, is_value), _)| *is_value)
+            .map(|((pname, _), val)| (pname.clone(), val.clone().unwrap_or(Value::None)))
+            .collect();
+        let skeleton = self.struct_skeleton(prog, name, value_params);
+        let (_, frame_vars) =
+            self.call_frame(prog, fidx, vec![skeleton, kwargs[0].1.clone()], &[])?;
         Ok(frame_vars.into_iter().next().unwrap_or(Value::None))
     }
 
@@ -553,6 +633,7 @@ impl VmBackend {
         regs: &mut [Value],
         vars: &mut [Value],
     ) -> Result<Flow, RuntimeError> {
+        self.burn_ctfe()?;
         match i {
             MirInstr::Const { dest, k } => regs[dest.0 as usize] = const_value(k),
             MirInstr::UseVar { dest, var, mode } => {
@@ -774,8 +855,14 @@ impl VmBackend {
                 // Normalize a user struct iterable to its iterator (`c.__iter__()`);
                 // a built-in `range`/`List` iterates in place (no-op).
                 let slot = *iter as usize;
-                if let Value::Struct { name, .. } = &vars[slot] {
+                for _ in 0..8 {
+                    let Value::Struct { name, .. } = &vars[slot] else {
+                        break;
+                    };
                     let sname = name.clone();
+                    if prog.index_of(&format!("{sname}.__next__")).is_some() {
+                        break;
+                    }
                     let it = vars[slot].clone();
                     vars[slot] = self.call_dunder(prog, &sname, "__iter__", vec![it])?;
                 }
@@ -1151,9 +1238,10 @@ impl VmBackend {
         kwargs: Vec<(String, Value)>,
         param_vals: &[Option<Value>],
     ) -> Result<Value, RuntimeError> {
-        // Built-ins and constructors take positional arguments only (the checker
-        // rejects keyword args to them).
-        if !kwargs.is_empty() && !prog.sigs.contains_key(name) {
+        // Built-ins take positional arguments only, and user functions handle
+        // keywords through their signatures below. Struct constructors get a
+        // narrow exception for Mojo's lifecycle copy constructor (`copy:`).
+        if !kwargs.is_empty() && !prog.sigs.contains_key(name) && !prog.structs.contains_key(name) {
             return Err(RuntimeError::Unsupported(format!(
                 "vm: keyword arguments to '{name}' are not supported"
             )));
@@ -1217,6 +1305,18 @@ impl VmBackend {
             "round" => builtin_round(arg1(name, args)?),
             "Int" | "UInt" | "Float64" => builtin_convert(name, arg1(name, args)?),
             "Error" => builtin_error(arg1(name, args)?),
+            // A struct constructor. A hand-written `def __init__(out self, …)`
+            // takes precedence over the fieldwise constructor: build an uninitialized
+            // `self` skeleton, run `__init__`, and return the initialized value.
+            _ if prog.structs.contains_key(name) => {
+                if !kwargs.is_empty() {
+                    self.construct_via_copy(prog, name, args, kwargs, param_vals)
+                } else if prog.index_of(&format!("{name}.__init__")).is_some() {
+                    self.construct_via_init(prog, name, args, param_vals)
+                } else {
+                    construct(&prog.structs[name], name, args, param_vals)
+                }
+            }
             // `List[T]()` / `List(a, b, …)` construction (the literal `[a, b]`
             // lowers to `MakeList` instead). The element type in `[T]` is dropped
             // by the MIR but the runtime list is dynamically typed, so args suffice.
@@ -1238,16 +1338,6 @@ impl VmBackend {
                     }
                 };
                 self.heap_alloc(n)
-            }
-            // A struct constructor. A hand-written `def __init__(out self, …)`
-            // takes precedence over the fieldwise constructor: build an uninitialized
-            // `self` skeleton, run `__init__`, and return the initialized value.
-            _ if prog.structs.contains_key(name) => {
-                if prog.index_of(&format!("{name}.__init__")).is_some() {
-                    self.construct_via_init(prog, name, args, param_vals)
-                } else {
-                    construct(&prog.structs[name], name, args, param_vals)
-                }
             }
             _ => match prog.index_of(name) {
                 Some(idx) => {
@@ -1284,18 +1374,8 @@ impl VmBackend {
 
 impl Backend for VmBackend {
     fn run(&mut self, program: &[Stmt]) -> Result<(), RuntimeError> {
-        let prog = Prog {
-            // Elaborate ASAP drops: splice a `DropVar` after each variable's last
-            // use, so a struct's `__del__` runs there (Phase 4). A no-op for values
-            // without a destructor, so parity with the tree-walker is preserved.
-            mir: crate::analysis::elaborate_drops_program(crate::mir::lower_program(program)),
-            structs: build_structs(program),
-            sigs: build_sigs(program),
-        };
-        // A program with no lifecycle copy/move methods uses the default (raw clone /
-        // slot transfer) path everywhere — so non-lifecycle programs are unchanged.
-        self.has_copyinit = prog.defines(".__copyinit__");
-        self.has_moveinit = prog.defines(".__moveinit__");
+        let prog = build_prog(program);
+        self.configure_lifecycle(&prog);
         // Run the top-level block, then `main()`. Capture the top-level frame's
         // user variables (skipping synthetic `$…` temporaries) as the global
         // bindings.
@@ -1321,6 +1401,17 @@ impl Backend for VmBackend {
 
     fn bindings(&self) -> Vec<(String, Value)> {
         self.bindings.clone()
+    }
+}
+
+fn build_prog(program: &[Stmt]) -> Prog {
+    Prog {
+        // Elaborate ASAP drops: splice a `DropVar` after each variable's last
+        // use, so a struct's `__del__` runs there (Phase 4). A no-op for values
+        // without a destructor, so parity with the tree-walker is preserved.
+        mir: crate::analysis::elaborate_drops_program(crate::mir::lower_program(program)),
+        structs: build_structs(program),
+        sigs: build_sigs(program),
     }
 }
 

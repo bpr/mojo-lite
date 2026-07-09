@@ -21,7 +21,8 @@
 use std::collections::HashMap;
 
 use crate::ast::{
-    ArgConvention, Dtype, Expr, ExprKind, InfixOp, Method, PrefixOp, Stmt, StmtKind, Type,
+    ArgConvention, Dtype, Expr, ExprKind, FnParam, InfixOp, Method, PrefixOp, Stmt, StmtKind,
+    StructComptime, TraitComptime, Type,
 };
 use crate::ct::CtValue;
 use crate::error::TypeError;
@@ -35,14 +36,28 @@ struct StructInfo {
     conforms: Vec<String>,
     /// Declared fields, in order (drives the fieldwise constructor).
     fields: Vec<(String, Ty)>,
+    /// Associated compile-time facts declared by `comptime NAME = ...` in the
+    /// struct body. These live on the type, not on runtime instances.
+    associated: HashMap<String, CtValue>,
     methods: HashMap<String, MethodSig>,
     fieldwise_init: bool,
 }
 
-/// The checked signature of a trait: its required methods. A requirement's
-/// signature may mention `Ty::SelfType` (the conforming type).
+/// The checked signature of a trait: required methods plus associated
+/// compile-time facts. A method requirement's signature may mention
+/// `Ty::SelfType` (the conforming type).
 struct TraitInfo {
     methods: HashMap<String, MethodSig>,
+    comptime_members: HashMap<String, CtMemberReq>,
+}
+
+/// The required kind/type of a trait `comptime NAME: Annotation` member.
+#[derive(Clone, PartialEq)]
+enum CtMemberReq {
+    /// A compile-time value whose value type must match this type.
+    Value(Ty),
+    /// A compile-time type value whose type must conform to these trait bounds.
+    Type { bounds: Vec<String> },
 }
 
 #[derive(Clone, PartialEq)]
@@ -78,6 +93,9 @@ pub struct Checker {
     /// The `Ty` denoted by a bare `Self` while checking a struct's members (the
     /// struct type) or a trait's requirements (`Ty::SelfType`). `None` elsewhere.
     self_ty: Option<Ty>,
+    /// Trait-associated comptime requirements in scope while checking a trait's
+    /// own method requirement signatures, so `Self.Element` can resolve.
+    trait_self_comptime: Vec<HashMap<String, CtMemberReq>>,
     /// Compile-time `Int` constants declared by `comptime NAME = value`.
     comptimes: HashMap<String, i64>,
     /// Whether `self` is writable in the method body being checked — set while
@@ -94,6 +112,7 @@ impl Checker {
             tparams: Vec::new(),
             self_decls: Vec::new(),
             self_ty: None,
+            trait_self_comptime: Vec::new(),
             comptimes: HashMap::new(),
             self_mutable: false,
         }
@@ -150,6 +169,22 @@ impl Checker {
                 if name == "Error" && args.is_empty() {
                     return Ok(Ty::Error);
                 }
+                if let Some(info) = self.structs.get(name) {
+                    let decls = info.decls.clone();
+                    if args.len() != decls.len() {
+                        return Err(TypeError::WrongTypeArgCount {
+                            name: name.clone(),
+                            expected: decls.len(),
+                            got: args.len(),
+                        });
+                    }
+                    let tyargs = decls
+                        .iter()
+                        .zip(args)
+                        .map(|(decl, arg)| self.resolve_param_arg(decl, arg))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    return Ok(Ty::Struct(name.clone(), tyargs));
+                }
                 if name == "List" {
                     return self.list_type(args);
                 }
@@ -159,23 +194,7 @@ impl Checker {
                 if name == "UnsafePointer" {
                     return self.pointer_type(args);
                 }
-                let decls = match self.structs.get(name) {
-                    Some(info) => info.decls.clone(),
-                    None => return Err(TypeError::UnknownType(name.clone())),
-                };
-                if args.len() != decls.len() {
-                    return Err(TypeError::WrongTypeArgCount {
-                        name: name.clone(),
-                        expected: decls.len(),
-                        got: args.len(),
-                    });
-                }
-                let tyargs = decls
-                    .iter()
-                    .zip(args)
-                    .map(|(decl, arg)| self.resolve_param_arg(decl, arg))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ty::Struct(name.clone(), tyargs)
+                return Err(TypeError::UnknownType(name.clone()));
             }
             // `Self.T` — one of the enclosing struct's *type* parameters (a value
             // parameter is not a type, so `Self.n` in type position is an error).
@@ -184,7 +203,7 @@ impl Checker {
                     name: name.clone(),
                     bounds: bounds.clone(),
                 },
-                _ => return Err(TypeError::UnknownSelfParam(name.clone())),
+                _ => return self.associated_type_for_self(name),
             },
             // Bare `Self` — the enclosing struct type or a trait's abstract Self.
             // Not usable as a type in a value-parameterized struct (a value
@@ -196,7 +215,126 @@ impl Checker {
                 Some(ty) => ty.clone(),
                 None => return Err(TypeError::UnknownSelfParam("Self".to_string())),
             },
+            Type::Assoc { base, name } => {
+                let base_ty = self.ty_from_anno(base)?;
+                self.associated_type_from_base(&base_ty, name)?
+            }
         })
+    }
+
+    fn associated_type_for_self(&self, name: &str) -> Result<Ty, TypeError> {
+        if let Some(reqs) = self.trait_self_comptime.last()
+            && let Some(req) = reqs.get(name)
+        {
+            return match req {
+                CtMemberReq::Type { .. } => Ok(Ty::Assoc {
+                    base: Box::new(Ty::SelfType),
+                    name: name.to_string(),
+                }),
+                CtMemberReq::Value(_) => Err(TypeError::NoSuchAssociatedType {
+                    object_type: "Self".to_string(),
+                    member: name.to_string(),
+                }),
+            };
+        }
+        let Some(self_ty) = &self.self_ty else {
+            return Err(TypeError::UnknownSelfParam(name.to_string()));
+        };
+        if let Ty::Struct(sname, _) = self_ty
+            && !self.structs.contains_key(sname)
+        {
+            return Err(TypeError::UnknownSelfParam(name.to_string()));
+        }
+        self.associated_type_from_base(self_ty, name)
+    }
+
+    fn associated_type_from_base(&self, base: &Ty, name: &str) -> Result<Ty, TypeError> {
+        match base {
+            Ty::Struct(sname, targs) => {
+                let info = self
+                    .structs
+                    .get(sname)
+                    .ok_or_else(|| TypeError::UnknownType(sname.clone()))?;
+                let value =
+                    info.associated
+                        .get(name)
+                        .ok_or_else(|| TypeError::NoSuchAssociatedType {
+                            object_type: base.to_string(),
+                            member: name.to_string(),
+                        })?;
+                let CtValue::Type(ty) = value else {
+                    return Err(TypeError::NoSuchAssociatedType {
+                        object_type: base.to_string(),
+                        member: name.to_string(),
+                    });
+                };
+                let subst = struct_subst(&info.decls, targs);
+                Ok(self.resolve_assoc_ty(&substitute(ty, &subst)))
+            }
+            Ty::Param { bounds, .. } => {
+                if self.lookup_trait_assoc_type(bounds, name).is_some() {
+                    Ok(Ty::Assoc {
+                        base: Box::new(base.clone()),
+                        name: name.to_string(),
+                    })
+                } else {
+                    Err(TypeError::NoSuchAssociatedType {
+                        object_type: base.to_string(),
+                        member: name.to_string(),
+                    })
+                }
+            }
+            Ty::Assoc { .. } => Ok(Ty::Assoc {
+                base: Box::new(base.clone()),
+                name: name.to_string(),
+            }),
+            _ => Err(TypeError::NoSuchAssociatedType {
+                object_type: base.to_string(),
+                member: name.to_string(),
+            }),
+        }
+    }
+
+    fn resolve_assoc_ty(&self, ty: &Ty) -> Ty {
+        match ty {
+            Ty::Assoc { base, name } => {
+                let base = self.resolve_assoc_ty(base);
+                self.associated_type_from_base(&base, name)
+                    .unwrap_or_else(|_| Ty::Assoc {
+                        base: Box::new(base),
+                        name: name.clone(),
+                    })
+            }
+            Ty::Struct(name, args) => {
+                Ty::Struct(name.clone(), map_tyargs(args, |t| self.resolve_assoc_ty(t)))
+            }
+            Ty::List(elem) => Ty::List(Box::new(self.resolve_assoc_ty(elem))),
+            Ty::Tuple(elems) => Ty::Tuple(elems.iter().map(|t| self.resolve_assoc_ty(t)).collect()),
+            Ty::Pointer(elem) => Ty::Pointer(Box::new(self.resolve_assoc_ty(elem))),
+            Ty::Func {
+                params,
+                names,
+                ret,
+                required,
+                variadic,
+                conventions,
+            } => Ty::Func {
+                params: params.iter().map(|p| self.resolve_assoc_ty(p)).collect(),
+                names: names.clone(),
+                ret: Box::new(self.resolve_assoc_ty(ret)),
+                required: *required,
+                variadic: variadic
+                    .as_ref()
+                    .map(|v| Box::new(self.resolve_assoc_ty(v))),
+                conventions: conventions.clone(),
+            },
+            Ty::GenericFunc { decls, params, ret } => Ty::GenericFunc {
+                decls: decls.clone(),
+                params: params.iter().map(|p| self.resolve_assoc_ty(p)).collect(),
+                ret: Box::new(self.resolve_assoc_ty(ret)),
+            },
+            _ => ty.clone(),
+        }
     }
 
     /// Resolve one supplied parameter argument against its declared parameter: a
@@ -399,6 +537,151 @@ impl Checker {
                 "not a comptime Int expression".to_string(),
             )),
         }
+    }
+
+    /// Classify a trait comptime-member annotation. In Mojo terms,
+    /// `comptime count: Int` requires an integer compile-time value, while
+    /// `comptime Element: AnyType` requires a type-valued member whose type
+    /// conforms to `AnyType`.
+    fn ct_member_req_from_anno(&self, ty: &Type) -> Result<CtMemberReq, TypeError> {
+        if let Type::Named(name, args) = ty
+            && args.is_empty()
+            && (BUILTIN_TRAITS.contains(&name.as_str()) || self.traits.contains_key(name))
+        {
+            self.check_trait_name(name)?;
+            return Ok(CtMemberReq::Type {
+                bounds: vec![name.clone()],
+            });
+        }
+        Ok(CtMemberReq::Value(self.ty_from_anno(ty)?))
+    }
+
+    fn check_struct_associated(
+        &self,
+        associated: &[StructComptime],
+    ) -> Result<HashMap<String, CtValue>, TypeError> {
+        let mut out = HashMap::new();
+        for member in associated {
+            if out.contains_key(&member.name) {
+                return Err(TypeError::Redeclaration(member.name.clone()));
+            }
+            let value = self.eval_associated_ct(&member.value, &out)?;
+            out.insert(member.name.clone(), value);
+        }
+        Ok(out)
+    }
+
+    /// Evaluate a struct-level associated comptime value. This intentionally
+    /// accepts type-valued expressions in addition to runtime-materializable
+    /// constants because associated facts are type metadata, not executable code.
+    fn eval_associated_ct(
+        &self,
+        expr: &Expr,
+        associated: &HashMap<String, CtValue>,
+    ) -> Result<CtValue, TypeError> {
+        match &expr.kind {
+            ExprKind::Int(n) => Ok(CtValue::Int(*n)),
+            ExprKind::Bool(b) => Ok(CtValue::Bool(*b)),
+            ExprKind::Str(s) => Ok(CtValue::Str(s.clone())),
+            ExprKind::Identifier(name) => {
+                if let Some(n) = self.comptimes.get(name) {
+                    return Ok(CtValue::Int(*n));
+                }
+                self.ty_value_from_name(name, &[])
+                    .ok_or_else(|| TypeError::NotComptime(name.clone()))
+            }
+            ExprKind::TypeApply { name, args } => self
+                .ty_value_from_name(name, args)
+                .ok_or_else(|| TypeError::NotComptime(name.clone())),
+            ExprKind::Member { object, field } => {
+                if let ExprKind::Identifier(s) = &object.kind
+                    && s == "Self"
+                {
+                    if let Some(value) = self.self_param_ct_value(field) {
+                        return Ok(value);
+                    }
+                    if let Some(value) = associated.get(field) {
+                        return Ok(value.clone());
+                    }
+                    return Err(TypeError::UnknownSelfParam(field.clone()));
+                }
+                Err(TypeError::NotComptime(
+                    "unsupported associated comptime member access".to_string(),
+                ))
+            }
+            ExprKind::Prefix(PrefixOp::Neg, e) => {
+                let CtValue::Int(n) = self.eval_associated_ct(e, associated)? else {
+                    return Err(TypeError::NotComptime(
+                        "unary '-' expects a comptime Int".to_string(),
+                    ));
+                };
+                Ok(CtValue::Int(-n))
+            }
+            ExprKind::Infix(op, l, r) => {
+                let (CtValue::Int(a), CtValue::Int(b)) = (
+                    self.eval_associated_ct(l, associated)?,
+                    self.eval_associated_ct(r, associated)?,
+                ) else {
+                    return Err(TypeError::NotComptime(
+                        "integer comptime operation expects Int operands".to_string(),
+                    ));
+                };
+                let value = match op {
+                    InfixOp::Add => a + b,
+                    InfixOp::Sub => a - b,
+                    InfixOp::Mul => a * b,
+                    InfixOp::FloorDiv if b != 0 => a.div_euclid(b),
+                    InfixOp::Mod if b != 0 => a.rem_euclid(b),
+                    InfixOp::Pow if b >= 0 => a.pow(b as u32),
+                    _ => {
+                        return Err(TypeError::NotComptime(
+                            "unsupported associated comptime operation".to_string(),
+                        ));
+                    }
+                };
+                Ok(CtValue::Int(value))
+            }
+            ExprKind::TupleLit(elems) => elems
+                .iter()
+                .map(|e| self.eval_associated_ct(e, associated))
+                .collect::<Result<Vec<_>, _>>()
+                .map(CtValue::Tuple),
+            ExprKind::ListLit(elems) => elems
+                .iter()
+                .map(|e| self.eval_associated_ct(e, associated))
+                .collect::<Result<Vec<_>, _>>()
+                .map(CtValue::List),
+            _ => Err(TypeError::NotComptime(
+                "not an associated comptime expression".to_string(),
+            )),
+        }
+    }
+
+    fn self_param_ct_value(&self, name: &str) -> Option<CtValue> {
+        self.self_decls.iter().find_map(|decl| match decl {
+            ParamDecl::Type { name: n, bounds } if n == name => {
+                Some(CtValue::Type(Box::new(Ty::Param {
+                    name: n.clone(),
+                    bounds: bounds.clone(),
+                })))
+            }
+            ParamDecl::Value { name: n } if n == name => Some(CtValue::Param(n.clone())),
+            _ => None,
+        })
+    }
+
+    fn ty_value_from_name(&self, name: &str, args: &[crate::ast::ParamArg]) -> Option<CtValue> {
+        if args.is_empty() {
+            if let Some(ty) = scalar_type_name(name) {
+                return Some(CtValue::Type(Box::new(ty)));
+            }
+            if name == "None" {
+                return Some(CtValue::Type(Box::new(Ty::None)));
+            }
+        }
+        self.ty_from_anno(&Type::Named(name.to_string(), args.to_vec()))
+            .ok()
+            .map(|ty| CtValue::Type(Box::new(ty)))
     }
 
     pub fn check_program(&mut self, stmts: &[Stmt]) -> Result<(), TypeError> {
@@ -757,6 +1040,7 @@ impl Checker {
                 type_params,
                 conforms,
                 fields,
+                associated,
                 methods,
                 fieldwise_init,
                 decorators: _,
@@ -765,6 +1049,7 @@ impl Checker {
                 type_params,
                 conforms,
                 fields,
+                associated,
                 methods,
                 *fieldwise_init,
             ),
@@ -868,18 +1153,7 @@ impl Checker {
                 // `range`, the element type for a `List`, or — for a user struct —
                 // the element type of its `__iter__()` iterator (`__next__`'s return).
                 let iter_ty = self.infer(iter)?;
-                let elem_ty = match &iter_ty {
-                    Ty::Range => Ty::Int,
-                    Ty::List(elem) => (**elem).clone(),
-                    Ty::Struct(..) => self.iter_element_ty(&iter_ty)?,
-                    other => {
-                        return Err(TypeError::TypeMismatch {
-                            expected: "range, List, or a type with __iter__".to_string(),
-                            found: other.to_string(),
-                            context: "for-loop iterable".to_string(),
-                        });
-                    }
-                };
+                let elem_ty = self.iterable_element_ty(&iter_ty)?;
                 self.scopes.push(HashMap::new());
                 let result = match self.declare(var, elem_ty) {
                     Ok(()) => self.check_block(body, ret, true),
@@ -1041,28 +1315,39 @@ impl Checker {
         name: &str,
         refines: &[String],
         methods: &[crate::ast::TraitMethod],
-        comptime_members: &[crate::ast::TraitComptime],
+        comptime_members: &[TraitComptime],
     ) -> Result<(), TypeError> {
         if self.traits.contains_key(name) || self.structs.contains_key(name) {
             return Err(TypeError::Redeclaration(name.to_string()));
         }
-        // The parse-only trait extensions are flagged here; a pure trait (only
-        // `...`-bodied methods, no super-traits, no comptime members) is modeled.
+        // The remaining parse-only trait extensions are flagged here; method
+        // requirements and comptime associated-member requirements are modeled.
         if !refines.is_empty() {
             return Err(TypeError::Unsupported("trait inheritance".to_string()));
-        }
-        if !comptime_members.is_empty() {
-            return Err(TypeError::Unsupported("trait comptime member".to_string()));
         }
         if methods.iter().any(|m| m.default_body.is_some()) {
             return Err(TypeError::Unsupported("trait default method".to_string()));
         }
+        let mut ct_members = HashMap::new();
+        for member in comptime_members {
+            if ct_members.contains_key(&member.name) {
+                return Err(TypeError::Redeclaration(member.name.clone()));
+            }
+            ct_members.insert(
+                member.name.clone(),
+                self.ct_member_req_from_anno(&member.ty)?,
+            );
+        }
         // Requirement signatures resolve `Self` to the abstract `Ty::SelfType`.
         let saved_self_ty = self.self_ty.replace(Ty::SelfType);
         let saved_self_decls = std::mem::take(&mut self.self_decls);
+        self.trait_self_comptime.push(ct_members.clone());
         let result = (|| {
             let mut sigs: HashMap<String, MethodSig> = HashMap::new();
             for m in methods {
+                if ct_members.contains_key(&m.name) {
+                    return Err(TypeError::Redeclaration(m.name.clone()));
+                }
                 if let Some(feature) = Self::advanced_param_feature(
                     &m.params,
                     m.positional_only,
@@ -1086,10 +1371,17 @@ impl Checker {
             }
             Ok(sigs)
         })();
+        self.trait_self_comptime.pop();
         self.self_ty = saved_self_ty;
         self.self_decls = saved_self_decls;
-        self.traits
-            .insert(name.to_string(), TraitInfo { methods: result? });
+        let methods = result?;
+        self.traits.insert(
+            name.to_string(),
+            TraitInfo {
+                methods,
+                comptime_members: ct_members,
+            },
+        );
         Ok(())
     }
 
@@ -1097,12 +1389,14 @@ impl Checker {
     /// parameters are validated and kept in scope (as `Self.T`) for its fields
     /// and methods; field/method types referring to them become `Ty::Param`.
     /// Declared trait conformances are verified once the members are known.
+    #[allow(clippy::too_many_arguments)]
     fn check_struct(
         &mut self,
         name: &str,
         type_params: &[crate::ast::TypeParam],
         conforms: &[String],
         fields: &[crate::ast::Param],
+        associated: &[StructComptime],
         methods: &[Method],
         fieldwise_init: bool,
     ) -> Result<(), TypeError> {
@@ -1125,6 +1419,7 @@ impl Checker {
             decls,
             conforms,
             fields,
+            associated,
             methods,
             fieldwise_init,
             &self_ty,
@@ -1141,6 +1436,7 @@ impl Checker {
         decls: Vec<ParamDecl>,
         conforms: &[String],
         fields: &[crate::ast::Param],
+        associated: &[StructComptime],
         methods: &[Method],
         fieldwise_init: bool,
         self_ty: &Ty,
@@ -1154,6 +1450,7 @@ impl Checker {
             }
             field_tys.push((f.name.clone(), self.ty_from_anno(&f.ty)?));
         }
+        let associated_values = self.check_struct_associated(associated)?;
         // Register the (method-less) struct first, so methods may reference the
         // struct's own type (even parameterized, `Pair[Self.T]`) in signatures.
         self.structs.insert(
@@ -1162,12 +1459,14 @@ impl Checker {
                 decls,
                 conforms: conforms.to_vec(),
                 fields: field_tys,
+                associated: associated_values,
                 methods: HashMap::new(),
                 fieldwise_init,
             },
         );
         // Method signatures.
         for m in methods {
+            let method_name = lifecycle_method_name(m);
             let sig = MethodSig {
                 params: self.param_tys(&m.params)?,
                 ret: match &m.ret {
@@ -1177,8 +1476,8 @@ impl Checker {
                 mut_self: matches!(m.self_convention, Some(crate::ast::ArgConvention::Mut)),
             };
             let info = self.structs.get_mut(name).expect("just registered");
-            if info.methods.insert(m.name.clone(), sig).is_some() {
-                return Err(TypeError::Redeclaration(m.name.clone()));
+            if info.methods.insert(method_name.to_string(), sig).is_some() {
+                return Err(TypeError::Redeclaration(method_name.to_string()));
             }
         }
         // `@fieldwise_init` and a hand-written `__init__` both define a constructor;
@@ -1231,9 +1530,9 @@ impl Checker {
                 params: req_sig
                     .params
                     .iter()
-                    .map(|t| substitute_self(t, self_ty))
+                    .map(|t| self.resolve_assoc_ty(&substitute_self(t, self_ty)))
                     .collect(),
-                ret: substitute_self(&req_sig.ret, self_ty),
+                ret: self.resolve_assoc_ty(&substitute_self(&req_sig.ret, self_ty)),
                 mut_self: got.mut_self,
             };
             if *got != want {
@@ -1244,12 +1543,77 @@ impl Checker {
                 });
             }
         }
+        for (member, req) in &trait_info.comptime_members {
+            let got = struct_info.associated.get(member).ok_or_else(|| {
+                TypeError::MissingTraitComptimeMember {
+                    struct_name: name.to_string(),
+                    trait_name: tr.to_string(),
+                    member: member.clone(),
+                }
+            })?;
+            if !self.ct_member_satisfies(got, req, self_ty) {
+                return Err(TypeError::TraitComptimeMemberMismatch {
+                    struct_name: name.to_string(),
+                    trait_name: tr.to_string(),
+                    member: member.clone(),
+                });
+            }
+        }
         Ok(())
     }
 
+    fn ct_member_satisfies(&self, value: &CtValue, req: &CtMemberReq, self_ty: &Ty) -> bool {
+        match req {
+            CtMemberReq::Value(expected) => self
+                .ct_value_ty(value, self_ty)
+                .is_some_and(|actual| coerces(&actual, expected)),
+            CtMemberReq::Type { bounds } => {
+                let CtValue::Type(ty) = value else {
+                    return false;
+                };
+                bounds.iter().all(|bound| self.conforms_to(ty, bound))
+            }
+        }
+    }
+
+    fn ct_value_ty(&self, value: &CtValue, self_ty: &Ty) -> Option<Ty> {
+        match value {
+            CtValue::Int(_) | CtValue::Param(_) => Some(Ty::Int),
+            CtValue::Bool(_) => Some(Ty::Bool),
+            CtValue::Str(_) => Some(Ty::String),
+            CtValue::Tuple(values) => values
+                .iter()
+                .map(|v| self.ct_value_ty(v, self_ty))
+                .collect::<Option<Vec<_>>>()
+                .map(Ty::Tuple),
+            CtValue::List(values) => {
+                let first = values.first()?;
+                let elem = self.ct_value_ty(first, self_ty)?;
+                if values.iter().skip(1).all(|v| {
+                    self.ct_value_ty(v, self_ty)
+                        .is_some_and(|ty| coerces(&ty, &elem))
+                }) {
+                    Some(Ty::List(Box::new(elem)))
+                } else {
+                    None
+                }
+            }
+            CtValue::Type(_) => {
+                let _ = self_ty;
+                None
+            }
+        }
+    }
+
     fn check_method(&mut self, self_ty: &Ty, m: &Method) -> Result<(), TypeError> {
-        if let Some(feature) =
-            Self::advanced_param_feature(&m.params, m.positional_only, m.keyword_only, true, true)
+        if !is_mojo_copy_constructor(m)
+            && let Some(feature) = Self::advanced_param_feature(
+                &m.params,
+                m.positional_only,
+                m.keyword_only,
+                true,
+                true,
+            )
         {
             return Err(TypeError::Unsupported(feature.to_string()));
         }
@@ -1366,11 +1730,45 @@ impl Checker {
         name: &str,
         param_args: &[crate::ast::ParamArg],
         args: &[Expr],
+        kwargs: &[crate::ast::KwArg],
     ) -> Result<Ty, TypeError> {
         let info = self
             .structs
             .get(name)
             .expect("caller checked it is a struct");
+        if !kwargs.is_empty() {
+            if args.is_empty()
+                && kwargs.len() == 1
+                && kwargs[0].name == "copy"
+                && let Some(sig) = info.methods.get("__copyinit__")
+            {
+                let params = sig.params.clone();
+                let decls = info.decls.clone();
+                if params.len() != 1 {
+                    return Err(TypeError::BadCall {
+                        func: name.to_string(),
+                        reason: "copy constructor must take exactly one 'copy' argument"
+                            .to_string(),
+                    });
+                }
+                let arg_ty = self.infer(&kwargs[0].value)?;
+                let (subst, tyargs) =
+                    self.resolve_use_params(name, &decls, param_args, &params, std::slice::from_ref(&arg_ty))?;
+                let expected = substitute(&params[0], &subst);
+                if !coerces(&arg_ty, &expected) {
+                    return Err(TypeError::TypeMismatch {
+                        expected: expected.to_string(),
+                        found: arg_ty.to_string(),
+                        context: format!("argument 'copy' to '{}.__init__'", name),
+                    });
+                }
+                return Ok(Ty::Struct(name.to_string(), tyargs));
+            }
+            return Err(TypeError::BadCall {
+                func: name.to_string(),
+                reason: "keyword arguments are not supported here".to_string(),
+            });
+        }
         // A hand-written `def __init__(out self, …)` is the constructor: check the
         // call arguments against its parameters (the `self` receiver is implicit).
         // Takes precedence over `@fieldwise_init`. On a **generic** struct, the type
@@ -1943,6 +2341,16 @@ impl Checker {
                 _ => Err(TypeError::UnknownSelfParam(field.to_string())),
             };
         }
+        // `T.size` where `T` is a generic type parameter and a bound trait
+        // requires `comptime size: Int`: expression-level access to an associated
+        // compile-time value. Type-valued associated members remain type-position
+        // only (`T.Element` in annotations).
+        if let ExprKind::Identifier(name) = &object.kind
+            && let Some(bounds) = self.lookup_tparam(name)
+            && let Some(ty) = self.lookup_trait_assoc_value_ty(&bounds, field)
+        {
+            return Ok(ty);
+        }
         let obj_ty = self.infer(object)?;
         if let Ty::Struct(sname, targs) = &obj_ty {
             let info = self
@@ -2147,6 +2555,35 @@ impl Checker {
         Some(Ok(substitute(&sig.ret, &subst)))
     }
 
+    fn iterable_element_ty(&self, ty: &Ty) -> Result<Ty, TypeError> {
+        match ty {
+            Ty::Range => Ok(Ty::Int),
+            Ty::List(elem) => Ok((**elem).clone()),
+            Ty::Struct(..) => self.iter_element_ty(ty),
+            Ty::Param { bounds, .. } => {
+                if self.lookup_trait_assoc_type(bounds, "Element").is_some() {
+                    Ok(Ty::Assoc {
+                        base: Box::new(ty.clone()),
+                        name: "Element".to_string(),
+                    })
+                } else {
+                    Err(TypeError::TypeMismatch {
+                        expected: "range, List, a type with __iter__, or an Iterable-style bound"
+                            .to_string(),
+                        found: ty.to_string(),
+                        context: "for-loop iterable".to_string(),
+                    })
+                }
+            }
+            other => Err(TypeError::TypeMismatch {
+                expected: "range, List, a type with __iter__, or an Iterable-style bound"
+                    .to_string(),
+                found: other.to_string(),
+                context: "for-loop iterable".to_string(),
+            }),
+        }
+    }
+
     /// The `for`-loop element type of a user struct iterable, validating the
     /// stable Mojo iterator protocol. A struct defines `__iter__(self) -> Iter`,
     /// where `Iter` is either a built-in `List[Element]` or a struct with
@@ -2189,6 +2626,9 @@ impl Checker {
             return Err(bad_iter());
         };
         let iinfo = self.structs.get(iname).ok_or_else(bad_iter)?;
+        if !iinfo.methods.contains_key("__next__") && iinfo.methods.contains_key("__iter__") {
+            return self.iter_element_ty(&it_ty);
+        }
         let isubst = struct_subst(&iinfo.decls, itargs);
         // `__len__(self) -> Int` — bounded iteration (loop while `len(it) > 0`).
         let len_sig = iinfo
@@ -2346,6 +2786,29 @@ impl Checker {
             .iter()
             .filter_map(|b| self.traits.get(b))
             .find_map(|info| info.methods.get(method).cloned())
+    }
+
+    /// Find a type-valued associated comptime member required by any of the
+    /// given trait bounds. Built-in bounds contribute none.
+    fn lookup_trait_assoc_type(&self, bounds: &[String], member: &str) -> Option<Vec<String>> {
+        bounds
+            .iter()
+            .filter_map(|b| self.traits.get(b))
+            .find_map(|info| match info.comptime_members.get(member) {
+                Some(CtMemberReq::Type { bounds }) => Some(bounds.clone()),
+                _ => None,
+            })
+    }
+
+    /// Find a value-valued associated comptime member required by a bound trait.
+    fn lookup_trait_assoc_value_ty(&self, bounds: &[String], member: &str) -> Option<Ty> {
+        bounds
+            .iter()
+            .filter_map(|b| self.traits.get(b))
+            .find_map(|info| match info.comptime_members.get(member) {
+                Some(CtMemberReq::Value(ty)) => Some(ty.clone()),
+                _ => None,
+            })
     }
 
     fn infer_prefix(&self, op: PrefixOp, operand: &Expr) -> Result<Ty, TypeError> {
@@ -2569,38 +3032,36 @@ impl Checker {
         let ty = match self.lookup(name) {
             Some(ty) => ty.clone(),
             // Built-ins and struct construction, resolved only when the name
-            // isn't shadowed by a binding. None of these accept keyword arguments.
-            None => {
-                if !kwargs.is_empty() {
+            // isn't shadowed by a binding.
+            None => match name {
+                _ if self.structs.contains_key(name) => {
+                    return self.infer_construction(name, param_args, args, kwargs);
+                }
+                _ if !kwargs.is_empty() => {
                     return Err(TypeError::BadCall {
                         func: name.to_string(),
                         reason: "keyword arguments are not supported here".to_string(),
                     });
                 }
-                match name {
-                    "print" => return self.infer_print(args),
-                    "String" => return self.infer_stringify(args),
-                    "abs" => return self.infer_abs(args),
-                    "min" | "max" => return self.infer_min_max(name, args),
-                    "round" => return self.infer_round(args),
-                    "len" => return self.infer_len(args),
-                    "range" => return self.infer_range(args),
-                    "Int" => return self.infer_conversion(Ty::Int, args),
-                    "UInt" => return self.infer_conversion(Ty::UInt, args),
-                    "Float64" => return self.infer_conversion(Ty::Float64, args),
-                    "SIMD" => return self.infer_simd_construction(param_args, args),
-                    "List" => return self.infer_list_construction(param_args, args),
-                    "Error" => return self.infer_error_construction(args),
-                    _ if Dtype::from_scalar_alias(name).is_some() => {
-                        let dtype = Dtype::from_scalar_alias(name).unwrap();
-                        return self.infer_simd_alias_construction(dtype, param_args, args);
-                    }
-                    _ if self.structs.contains_key(name) => {
-                        return self.infer_construction(name, param_args, args);
-                    }
-                    _ => return Err(TypeError::UndefinedVariable(name.to_string())),
+                "print" => return self.infer_print(args),
+                "String" => return self.infer_stringify(args),
+                "abs" => return self.infer_abs(args),
+                "min" | "max" => return self.infer_min_max(name, args),
+                "round" => return self.infer_round(args),
+                "len" => return self.infer_len(args),
+                "range" => return self.infer_range(args),
+                "Int" => return self.infer_conversion(Ty::Int, args),
+                "UInt" => return self.infer_conversion(Ty::UInt, args),
+                "Float64" => return self.infer_conversion(Ty::Float64, args),
+                "SIMD" => return self.infer_simd_construction(param_args, args),
+                "List" => return self.infer_list_construction(param_args, args),
+                "Error" => return self.infer_error_construction(args),
+                _ if Dtype::from_scalar_alias(name).is_some() => {
+                    let dtype = Dtype::from_scalar_alias(name).unwrap();
+                    return self.infer_simd_alias_construction(dtype, param_args, args);
                 }
-            }
+                _ => return Err(TypeError::UndefinedVariable(name.to_string())),
+            },
         };
         let (params, names, ret, required, variadic, conventions) = match ty {
             // A non-generic function takes no compile-time parameters.
@@ -2729,7 +3190,7 @@ impl Checker {
         let (subst, _tyargs) =
             self.resolve_use_params(name, decls, param_args, params, &arg_tys)?;
         for (i, (aty, pty)) in arg_tys.iter().zip(params).enumerate() {
-            let expected = substitute(pty, &subst);
+            let expected = self.resolve_assoc_ty(&substitute(pty, &subst));
             if !coerces(aty, &expected) {
                 return Err(TypeError::TypeMismatch {
                     expected: expected.to_string(),
@@ -2738,7 +3199,7 @@ impl Checker {
                 });
             }
         }
-        Ok(substitute(ret, &subst))
+        Ok(self.resolve_assoc_ty(&substitute(ret, &subst)))
     }
 
     /// Type the built-in `print(...)`: any number of *printable* arguments,
@@ -3111,6 +3572,10 @@ fn substitute(ty: &Ty, subst: &HashMap<String, Ty>) -> Ty {
         Ty::List(elem) => Ty::List(Box::new(substitute(elem, subst))),
         Ty::Tuple(elems) => Ty::Tuple(elems.iter().map(|t| substitute(t, subst)).collect()),
         Ty::Pointer(elem) => Ty::Pointer(Box::new(substitute(elem, subst))),
+        Ty::Assoc { base, name } => Ty::Assoc {
+            base: Box::new(substitute(base, subst)),
+            name: name.clone(),
+        },
         Ty::Func {
             params,
             names,
@@ -3147,6 +3612,10 @@ fn substitute_self(ty: &Ty, replacement: &Ty) -> Ty {
                 .collect(),
         ),
         Ty::Pointer(elem) => Ty::Pointer(Box::new(substitute_self(elem, replacement))),
+        Ty::Assoc { base, name } => Ty::Assoc {
+            base: Box::new(substitute_self(base, replacement)),
+            name: name.clone(),
+        },
         Ty::Func {
             params,
             names,
@@ -3246,7 +3715,9 @@ fn dtype_from_arg(arg: &crate::ast::ParamArg) -> Result<Dtype, TypeError> {
         crate::ast::ParamArg::Value(Expr {
             kind: ExprKind::Member { field, .. },
             ..
-        }) => format!("DType.{}", field),
+        }) => {
+            format!("DType.{}", field)
+        }
         _ => "a non-DType argument".to_string(),
     }))
 }
@@ -3449,6 +3920,33 @@ pub(crate) fn match_call_slots(
 
 /// The number of **required** parameters (those with no default). Defaults must
 /// be trailing, so a required parameter after a defaulted one is an error.
+fn lifecycle_method_name(m: &Method) -> &str {
+    if is_mojo_copy_constructor(m) {
+        "__copyinit__"
+    } else {
+        &m.name
+    }
+}
+
+fn is_mojo_copy_constructor(m: &Method) -> bool {
+    m.name == "__init__"
+        && m.has_self
+        && matches!(m.self_convention, Some(ArgConvention::Out))
+        && m.positional_only.is_none()
+        && m.keyword_only == Some(0)
+        && m.params.len() == 1
+        && is_copy_param(&m.params[0])
+        && m.ret.is_none()
+}
+
+fn is_copy_param(p: &FnParam) -> bool {
+    p.name == "copy"
+        && p.default.is_none()
+        && p.kind == crate::ast::ParamKind::Regular
+        && p.convention.is_none()
+        && matches!(p.ty, Type::SelfType)
+}
+
 fn required_count(params: &[crate::ast::FnParam]) -> Result<usize, TypeError> {
     let mut seen_default = false;
     let mut required = 0;
@@ -3613,6 +4111,18 @@ fn coerces(from: &Ty, to: &Ty) -> bool {
         return true;
     }
     match (from, to) {
+        (Ty::Param { name: a, .. }, Ty::Param { name: b, .. }) => a == b,
+        (Ty::Struct(an, aargs), Ty::Struct(bn, bargs)) => {
+            an == bn
+                && aargs.len() == bargs.len()
+                && aargs.iter().zip(bargs).all(|(a, b)| match (a, b) {
+                    (TyArg::Ty(a), TyArg::Ty(b)) => coerces(a, b),
+                    (TyArg::Val(a), TyArg::Val(b)) => a == b,
+                    _ => false,
+                })
+        }
+        (Ty::List(a), Ty::List(b)) => coerces(a, b),
+        (Ty::Pointer(a), Ty::Pointer(b)) => coerces(a, b),
         (Ty::IntLiteral, Ty::Int | Ty::UInt | Ty::Float64 | Ty::FloatLiteral) => true,
         (Ty::FloatLiteral, Ty::Float64) => true,
         // A tuple coerces element-wise (same arity) — so a literal element

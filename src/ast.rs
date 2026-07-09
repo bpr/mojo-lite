@@ -30,7 +30,15 @@ pub enum Type {
     Named(String, Vec<ParamArg>),
     /// `Self.T` — one of the enclosing struct's own type parameters, referenced
     /// from inside its body (Mojo spelling; a bare `T` is not in scope there).
+    /// The checker also accepts it as a shorthand for a type-valued associated
+    /// member when there is no struct parameter by that name.
     SelfParam(String),
+    /// `Base.Member` in type position — an associated type/comptime member lookup
+    /// on a type parameter, `Self`, or a concrete type.
+    Assoc {
+        base: Box<Type>,
+        name: String,
+    },
     /// Bare `Self` — the enclosing struct type (in a struct method) or the
     /// conforming type (in a trait method requirement).
     SelfType,
@@ -289,12 +297,19 @@ pub struct TraitMethod {
 
 /// A `comptime NAME: Type` **member requirement** inside a `trait` body — a
 /// compile-time constant / associated alias a conforming struct must define
-/// (`comptime count: Int`, `comptime EltType: Copyable`). Parsed; the checker
-/// flags a trait that declares one as unsupported.
+/// (`comptime count: Int`, `comptime EltType: Copyable`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TraitComptime {
     pub name: String,
     pub ty: Type,
+}
+
+/// A `comptime NAME = expr` associated compile-time fact inside a `struct` body.
+/// These are declarations on the type, not runtime statements.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructComptime {
+    pub name: String,
+    pub value: Expr,
 }
 
 /// The names imported by a `from ... import ...` statement.
@@ -411,7 +426,8 @@ pub enum StmtKind {
         ret: Option<Type>,
         body: Vec<Stmt>,
     },
-    /// `[decorators] struct Name[type_params](conforms): <fields and methods>`
+    /// `[decorators] struct Name[type_params](conforms): <fields, associated
+    /// comptime facts, and methods>`
     Struct {
         name: String,
         /// Decorators preceding the struct (`@value`, …). Parsed; only
@@ -423,6 +439,7 @@ pub enum StmtKind {
         /// if none. Nominal — a `[T: A]` bound is satisfied only if `A` is here.
         conforms: Vec<String>,
         fields: Vec<Param>,
+        associated: Vec<StructComptime>,
         methods: Vec<Method>,
         /// Whether `@fieldwise_init` was present (so `Name(...)` constructs).
         fieldwise_init: bool,
@@ -430,10 +447,10 @@ pub enum StmtKind {
     /// `trait Name[(Super, …)]: <members>` — declares method (and `comptime`
     /// member) requirements that a conforming struct must implement. `refines` is
     /// the optional parenthesized list of **super-traits** (trait inheritance);
-    /// `comptime_members` are `comptime NAME: Type` requirements. A pure trait
-    /// (only `...`-bodied methods, no `refines`, no comptime members) is fully
-    /// modeled; the checker flags the parse-only extensions (`refines`, a default
-    /// method body, or a comptime member) as unsupported. (Generic traits
+    /// `comptime_members` are `comptime NAME: Type` requirements. A trait with
+    /// method requirements and associated comptime requirements is modeled; the
+    /// checker still flags parse-only extensions (`refines` and a default method
+    /// body) as unsupported. (Generic traits
     /// `trait T[U]:` are not valid current Mojo, so they are not parsed.)
     Trait {
         name: String,

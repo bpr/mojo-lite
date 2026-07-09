@@ -144,6 +144,8 @@ CtValue::Bool
 CtValue::Str
 CtValue::Tuple
 CtValue::List
+CtValue::Type
+CtValue::Param
 ```
 
 The implemented forms are:
@@ -158,18 +160,71 @@ The implemented forms are:
 - `comptime for`: evaluates the iterable as either `range(...)` or a
   compile-time tuple/list, substitutes the loop variable with a literal, and
   splices a fresh elaborated copy of the loop body for each element.
-- CTFE calls: a compile-time expression may call a pure, non-generic, top-level
-  `def`. The body is executed by a small AST interpreter that supports local
-  variables, assignment, `if`, `while`, `for`, `break`, `continue`, expression
-  statements, and `return`.
+- CTFE calls: a compile-time expression may call a pure top-level `def`,
+  including value-parameterized helpers and helpers whose type parameters are
+  used only for compile-time facts. The elaborator clones the needed helper call
+  graph, folds compile-time-only operations such as `is_same_type[T, U]()` and
+  `T.size` out of the cloned bodies, and executes the resulting helper through
+  HIR, MIR, and the register VM in compile-time mode.
 - Materialization: module-level `comptime` constants are inlined as runtime
   literals into later code, so a function can use a constant computed at module
   elaboration time.
 
-CTFE is intentionally not the register VM. It is a small, fuel-bounded
-compile-time execution island. That keeps the first implementation simple and
-isolated, but it also means any semantics supported by CTFE must be mirrored
-manually until compile-time execution is moved onto MIR/VM machinery.
+The important distinction is that the elaborator still owns compile-time AST
+rewriting, while function-body execution now goes through the MIR/VM path. The
+remaining expression evaluator in `src/comptime.rs` is not a second function
+runtime; it exists to decide `comptime if`, enumerate `comptime for`, resolve
+type-valued compile-time facts, and fold those facts before a CTFE helper is
+lowered to MIR.
+
+### VM-Backed CTFE
+
+When a compile-time expression calls a helper `def`, the elaborator first resolves
+the explicit compile-time arguments into `CtValue`s. Value parameters are passed
+to the VM as reified frame locals; type parameters remain compile-time facts in
+the elaborator's environment.
+
+Before lowering the helper for CTFE, the elaborator walks the transitive helper
+call graph and rejects runtime effects:
+
+- `print`
+- `raise`
+- pointer allocation
+- methods and user-value dunder dispatch
+- `try`
+- nested declarations
+- keyword calls and other unsupported runtime forms
+
+For the accepted call graph, the elaborator clones the needed top-level `def`s.
+In the root helper body it folds compile-time-only expressions into ordinary
+runtime literals:
+
+```mojo
+return T.size
+```
+
+may become:
+
+```mojo
+return 8
+```
+
+for an instantiation such as `capacity[Buffer[8]]()`. Similarly,
+`is_same_type[T, Int]()` is replaced with a `Bool` literal. After this rewrite,
+the cloned helper program is ordinary AST and can be lowered through the same
+HIR/MIR/VM machinery as runtime code.
+
+The VM has a narrow CTFE entry point:
+
+```rust
+VmBackend::run_function_value(...)
+```
+
+It executes a named top-level helper without running `__toplevel__` or `main`,
+burns the shared compile-time fuel budget, and returns a runtime `Value` plus the
+remaining fuel. The elaborator converts the result back to `CtValue`. Only
+runtime-materializable compile-time values can cross that boundary today:
+`Int`, `Bool`, `String`, `Tuple`, and `List`.
 
 ### Fuel
 
@@ -181,9 +236,10 @@ program-wide quota:
 const FUEL: usize = 100_000;
 ```
 
-The elaborator burns fuel for compile-time function calls, statements executed
-inside CTFE, loop iterations, and `comptime for` unrolling. If the budget reaches
-zero, elaboration fails with `ComptimeError::QuotaExceeded`.
+The elaborator burns fuel for expression-level compile-time work and
+`comptime for` unrolling. VM-backed CTFE burns from the same budget for function
+calls, basic-block execution, and instructions. If the budget reaches zero,
+elaboration fails with a compile-time quota error.
 
 The goal is to prevent compile-time execution from hanging the compiler. A bad
 `while True` in a CTFE function or an enormous generated loop should fail
@@ -1027,9 +1083,9 @@ reimplementing every scalar/list/string/SIMD rule from scratch.
 
 The main pressure points are:
 
-- CTFE currently has a small AST interpreter; moving CTFE onto restricted MIR/VM
-  execution would reduce duplicated semantics and make compile-time execution
-  track runtime behavior more closely
+- CTFE function-body execution now uses restricted MIR/VM execution, but nested
+  generic helper specialization still needs to grow beyond the current direct
+  entry-helper fact folding
 - the compile-time value universe still needs to grow toward Mojo-style
   type-level values, declaration generation, and richer specialization
 - more declaration facts should move out of VM-side AST registries

@@ -1,7 +1,7 @@
 use mojo_lite::ast::{
     ArgConvention, Decorator, Expr, ExprKind, FnParam, ImportName, ImportNames, InfixOp, KwArg,
-    Method, Param, ParamArg, ParamKind, PrefixOp, Stmt, StmtKind, TStringPart, TraitComptime,
-    TraitMethod, Type, TypeParam, WithItem,
+    Method, Param, ParamArg, ParamKind, PrefixOp, Stmt, StmtKind, StructComptime, TStringPart,
+    TraitComptime, TraitMethod, Type, TypeParam, WithItem,
 };
 use mojo_lite::{Lexer, Parser};
 
@@ -169,6 +169,7 @@ fn parses_struct_with_field_and_method() {
                 name: "x".into(),
                 ty: Type::Int
             }],
+            associated: vec![],
             methods: vec![Method {
                 name: "get".into(),
                 has_self: true,
@@ -464,6 +465,7 @@ fn parses_generic_struct_header_and_self_param_field() {
                     ty: Type::SelfParam("T".into())
                 },
             ],
+            associated: vec![],
             methods: vec![],
             fieldwise_init: true,
         })
@@ -624,6 +626,46 @@ fn parses_trait_comptime_member() {
             );
         }
         other => panic!("expected a trait, got {:?}", other),
+    }
+}
+
+#[test]
+fn parses_associated_type_annotation() {
+    match &parse("def first[C: Iterable](c: C) -> C.Element:\n    pass\n")[0].kind {
+        StmtKind::Def { ret, .. } => {
+            assert_eq!(
+                ret,
+                &Some(Type::Assoc {
+                    base: Box::new(Type::Named("C".into(), vec![])),
+                    name: "Element".into(),
+                })
+            );
+        }
+        other => panic!("expected a def, got {:?}", other),
+    }
+}
+
+#[test]
+fn parses_struct_comptime_associated_member() {
+    match &parse("@fieldwise_init\nstruct Box[T: AnyType]:\n    comptime Element = Self.T\n    var value: Self.T\n")[0].kind {
+        StmtKind::Struct {
+            associated,
+            fields,
+            ..
+        } => {
+            assert_eq!(
+                associated,
+                &vec![StructComptime {
+                    name: "Element".into(),
+                    value: Expr::from(ExprKind::Member {
+                        object: ident("Self"),
+                        field: "T".into(),
+                    })
+                }]
+            );
+            assert_eq!(fields[0].name, "value");
+        }
+        other => panic!("expected a struct, got {:?}", other),
     }
 }
 
@@ -1400,6 +1442,24 @@ fn parses_ref_return_type() {
 fn parses_keyword_call_arguments() {
     assert_eq!(
         parse_expr("f(a=1, b=2)"),
+        Expr::from(ExprKind::Call {
+            name: "f".into(),
+            param_args: vec![],
+            args: vec![],
+            kwargs: vec![
+                KwArg {
+                    name: "a".into(),
+                    value: Expr::from(ExprKind::Int(1))
+                },
+                KwArg {
+                    name: "b".into(),
+                    value: Expr::from(ExprKind::Int(2))
+                },
+            ],
+        })
+    );
+    assert_eq!(
+        parse_expr("f(a: 1, b: 2)"),
         Expr::from(ExprKind::Call {
             name: "f".into(),
             param_args: vec![],

@@ -21,7 +21,7 @@ struct ListIter[T: Copyable & Movable]:
         self.idx = self.idx + 1
         return v
 
-struct List[T: Copyable & Movable]:
+struct List[T: Copyable & Movable](Copyable):
     var data: UnsafePointer[Self.T]
     var size: Int
     var cap: Int
@@ -31,14 +31,17 @@ struct List[T: Copyable & Movable]:
         self.size = 0
         self.data = UnsafePointer[Self.T].alloc(4)
 
-    def __copyinit__(out self, existing: Self):
-        self.cap = existing.cap
-        self.size = existing.size
-        self.data = UnsafePointer[Self.T].alloc(existing.cap)
+    def __init__(out self, *, copy: Self):
+        self.cap = copy.cap
+        self.size = copy.size
+        self.data = UnsafePointer[Self.T].alloc(copy.cap)
         var i: Int = 0
-        while i < existing.size:
-            self.data[i] = existing.data[i]
+        while i < copy.size:
+            self.data[i] = copy.data[i]
             i = i + 1
+
+    def copy(self) -> Self:
+        return List[Self.T](copy: self)
 
     def __moveinit__(out self, owned existing: Self):
         self.cap = existing.cap

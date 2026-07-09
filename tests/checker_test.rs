@@ -396,7 +396,10 @@ fn rejects_for_over_non_range() {
         TypeError::TypeMismatch {
             expected, found, ..
         } => {
-            assert_eq!(expected, "range, List, or a type with __iter__");
+            assert_eq!(
+                expected,
+                "range, List, a type with __iter__, or an Iterable-style bound"
+            );
             assert_eq!(found, "Int");
         }
         other => panic!("expected a type mismatch, got {:?}", other),
@@ -636,6 +639,65 @@ fn rejects_struct_with_mismatched_trait_method_signature() {
     );
     assert!(
         matches!(e, TypeError::TraitMethodMismatch { .. }),
+        "got {:?}",
+        e
+    );
+}
+
+#[test]
+fn accepts_trait_comptime_type_member_conformance() {
+    ok(
+        "trait HasElement:\n    comptime Element: AnyType\n\n@fieldwise_init\nstruct Box[T: AnyType](HasElement):\n    comptime Element = Self.T\n    var value: Self.T\n",
+    );
+}
+
+#[test]
+fn accepts_trait_comptime_value_member_conformance() {
+    ok(
+        "trait Fixed:\n    comptime size: Int\n\n@fieldwise_init\nstruct Buffer[size: Int](Fixed):\n    comptime size = Self.size\n    var tag: Int\n",
+    );
+}
+
+#[test]
+fn rejects_missing_trait_comptime_member() {
+    let e = err(
+        "trait HasElement:\n    comptime Element: AnyType\n\n@fieldwise_init\nstruct Box[T: AnyType](HasElement):\n    var value: Self.T\n",
+    );
+    assert!(
+        matches!(
+            &e,
+            TypeError::MissingTraitComptimeMember { member, .. } if member == "Element"
+        ),
+        "got {:?}",
+        e
+    );
+}
+
+#[test]
+fn rejects_trait_comptime_member_kind_mismatch() {
+    let e = err(
+        "trait HasElement:\n    comptime Element: AnyType\n\n@fieldwise_init\nstruct Box(HasElement):\n    comptime Element = 1\n    var value: Int\n",
+    );
+    assert!(
+        matches!(
+            &e,
+            TypeError::TraitComptimeMemberMismatch { member, .. } if member == "Element"
+        ),
+        "got {:?}",
+        e
+    );
+}
+
+#[test]
+fn rejects_associated_value_in_type_position() {
+    let e = err(
+        "trait Fixed:\n    comptime size: Int\n\ndef bad[C: Fixed](c: C) -> C.size:\n    return 0\n",
+    );
+    assert!(
+        matches!(
+            &e,
+            TypeError::NoSuchAssociatedType { member, .. } if member == "size"
+        ),
         "got {:?}",
         e
     );
@@ -2035,6 +2097,12 @@ fn copyinit_makes_type_copyable_and_checks_di() {
     // Defining `__copyinit__` makes a struct Copyable, so `var q = p` is allowed.
     ok(
         "struct P:\n    var a: Int\n    def __init__(out self):\n        self.a = 1\n    def __copyinit__(out self, e: P):\n        self.a = e.a\n\ndef main():\n    var p: P = P()\n    var q: P = p\n    print(q.a)\n",
+    );
+    // Current Mojo spells the copy constructor as an `__init__` overload with a
+    // keyword-only `copy: Self`; mojo-lite registers that as the lifecycle copy
+    // initializer internally.
+    ok(
+        "struct Q:\n    var a: Int\n    def __init__(out self):\n        self.a = 1\n    def __init__(out self, *, copy: Self):\n        self.a = copy.a\n\ndef main():\n    var p: Q = Q()\n    var q: Q = Q(copy: p)\n    print(q.a)\n",
     );
     // A struct without `__copyinit__`/Copyable is move-only: `var q = p` is rejected.
     assert!(matches!(

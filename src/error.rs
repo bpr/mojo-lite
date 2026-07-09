@@ -83,6 +83,11 @@ pub enum TypeError {
         object_type: String,
         field: String,
     },
+    /// Associated type/comptime member lookup in type position failed.
+    NoSuchAssociatedType {
+        object_type: String,
+        member: String,
+    },
     /// Method call on a value whose type has no such method.
     NoSuchMethod {
         object_type: String,
@@ -139,6 +144,20 @@ pub enum TypeError {
         struct_name: String,
         trait_name: String,
         method: String,
+    },
+    /// A struct declares conformance to a trait but is missing a required
+    /// associated compile-time member.
+    MissingTraitComptimeMember {
+        struct_name: String,
+        trait_name: String,
+        member: String,
+    },
+    /// A struct's associated compile-time member exists but has the wrong
+    /// compile-time kind or type for the trait requirement.
+    TraitComptimeMemberMismatch {
+        struct_name: String,
+        trait_name: String,
+        member: String,
     },
     /// A value parameter was declared with a type other than `Int` (the only
     /// value-parameter type supported).
@@ -276,18 +295,22 @@ impl fmt::Display for TypeError {
                 name,
                 expected,
                 got,
-            } => write!(
-                f,
-                "'{}' expects {} argument(s), got {}",
-                name, expected, got
-            ),
+            } => {
+                write!(
+                    f,
+                    "'{}' expects {} argument(s), got {}",
+                    name, expected, got
+                )
+            }
             TypeError::Redeclaration(name) => {
                 write!(f, "'{}' is already declared in this scope", name)
             }
-            TypeError::ClosureEscape => write!(
-                f,
-                "closures cannot escape their defining scope (downward funargs only)"
-            ),
+            TypeError::ClosureEscape => {
+                write!(
+                    f,
+                    "closures cannot escape their defining scope (downward funargs only)"
+                )
+            }
             TypeError::ReturnOutsideFunction => write!(f, "'return' outside of a function"),
             TypeError::BreakOutsideLoop => write!(f, "'break' outside of a loop"),
             TypeError::ContinueOutsideLoop => write!(f, "'continue' outside of a loop"),
@@ -295,17 +318,29 @@ impl fmt::Display for TypeError {
                 expected,
                 found,
                 context,
-            } => write!(
-                f,
-                "type mismatch for {}: expected {}, found {}",
-                context, expected, found
-            ),
+            } => {
+                write!(
+                    f,
+                    "type mismatch for {}: expected {}, found {}",
+                    context, expected, found
+                )
+            }
             TypeError::BadOperator { op, operands } => {
                 write!(f, "operator '{}' is not defined for {}", op, operands)
             }
             TypeError::UnknownType(name) => write!(f, "unknown type '{}'", name),
             TypeError::NoSuchField { object_type, field } => {
                 write!(f, "type '{}' has no field '{}'", object_type, field)
+            }
+            TypeError::NoSuchAssociatedType {
+                object_type,
+                member,
+            } => {
+                write!(
+                    f,
+                    "type '{}' has no associated type '{}'",
+                    object_type, member
+                )
             }
             TypeError::NoSuchMethod {
                 object_type,
@@ -343,11 +378,13 @@ impl fmt::Display for TypeError {
                 name,
                 expected,
                 got,
-            } => write!(
-                f,
-                "type '{}' expects {} type argument(s), got {}",
-                name, expected, got
-            ),
+            } => {
+                write!(
+                    f,
+                    "type '{}' expects {} type argument(s), got {}",
+                    name, expected, got
+                )
+            }
             TypeError::UnknownSelfParam(name) => {
                 write!(
                     f,
@@ -387,11 +424,31 @@ impl fmt::Display for TypeError {
                 "struct '{}' method '{}' does not match the signature required by trait '{}'",
                 struct_name, method, trait_name
             ),
-            TypeError::BadValueParamType { name, ty } => write!(
+            TypeError::MissingTraitComptimeMember {
+                struct_name,
+                trait_name,
+                member,
+            } => write!(
                 f,
-                "value parameter '{}' must have type Int, not '{}'",
-                name, ty
+                "struct '{}' declares conformance to trait '{}' but is missing comptime member '{}'",
+                struct_name, trait_name, member
             ),
+            TypeError::TraitComptimeMemberMismatch {
+                struct_name,
+                trait_name,
+                member,
+            } => write!(
+                f,
+                "struct '{}' comptime member '{}' does not match the requirement from trait '{}'",
+                struct_name, member, trait_name
+            ),
+            TypeError::BadValueParamType { name, ty } => {
+                write!(
+                    f,
+                    "value parameter '{}' must have type Int, not '{}'",
+                    name, ty
+                )
+            }
             TypeError::NotComptime(what) => {
                 write!(f, "not a compile-time Int constant: {}", what)
             }
@@ -440,15 +497,19 @@ impl fmt::Display for RuntimeError {
                 name,
                 expected,
                 got,
-            } => write!(
-                f,
-                "'{}' expects {} argument(s), got {}",
-                name, expected, got
-            ),
-            RuntimeError::ClosureEscape => write!(
-                f,
-                "closures cannot escape their defining scope (downward funargs only)"
-            ),
+            } => {
+                write!(
+                    f,
+                    "'{}' expects {} argument(s), got {}",
+                    name, expected, got
+                )
+            }
+            RuntimeError::ClosureEscape => {
+                write!(
+                    f,
+                    "closures cannot escape their defining scope (downward funargs only)"
+                )
+            }
             RuntimeError::Raised(msg) => write!(f, "unhandled error: {}", msg),
             RuntimeError::Unsupported(what) => write!(f, "unsupported feature: {}", what),
         }

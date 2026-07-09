@@ -18,8 +18,8 @@
 //! `xs[i] += e` lower uniformly (indices evaluated once).
 
 use crate::ast::{
-    ArgConvention, Dtype, Expr, ExprKind, FnParam, InfixOp, ParamArg, PrefixOp, Stmt, StmtKind,
-    TStringPart, Type,
+    ArgConvention, Dtype, Expr, ExprKind, FnParam, InfixOp, Method, ParamArg, PrefixOp, Stmt,
+    StmtKind, TStringPart, Type,
 };
 use crate::token::DUMMY_SPAN;
 use std::collections::HashSet;
@@ -771,19 +771,23 @@ impl Flatten<'_> {
                 object,
                 method,
                 args,
-                ..
+                kwargs,
             } => {
                 // A **static** method on a parameterized built-in type — the receiver
                 // is a type, not a value (`UnsafePointer[T].alloc(n)`). Lower to a
                 // builtin call `Type.method(args)`; the element type is erased.
                 if let ExprKind::TypeApply { name, .. } = &object.kind {
                     let regs = self.args(args);
+                    let kw: Vec<(String, Reg)> = kwargs
+                        .iter()
+                        .map(|k| (k.name.clone(), self.expr(&k.value)))
+                        .collect();
                     let d = self.fresh(span(e), None);
                     self.emit(MirInstr::Call {
                         dest: d,
                         func: FuncRef::named(&format!("{name}.{method}")),
                         args: regs,
-                        kwargs: Vec::new(),
+                        kwargs: kw,
                         arg_places: vec![None; args.len()],
                         param_arg_regs: Vec::new(),
                     });
@@ -1921,6 +1925,29 @@ fn lower_fn_nested(
     }
 }
 
+fn lifecycle_method_name(m: &Method) -> &str {
+    if is_mojo_copy_constructor(m) {
+        "__copyinit__"
+    } else {
+        &m.name
+    }
+}
+
+fn is_mojo_copy_constructor(m: &Method) -> bool {
+    m.name == "__init__"
+        && m.has_self
+        && matches!(m.self_convention, Some(ArgConvention::Out))
+        && m.positional_only.is_none()
+        && m.keyword_only == Some(0)
+        && m.params.len() == 1
+        && m.params[0].name == "copy"
+        && m.params[0].default.is_none()
+        && m.params[0].kind == crate::ast::ParamKind::Regular
+        && m.params[0].convention.is_none()
+        && matches!(m.params[0].ty, Type::SelfType)
+        && m.ret.is_none()
+}
+
 /// Lower a whole program (a top-level statement list) into per-function MIR.
 ///
 /// Decision — **declarations are handled here, not inside a function body**: each
@@ -1945,7 +1972,8 @@ pub fn lower_program(program: &[Stmt]) -> MirProgram {
             }
             StmtKind::Struct { name, methods, .. } => {
                 for m in methods {
-                    let mangled = format!("{name}.{}", m.name);
+                    let method_name = lifecycle_method_name(m);
+                    let mangled = format!("{name}.{method_name}");
                     // A method's receiver `self` is the implicit first parameter,
                     // followed by the declared params.
                     let mut names: Vec<String> = Vec::new();
