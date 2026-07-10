@@ -285,6 +285,11 @@ pub struct Method {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TraitMethod {
     pub name: String,
+    /// The receiver's argument convention: `None` = plain read-only `self`,
+    /// or one of Mojo's explicit receiver conventions (`mut self`, `owned self`,
+    /// `ref self`, ...). Like `Method`, `self` is implicit and not stored in
+    /// `params`.
+    pub self_convention: Option<ArgConvention>,
     pub params: Vec<FnParam>,
     pub positional_only: Option<usize>,
     pub keyword_only: Option<usize>,

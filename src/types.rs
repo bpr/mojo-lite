@@ -43,6 +43,11 @@ pub enum Ty {
         params: Vec<Ty>,
         ret: Box<Ty>,
     },
+    /// A source name that denotes multiple callable signatures. The checker
+    /// resolves an overload set at each call site. The first implementation
+    /// supports distinct call shapes/arity; keeping this as a first-class type
+    /// leaves type-ranked overload resolution as a natural extension.
+    Overload(Vec<Ty>),
     /// A type parameter (`T`) inside a generic body, carrying its trait bounds.
     Param {
         name: String,
@@ -129,6 +134,16 @@ impl fmt::Display for Ty {
                     write!(f, "{}", p)?;
                 }
                 write!(f, ") -> {}", ret)
+            }
+            Ty::Overload(candidates) => {
+                write!(f, "overload(")?;
+                for (i, candidate) in candidates.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " | ")?;
+                    }
+                    write!(f, "{}", candidate)?;
+                }
+                write!(f, ")")
             }
             Ty::Param { name, .. } => write!(f, "{}", name),
             Ty::Assoc { base, name } => write!(f, "{}.{}", base, name),

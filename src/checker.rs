@@ -18,6 +18,7 @@
 //! would resolve it at call time. Choosing soundness over completeness here keeps
 //! the checker simple; hoisting `def` signatures per block is future work.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::ast::{
@@ -26,6 +27,7 @@ use crate::ast::{
 };
 use crate::ct::CtValue;
 use crate::error::TypeError;
+use crate::token::Span;
 use crate::types::{ParamDecl, Ty, TyArg};
 
 /// The checked signature of a struct, kept in the checker's registry.
@@ -39,7 +41,7 @@ struct StructInfo {
     /// Associated compile-time facts declared by `comptime NAME = ...` in the
     /// struct body. These live on the type, not on runtime instances.
     associated: HashMap<String, CtValue>,
-    methods: HashMap<String, MethodSig>,
+    methods: HashMap<String, Vec<MethodSig>>,
     fieldwise_init: bool,
 }
 
@@ -47,7 +49,7 @@ struct StructInfo {
 /// compile-time facts. A method requirement's signature may mention
 /// `Ty::SelfType` (the conforming type).
 struct TraitInfo {
-    methods: HashMap<String, MethodSig>,
+    methods: HashMap<String, Vec<MethodSig>>,
     comptime_members: HashMap<String, CtMemberReq>,
 }
 
@@ -64,14 +66,171 @@ enum CtMemberReq {
 struct MethodSig {
     params: Vec<Ty>,
     ret: Ty,
-    /// `mut self` — the method may mutate `self`, so a call site must have a
-    /// mutable variable receiver (the mutation is written back to it).
-    mut_self: bool,
+    /// Receiver convention. `None` means plain read-only `self`; explicit
+    /// conventions (`mut`, `owned`, `ref`, ...) are preserved so trait
+    /// requirements can compare them exactly. Today only `mut self` changes call
+    /// checking behavior.
+    self_convention: Option<crate::ast::ArgConvention>,
+}
+
+fn fixed_callable_arity(ty: &Ty) -> Option<usize> {
+    match ty {
+        Ty::Func {
+            params,
+            required,
+            variadic: None,
+            ..
+        } if *required == params.len() => Some(params.len()),
+        Ty::GenericFunc { params, .. } => Some(params.len()),
+        _ => None,
+    }
+}
+
+fn method_arity_range(sig: &MethodSig) -> (usize, usize) {
+    (sig.params.len(), sig.params.len())
+}
+
+fn same_method_shape(a: &MethodSig, b: &MethodSig) -> bool {
+    method_arity_range(a) == method_arity_range(b) && a.params == b.params
+}
+
+fn same_callable_signature(a: &Ty, b: &Ty) -> bool {
+    match (a, b) {
+        (Ty::Func { params: ap, .. }, Ty::Func { params: bp, .. })
+        | (Ty::GenericFunc { params: ap, .. }, Ty::GenericFunc { params: bp, .. }) => ap == bp,
+        _ => false,
+    }
+}
+
+fn callable_lowered_name(name: &str, ty: &Ty) -> Option<String> {
+    Some(format!("{name}{}", callable_signature_suffix(ty)?))
+}
+
+fn method_lowered_name(type_name: &str, method: &str, sig: &MethodSig) -> String {
+    format!("{type_name}.{method}{}", method_signature_suffix(sig))
+}
+
+fn method_signature_suffix(sig: &MethodSig) -> String {
+    signature_suffix(sig.params.iter())
+}
+
+fn callable_signature_suffix(ty: &Ty) -> Option<String> {
+    match ty {
+        Ty::Func { params, .. } | Ty::GenericFunc { params, .. } => {
+            Some(signature_suffix(params.iter()))
+        }
+        _ => None,
+    }
+}
+
+fn signature_suffix<'a>(params: impl IntoIterator<Item = &'a Ty>) -> String {
+    let parts = params
+        .into_iter()
+        .map(type_mangle)
+        .collect::<Vec<_>>()
+        .join("$");
+    format!("$ov${parts}")
+}
+
+fn type_mangle(ty: &Ty) -> String {
+    let raw = match ty {
+        Ty::Int | Ty::IntLiteral => "Int".to_string(),
+        Ty::UInt => "UInt".to_string(),
+        Ty::Float64 | Ty::FloatLiteral => "Float64".to_string(),
+        Ty::Bool => "Bool".to_string(),
+        Ty::String => "String".to_string(),
+        Ty::None => "None".to_string(),
+        Ty::List(elem) => format!("List${}", type_mangle(elem)),
+        Ty::Tuple(elems) => format!(
+            "Tuple${}",
+            elems.iter().map(type_mangle).collect::<Vec<_>>().join("$")
+        ),
+        Ty::Struct(name, args) => {
+            let mut s = format!("Struct${name}");
+            for arg in args {
+                s.push('$');
+                match arg {
+                    TyArg::Ty(t) => s.push_str(&type_mangle(t)),
+                    TyArg::Val(v) => s.push_str(&format!("V{v}")),
+                }
+            }
+            s
+        }
+        Ty::Param { name, .. } => format!("Param${name}"),
+        Ty::SelfType => "Self".to_string(),
+        other => other.to_string(),
+    };
+    raw.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '$' })
+        .collect()
+}
+
+enum OverloadSelect {
+    NoMatch,
+    Ambiguous,
+}
+
+fn select_callable_overload(
+    matches: Vec<(Ty, usize, String)>,
+) -> Result<(Ty, String), OverloadSelect> {
+    let best = matches
+        .iter()
+        .map(|(_, score, _)| *score)
+        .min()
+        .ok_or(OverloadSelect::NoMatch)?;
+    let mut best_matches = matches
+        .into_iter()
+        .filter(|(_, score, _)| *score == best)
+        .collect::<Vec<_>>();
+    if best_matches.len() != 1 {
+        return Err(OverloadSelect::Ambiguous);
+    }
+    let (ret, _, target) = best_matches.remove(0);
+    Ok((ret, target))
+}
+
+fn select_method_overload(
+    _method: &str,
+    matches: Vec<(usize, Vec<Ty>, Ty, bool, Option<String>)>,
+) -> Option<(usize, Vec<Ty>, Ty, bool, Option<String>)> {
+    let best = matches.iter().map(|(score, ..)| *score).min()?;
+    let mut best_matches = matches
+        .into_iter()
+        .filter(|(score, ..)| *score == best)
+        .collect::<Vec<_>>();
+    if best_matches.len() == 1 {
+        Some(best_matches.remove(0))
+    } else {
+        None
+    }
+}
+
+fn overload_candidates(existing: &Ty, new_ty: &Ty) -> Option<Vec<Ty>> {
+    if fixed_callable_arity(new_ty).is_none() {
+        return None;
+    }
+    match existing {
+        Ty::Func { .. } | Ty::GenericFunc { .. } if fixed_callable_arity(existing).is_some() => {
+            Some(vec![existing.clone()])
+        }
+        Ty::Overload(candidates) => Some(candidates.clone()),
+        _ => None,
+    }
 }
 
 /// Type-check a whole program. Convenience wrapper over [`Checker`].
 pub fn check(stmts: &[Stmt]) -> Result<(), TypeError> {
     Checker::new().check_program(stmts)
+}
+
+/// Type-check a program and return the concrete lowered callee chosen for every
+/// overloaded call site. MIR lowering uses this side table so source calls like
+/// `f(x)` can lower to a signature-specific function even when overloads share
+/// the same arity.
+pub fn resolve_overload_targets(stmts: &[Stmt]) -> Result<HashMap<Span, String>, TypeError> {
+    let mut checker = Checker::new();
+    checker.check_program(stmts)?;
+    Ok(checker.overload_targets.into_inner())
 }
 
 /// A single-pass static type checker over the parsed AST.
@@ -101,6 +260,10 @@ pub struct Checker {
     /// Whether `self` is writable in the method body being checked — set while
     /// checking a `mut self` method's body (so `self.x = e` is allowed there).
     self_mutable: bool,
+    /// Source-span to lowered callee for calls whose source name denotes an
+    /// overload set. Interior mutability keeps expression inference usable from
+    /// read-only helper methods while still recording resolution facts.
+    overload_targets: RefCell<HashMap<Span, String>>,
 }
 
 impl Checker {
@@ -115,6 +278,7 @@ impl Checker {
             trait_self_comptime: Vec::new(),
             comptimes: HashMap::new(),
             self_mutable: false,
+            overload_targets: RefCell::new(HashMap::new()),
         }
     }
 
@@ -333,6 +497,12 @@ impl Checker {
                 params: params.iter().map(|p| self.resolve_assoc_ty(p)).collect(),
                 ret: Box::new(self.resolve_assoc_ty(ret)),
             },
+            Ty::Overload(candidates) => Ty::Overload(
+                candidates
+                    .iter()
+                    .map(|candidate| self.resolve_assoc_ty(candidate))
+                    .collect(),
+            ),
             _ => ty.clone(),
         }
     }
@@ -755,7 +925,10 @@ impl Checker {
                     // Re-assignment: the value must keep the variable's type.
                     Some(target) => {
                         // Assigning a closure could move it to an outer binding.
-                        if matches!(found, Ty::Func { .. } | Ty::GenericFunc { .. }) {
+                        if matches!(
+                            found,
+                            Ty::Func { .. } | Ty::GenericFunc { .. } | Ty::Overload(_)
+                        ) {
                             return Err(TypeError::ClosureEscape);
                         }
                         if !coerces(&found, &target) {
@@ -1193,7 +1366,10 @@ impl Checker {
                 }
                 // Returning a function value is an escape, regardless of the
                 // declared return type — match the evaluator's ClosureEscape.
-                if matches!(found, Ty::Func { .. } | Ty::GenericFunc { .. }) {
+                if matches!(
+                    found,
+                    Ty::Func { .. } | Ty::GenericFunc { .. } | Ty::Overload(_)
+                ) {
                     return Err(TypeError::ClosureEscape);
                 }
                 if !coerces(&found, expected) {
@@ -1343,7 +1519,7 @@ impl Checker {
         let saved_self_decls = std::mem::take(&mut self.self_decls);
         self.trait_self_comptime.push(ct_members.clone());
         let result = (|| {
-            let mut sigs: HashMap<String, MethodSig> = HashMap::new();
+            let mut sigs: HashMap<String, Vec<MethodSig>> = HashMap::new();
             for m in methods {
                 if ct_members.contains_key(&m.name) {
                     return Err(TypeError::Redeclaration(m.name.clone()));
@@ -1363,11 +1539,16 @@ impl Checker {
                         Some(t) => self.ty_from_anno(t)?,
                         None => Ty::None,
                     },
-                    mut_self: false,
+                    self_convention: m.self_convention,
                 };
-                if sigs.insert(m.name.clone(), sig).is_some() {
+                let overloads = sigs.entry(m.name.clone()).or_default();
+                if overloads
+                    .iter()
+                    .any(|existing| same_method_shape(existing, &sig))
+                {
                     return Err(TypeError::Redeclaration(m.name.clone()));
                 }
+                overloads.push(sig);
             }
             Ok(sigs)
         })();
@@ -1473,12 +1654,17 @@ impl Checker {
                     Some(t) => self.ty_from_anno(t)?,
                     None => Ty::None,
                 },
-                mut_self: matches!(m.self_convention, Some(crate::ast::ArgConvention::Mut)),
+                self_convention: m.self_convention,
             };
             let info = self.structs.get_mut(name).expect("just registered");
-            if info.methods.insert(method_name.to_string(), sig).is_some() {
+            let overloads = info.methods.entry(method_name.to_string()).or_default();
+            if overloads
+                .iter()
+                .any(|existing| same_method_shape(existing, &sig))
+            {
                 return Err(TypeError::Redeclaration(method_name.to_string()));
             }
+            overloads.push(sig);
         }
         // `@fieldwise_init` and a hand-written `__init__` both define a constructor;
         // having both is a conflict (the decorator *generates* `__init__`).
@@ -1514,8 +1700,8 @@ impl Checker {
             .structs
             .get(name)
             .expect("registered before conformance");
-        for (mname, req_sig) in &trait_info.methods {
-            let got =
+        for (mname, req_sigs) in &trait_info.methods {
+            let got_sigs =
                 struct_info
                     .methods
                     .get(mname)
@@ -1524,23 +1710,25 @@ impl Checker {
                         trait_name: tr.to_string(),
                         method: mname.clone(),
                     })?;
-            // The requirement's `Self` becomes this struct's type. `mut_self` is
-            // not part of conformance checking yet, so mirror the implementation.
-            let want = MethodSig {
-                params: req_sig
-                    .params
-                    .iter()
-                    .map(|t| self.resolve_assoc_ty(&substitute_self(t, self_ty)))
-                    .collect(),
-                ret: self.resolve_assoc_ty(&substitute_self(&req_sig.ret, self_ty)),
-                mut_self: got.mut_self,
-            };
-            if *got != want {
-                return Err(TypeError::TraitMethodMismatch {
-                    struct_name: name.to_string(),
-                    trait_name: tr.to_string(),
-                    method: mname.clone(),
-                });
+            // The requirement's `Self` becomes this struct's type. Receiver
+            // conventions are part of the trait method contract.
+            for req_sig in req_sigs {
+                let want = MethodSig {
+                    params: req_sig
+                        .params
+                        .iter()
+                        .map(|t| self.resolve_assoc_ty(&substitute_self(t, self_ty)))
+                        .collect(),
+                    ret: self.resolve_assoc_ty(&substitute_self(&req_sig.ret, self_ty)),
+                    self_convention: req_sig.self_convention,
+                };
+                if !got_sigs.iter().any(|got| *got == want) {
+                    return Err(TypeError::TraitMethodMismatch {
+                        struct_name: name.to_string(),
+                        trait_name: tr.to_string(),
+                        method: mname.clone(),
+                    });
+                }
             }
         }
         for (member, req) in &trait_info.comptime_members {
@@ -1727,6 +1915,7 @@ impl Checker {
     /// field arguments; value parameters must be supplied explicitly.
     fn infer_construction(
         &self,
+        span: Span,
         name: &str,
         param_args: &[crate::ast::ParamArg],
         args: &[Expr],
@@ -1737,23 +1926,27 @@ impl Checker {
             .get(name)
             .expect("caller checked it is a struct");
         if !kwargs.is_empty() {
-            if args.is_empty()
-                && kwargs.len() == 1
-                && kwargs[0].name == "copy"
-                && let Some(sig) = info.methods.get("__copyinit__")
-            {
-                let params = sig.params.clone();
-                let decls = info.decls.clone();
-                if params.len() != 1 {
+            if args.is_empty() && kwargs.len() == 1 && kwargs[0].name == "copy" {
+                let Some(sig) = info
+                    .methods
+                    .get("__copyinit__")
+                    .and_then(|sigs| sigs.iter().find(|sig| sig.params.len() == 1))
+                else {
                     return Err(TypeError::BadCall {
                         func: name.to_string(),
-                        reason: "copy constructor must take exactly one 'copy' argument"
-                            .to_string(),
+                        reason: "no matching copy constructor".to_string(),
                     });
-                }
+                };
+                let params = sig.params.clone();
+                let decls = info.decls.clone();
                 let arg_ty = self.infer(&kwargs[0].value)?;
-                let (subst, tyargs) =
-                    self.resolve_use_params(name, &decls, param_args, &params, std::slice::from_ref(&arg_ty))?;
+                let (subst, tyargs) = self.resolve_use_params(
+                    name,
+                    &decls,
+                    param_args,
+                    &params,
+                    std::slice::from_ref(&arg_ty),
+                )?;
                 let expected = substitute(&params[0], &subst);
                 if !coerces(&arg_ty, &expected) {
                     return Err(TypeError::TypeMismatch {
@@ -1774,35 +1967,107 @@ impl Checker {
         // Takes precedence over `@fieldwise_init`. On a **generic** struct, the type
         // parameters are solved by unifying `__init__`'s parameter types against the
         // argument types — exactly as the fieldwise path unifies field types.
-        if let Some(sig) = info.methods.get("__init__") {
-            let params = sig.params.clone();
-            let decls = info.decls.clone();
-            if params.len() != args.len() {
-                return Err(TypeError::ArityMismatch {
-                    name: name.to_string(),
-                    expected: params.len(),
-                    got: args.len(),
-                });
+        if let Some(sigs) = info.methods.get("__init__") {
+            if sigs.len() == 1 {
+                let sig = &sigs[0];
+                let params = sig.params.clone();
+                let decls = info.decls.clone();
+                let arg_tys = args
+                    .iter()
+                    .map(|a| self.infer(a))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let (subst, tyargs) =
+                    self.resolve_use_params(name, &decls, param_args, &params, &arg_tys)?;
+                for (i, (aty, pty)) in arg_tys.iter().zip(&params).enumerate() {
+                    let expected = substitute(pty, &subst);
+                    if !coerces(aty, &expected) {
+                        return Err(TypeError::TypeMismatch {
+                            expected: expected.to_string(),
+                            found: aty.to_string(),
+                            context: format!("argument {} to '{}.__init__'", i + 1, name),
+                        });
+                    }
+                    // A constructor argument is bound into `self` by value — consuming.
+                    self.check_consuming(
+                        &args[i],
+                        aty,
+                        &format!("argument {} to '{}'", i + 1, name),
+                    )?;
+                }
+                return Ok(Ty::Struct(name.to_string(), tyargs));
             }
+            let decls = info.decls.clone();
             let arg_tys = args
                 .iter()
                 .map(|a| self.infer(a))
                 .collect::<Result<Vec<_>, _>>()?;
-            let (subst, tyargs) =
-                self.resolve_use_params(name, &decls, param_args, &params, &arg_tys)?;
-            for (i, (aty, pty)) in arg_tys.iter().zip(&params).enumerate() {
-                let expected = substitute(pty, &subst);
-                if !coerces(aty, &expected) {
-                    return Err(TypeError::TypeMismatch {
-                        expected: expected.to_string(),
-                        found: aty.to_string(),
-                        context: format!("argument {} to '{}.__init__'", i + 1, name),
+            let overloaded = sigs.len() > 1;
+            let mut matches = Vec::new();
+            for sig in sigs {
+                let params = sig.params.clone();
+                if params.len() != arg_tys.len() {
+                    continue;
+                }
+                if let Ok((subst, tyargs)) =
+                    self.resolve_use_params(name, &decls, param_args, &params, &arg_tys)
+                {
+                    let mut score = 0;
+                    let mut ok = true;
+                    for (aty, pty) in arg_tys.iter().zip(&params) {
+                        let expected = substitute(pty, &subst);
+                        if !coerces(aty, &expected) {
+                            ok = false;
+                            break;
+                        }
+                        if *aty != expected {
+                            score += 1;
+                        }
+                    }
+                    if ok {
+                        matches.push((score, sig.clone(), tyargs));
+                    }
+                }
+            }
+            let best = matches.iter().map(|(score, ..)| *score).min();
+            if let Some(best) = best {
+                let mut best_matches = matches
+                    .into_iter()
+                    .filter(|(score, ..)| *score == best)
+                    .collect::<Vec<_>>();
+                if best_matches.len() != 1 {
+                    return Err(TypeError::BadCall {
+                        func: name.to_string(),
+                        reason: "ambiguous overloaded constructor call".to_string(),
                     });
                 }
-                // A constructor argument is bound into `self` by value — consuming.
-                self.check_consuming(&args[i], aty, &format!("argument {} to '{}'", i + 1, name))?;
+                let (_, sig, tyargs) = best_matches.remove(0);
+                for (i, aty) in arg_tys.iter().enumerate() {
+                    // A constructor argument is bound into `self` by value — consuming.
+                    self.check_consuming(
+                        &args[i],
+                        aty,
+                        &format!("argument {} to '{}'", i + 1, name),
+                    )?;
+                }
+                if overloaded {
+                    self.overload_targets
+                        .borrow_mut()
+                        .insert(span, method_lowered_name(name, "__init__", &sig));
+                }
+                return Ok(Ty::Struct(name.to_string(), tyargs));
             }
-            return Ok(Ty::Struct(name.to_string(), tyargs));
+        }
+        if info.methods.contains_key("__init__") {
+            return Err(TypeError::ArityMismatch {
+                name: name.to_string(),
+                expected: info
+                    .methods
+                    .get("__init__")
+                    .and_then(|sigs| sigs.first())
+                    .map(|sig| sig.params.len())
+                    .unwrap_or(0),
+                got: args.len(),
+            });
         }
         if !info.fieldwise_init {
             return Err(TypeError::NoConstructor(name.to_string()));
@@ -1973,10 +2238,23 @@ impl Checker {
         Ok(())
     }
 
-    /// Bind `name` in the innermost scope, rejecting a same-scope redeclaration.
+    /// Bind `name` in the innermost scope. Repeated function declarations form an
+    /// overload set when their call shapes differ; other same-scope repeats remain
+    /// redeclarations.
     fn declare(&mut self, name: &str, ty: Ty) -> Result<(), TypeError> {
         let scope = self.scopes.last_mut().expect("scope stack is never empty");
-        if scope.contains_key(name) {
+        if let Some(existing) = scope.get_mut(name) {
+            if let Some(mut candidates) = overload_candidates(existing, &ty) {
+                if candidates
+                    .iter()
+                    .any(|candidate| same_callable_signature(candidate, &ty))
+                {
+                    return Err(TypeError::Redeclaration(name.to_string()));
+                }
+                candidates.push(ty);
+                *existing = Ty::Overload(candidates);
+                return Ok(());
+            }
             return Err(TypeError::Redeclaration(name.to_string()));
         }
         scope.insert(name.to_string(), ty);
@@ -1991,7 +2269,9 @@ impl Checker {
     /// a `for` header).
     fn inferred_binding_ty(&self, value_ty: &Ty, name: &str) -> Result<Ty, TypeError> {
         match value_ty {
-            Ty::Func { .. } | Ty::GenericFunc { .. } => Err(TypeError::ClosureEscape),
+            Ty::Func { .. } | Ty::GenericFunc { .. } | Ty::Overload(_) => {
+                Err(TypeError::ClosureEscape)
+            }
             Ty::Range => Err(TypeError::TypeMismatch {
                 expected: "a storable type".to_string(),
                 found: "range".to_string(),
@@ -2038,7 +2318,7 @@ impl Checker {
                 param_args,
                 args,
                 kwargs,
-            } => self.infer_call(name, param_args, args, kwargs),
+            } => self.infer_call(expr.span, name, param_args, args, kwargs),
             ExprKind::Member { object, field } => self.infer_member(object, field),
             ExprKind::MethodCall {
                 object,
@@ -2047,7 +2327,7 @@ impl Checker {
                 kwargs,
             } => {
                 reject_kwargs(kwargs)?;
-                self.infer_method_call(object, method, args)
+                self.infer_method_call(expr.span, object, method, args)
             }
             ExprKind::Index { object, index } => self.infer_index(object, index),
             // Transfer is identity for typing (ownership move is not modeled).
@@ -2230,8 +2510,9 @@ impl Checker {
                     let sig = info
                         .methods
                         .get("__setitem__")
+                        .and_then(|sigs| sigs.iter().find(|sig| sig.params.len() == 2))
                         .ok_or_else(|| TypeError::NotIndexable(obj_ty.to_string()))?;
-                    if !sig.mut_self {
+                    if !matches!(sig.self_convention, Some(crate::ast::ArgConvention::Mut)) {
                         return Err(TypeError::TypeMismatch {
                             expected: "a 'mut self' __setitem__".to_string(),
                             found: "read-only self".to_string(),
@@ -2375,6 +2656,7 @@ impl Checker {
     /// substituted to `T`.
     fn infer_method_call(
         &self,
+        span: Span,
         object: &Expr,
         method: &str,
         args: &[Expr],
@@ -2397,37 +2679,56 @@ impl Checker {
         // Resolve the method to a concrete signature (params + return + whether
         // it mutates `self`) for this receiver, substituting the receiver's type
         // arguments (struct) or `Self` (a bounded type parameter's trait method).
-        let resolved: Option<(Vec<Ty>, Ty, bool)> = match &obj_ty {
+        let resolved: Option<(Vec<Ty>, Ty, bool, Option<String>)> = match &obj_ty {
             Ty::Struct(sname, targs) => {
                 let info = self
                     .structs
                     .get(sname)
                     .expect("struct types are registered");
-                info.methods.get(method).map(|sig| {
+                info.methods.get(method).and_then(|sigs| {
+                    let overloaded = sigs.len() > 1;
                     let subst = struct_subst(&info.decls, targs);
-                    (
-                        sig.params.iter().map(|t| substitute(t, &subst)).collect(),
-                        substitute(&sig.ret, &subst),
-                        sig.mut_self,
-                    )
+                    let mut matches = Vec::new();
+                    for sig in sigs {
+                        let params: Vec<Ty> =
+                            sig.params.iter().map(|t| substitute(t, &subst)).collect();
+                        if let Ok(score) = self.score_args(&params, args) {
+                            matches.push((
+                                score,
+                                params,
+                                substitute(&sig.ret, &subst),
+                                matches!(sig.self_convention, Some(crate::ast::ArgConvention::Mut)),
+                                overloaded.then(|| method_lowered_name(sname, method, sig)),
+                            ));
+                        }
+                    }
+                    select_method_overload(method, matches)
+                        .map(|(_, params, ret, mut_self, target)| (params, ret, mut_self, target))
                 })
             }
-            Ty::Param { bounds, .. } => self.lookup_trait_method(bounds, method).map(|sig| {
-                (
-                    sig.params
-                        .iter()
-                        .map(|t| substitute_self(t, &obj_ty))
-                        .collect(),
-                    substitute_self(&sig.ret, &obj_ty),
-                    sig.mut_self,
-                )
-            }),
+            Ty::Param { bounds, .. } => {
+                self.lookup_trait_method(bounds, method, args.len())
+                    .map(|sig| {
+                        (
+                            sig.params
+                                .iter()
+                                .map(|t| substitute_self(t, &obj_ty))
+                                .collect(),
+                            substitute_self(&sig.ret, &obj_ty),
+                            matches!(sig.self_convention, Some(crate::ast::ArgConvention::Mut)),
+                            None,
+                        )
+                    })
+            }
             _ => None,
         };
-        let (params, ret, mut_self) = resolved.ok_or_else(|| TypeError::NoSuchMethod {
+        let (params, ret, mut_self, target) = resolved.ok_or_else(|| TypeError::NoSuchMethod {
             object_type: obj_ty.to_string(),
             method: method.to_string(),
         })?;
+        if let Some(target) = target {
+            self.overload_targets.borrow_mut().insert(span, target);
+        }
         // A `mut self` method mutates its receiver, so the receiver must be a
         // writable place (the mutation is written back to it): a variable, a
         // field/index chain, or `self` in a `mut self` method.
@@ -2452,6 +2753,31 @@ impl Checker {
             }
         }
         Ok(ret)
+    }
+
+    fn score_args(&self, params: &[Ty], args: &[Expr]) -> Result<usize, TypeError> {
+        if params.len() != args.len() {
+            return Err(TypeError::ArityMismatch {
+                name: "overload".to_string(),
+                expected: params.len(),
+                got: args.len(),
+            });
+        }
+        let mut score = 0;
+        for (arg, expected) in args.iter().zip(params) {
+            let aty = self.infer(arg)?;
+            if !coerces(&aty, expected) {
+                return Err(TypeError::TypeMismatch {
+                    expected: expected.to_string(),
+                    found: aty.to_string(),
+                    context: "overload candidate".to_string(),
+                });
+            }
+            if aty != *expected {
+                score += 1;
+            }
+        }
+        Ok(score)
     }
 
     /// Type a static method on a parameterized built-in type. Currently only
@@ -2533,7 +2859,11 @@ impl Checker {
             return None;
         };
         let info = self.structs.get(sname)?;
-        let sig = info.methods.get(name)?;
+        let sig = info
+            .methods
+            .get(name)?
+            .iter()
+            .find(|sig| sig.params.len() == args.len())?;
         let subst = struct_subst(&info.decls, targs);
         let params: Vec<Ty> = sig.params.iter().map(|t| substitute(t, &subst)).collect();
         if params.len() != args.len() {
@@ -2604,6 +2934,7 @@ impl Checker {
         let iter_sig = cinfo
             .methods
             .get("__iter__")
+            .and_then(|sigs| sigs.iter().find(|sig| sig.params.is_empty()))
             .ok_or_else(|| no_method(c_ty, "__iter__"))?;
         if !iter_sig.params.is_empty() {
             return Err(TypeError::ArityMismatch {
@@ -2634,6 +2965,7 @@ impl Checker {
         let len_sig = iinfo
             .methods
             .get("__len__")
+            .and_then(|sigs| sigs.iter().find(|sig| sig.params.is_empty()))
             .ok_or_else(|| no_method(&it_ty, "__len__"))?;
         let len_ret = substitute(&len_sig.ret, &isubst);
         if len_ret != Ty::Int {
@@ -2647,6 +2979,7 @@ impl Checker {
         let next_sig = iinfo
             .methods
             .get("__next__")
+            .and_then(|sigs| sigs.iter().find(|sig| sig.params.is_empty()))
             .ok_or_else(|| no_method(&it_ty, "__next__"))?;
         if !next_sig.params.is_empty() {
             return Err(TypeError::ArityMismatch {
@@ -2655,7 +2988,10 @@ impl Checker {
                 got: next_sig.params.len(),
             });
         }
-        if !next_sig.mut_self {
+        if !matches!(
+            next_sig.self_convention,
+            Some(crate::ast::ArgConvention::Mut)
+        ) {
             return Err(TypeError::TypeMismatch {
                 expected: "a 'mut self' __next__".to_string(),
                 found: "read-only self".to_string(),
@@ -2781,11 +3117,21 @@ impl Checker {
 
     /// Find a `method` required by any of the given trait `bounds` (a bounded
     /// type parameter's usable methods). Built-in bounds contribute none.
-    fn lookup_trait_method(&self, bounds: &[String], method: &str) -> Option<MethodSig> {
+    fn lookup_trait_method(
+        &self,
+        bounds: &[String],
+        method: &str,
+        argc: usize,
+    ) -> Option<MethodSig> {
         bounds
             .iter()
             .filter_map(|b| self.traits.get(b))
-            .find_map(|info| info.methods.get(method).cloned())
+            .find_map(|info| {
+                info.methods
+                    .get(method)
+                    .and_then(|sigs| sigs.iter().find(|sig| sig.params.len() == argc))
+                    .cloned()
+            })
     }
 
     /// Find a type-valued associated comptime member required by any of the
@@ -2850,8 +3196,11 @@ impl Checker {
             Add | Sub | Mul | FloorDiv | Mod | Pow => common,
             // True division always yields Float64 (for any numeric operands).
             Div if common.is_some() => Some(Ty::Float64),
-            // Ordering between numbers.
-            Lt | Gt | Le | Ge if common.is_some() => Some(Ty::Bool),
+            // Ordering between numbers, or between equal opaque type parameters
+            // whose bound promises an ordering (`T: Comparable`).
+            Lt | Gt | Le | Ge if common.is_some() || (lt == rt && has_order_bound(&lt)) => {
+                Some(Ty::Bool)
+            }
             // Equality: between numbers (any common type), or equal non-numeric
             // scalars (Bool/String/None).
             Eq | Ne
@@ -3024,6 +3373,7 @@ impl Checker {
 
     fn infer_call(
         &self,
+        span: Span,
         name: &str,
         param_args: &[crate::ast::ParamArg],
         args: &[Expr],
@@ -3035,7 +3385,7 @@ impl Checker {
             // isn't shadowed by a binding.
             None => match name {
                 _ if self.structs.contains_key(name) => {
-                    return self.infer_construction(name, param_args, args, kwargs);
+                    return self.infer_construction(span, name, param_args, args, kwargs);
                 }
                 _ if !kwargs.is_empty() => {
                     return Err(TypeError::BadCall {
@@ -3063,6 +3413,44 @@ impl Checker {
                 _ => return Err(TypeError::UndefinedVariable(name.to_string())),
             },
         };
+        if let Ty::Overload(candidates) = ty {
+            let mut matches = Vec::new();
+            for candidate in candidates {
+                if let Ok((ret, score)) =
+                    self.infer_callable_ty(name, candidate.clone(), param_args, args, kwargs)
+                {
+                    if let Some(target) = callable_lowered_name(name, &candidate) {
+                        matches.push((ret, score, target));
+                    }
+                }
+            }
+            return match select_callable_overload(matches) {
+                Ok((ret, target)) => {
+                    self.overload_targets.borrow_mut().insert(span, target);
+                    Ok(ret)
+                }
+                Err(OverloadSelect::NoMatch) => Err(TypeError::BadCall {
+                    func: name.to_string(),
+                    reason: "no overload matches the supplied arguments".to_string(),
+                }),
+                Err(OverloadSelect::Ambiguous) => Err(TypeError::BadCall {
+                    func: name.to_string(),
+                    reason: "ambiguous overloaded call".to_string(),
+                }),
+            };
+        }
+        self.infer_callable_ty(name, ty, param_args, args, kwargs)
+            .map(|(ret, _)| ret)
+    }
+
+    fn infer_callable_ty(
+        &self,
+        name: &str,
+        ty: Ty,
+        param_args: &[crate::ast::ParamArg],
+        args: &[Expr],
+        kwargs: &[crate::ast::KwArg],
+    ) -> Result<(Ty, usize), TypeError> {
         let (params, names, ret, required, variadic, conventions) = match ty {
             // A non-generic function takes no compile-time parameters.
             Ty::Func {
@@ -3090,7 +3478,9 @@ impl Checker {
                         "keyword arguments to a generic function".to_string(),
                     ));
                 }
-                return self.infer_generic_call(name, &decls, &params, &ret, param_args, args);
+                return self
+                    .infer_generic_call(name, &decls, &params, &ret, param_args, args)
+                    .map(|ret| (ret, 0));
             }
             other => {
                 return Err(TypeError::NotCallable {
@@ -3114,6 +3504,7 @@ impl Checker {
             variadic.is_some(),
         )
         .map_err(|e| e.into_type_error(name))?;
+        let mut score = 0;
         for (i, slot) in slots.iter().enumerate() {
             let arg = match slot {
                 ArgSlot::Positional(p) => &args[*p],
@@ -3127,6 +3518,9 @@ impl Checker {
                     found: arg_ty.to_string(),
                     context: format!("argument '{}' to '{}'", names[i], name),
                 });
+            }
+            if arg_ty != params[i] {
+                score += 1;
             }
             // Only an `owned`/`deinit` parameter *consumes* its argument (moving the
             // value in). `read` (the default), `mut`, and `ref` all **borrow** — no
@@ -3153,6 +3547,9 @@ impl Checker {
                         context: format!("variadic argument to '{}'", name),
                     });
                 }
+                if arg_ty != **elem {
+                    score += 1;
+                }
             }
         }
 
@@ -3161,7 +3558,7 @@ impl Checker {
         // borrowed again — mutably, shared, or moved.
         check_call_aliasing(&slots, &conventions, args, kwargs)?;
 
-        Ok(*ret)
+        Ok((*ret, score))
     }
 
     /// Type a call to a generic function: solve its type parameters from the
@@ -3299,6 +3696,12 @@ impl Checker {
         // must return `Int`.
         if let Some(r) = self.struct_dunder(&tys[0], "__len__", &[]) {
             return r.and_then(|ret| require_dunder_ret(ret, &Ty::Int, "__len__"));
+        }
+        // `len(x)` on an opaque type parameter is permitted when its bound
+        // promises a length (`T: Sized`) — the concrete type's `__len__` runs at
+        // runtime after type erasure.
+        if has_len_bound(&tys[0]) {
+            return Ok(Ty::Int);
         }
         Err(TypeError::TypeMismatch {
             expected: "String or List".to_string(),
@@ -3591,6 +3994,12 @@ fn substitute(ty: &Ty, subst: &HashMap<String, Ty>) -> Ty {
             variadic: variadic.as_ref().map(|v| Box::new(substitute(v, subst))),
             conventions: conventions.clone(),
         },
+        Ty::Overload(candidates) => Ty::Overload(
+            candidates
+                .iter()
+                .map(|candidate| substitute(candidate, subst))
+                .collect(),
+        ),
         _ => ty.clone(),
     }
 }
@@ -3636,6 +4045,12 @@ fn substitute_self(ty: &Ty, replacement: &Ty) -> Ty {
                 .map(|v| Box::new(substitute_self(v, replacement))),
             conventions: conventions.clone(),
         },
+        Ty::Overload(candidates) => Ty::Overload(
+            candidates
+                .iter()
+                .map(|candidate| substitute_self(candidate, replacement))
+                .collect(),
+        ),
         _ => ty.clone(),
     }
 }
@@ -4001,6 +4416,31 @@ fn has_equality_bound(ty: &Ty) -> bool {
                 "Equatable" | "Comparable" | "Hashable" | "EqualityComparable"
             )
         }),
+        _ => false,
+    }
+}
+
+/// Whether an opaque type parameter carries a bound that promises an ordering
+/// (`<`/`<=`/`>`/`>=`). Only `Comparable` grants this — a plain `T: Equatable`
+/// permits `==`/`!=` but *not* ordering (see `has_equality_bound`). In current
+/// Mojo `Comparable` also implies equality, which `has_equality_bound` reflects.
+fn has_order_bound(ty: &Ty) -> bool {
+    match ty {
+        Ty::Param { bounds, .. } => bounds.iter().any(|b| b.as_str() == "Comparable"),
+        _ => false,
+    }
+}
+
+/// Whether an opaque type parameter carries a bound that promises a length, so
+/// `len(x)` is well-typed on it. `Sized` (`__len__(self) -> Int`) and
+/// `SizedRaising` (`__len__(self) raises -> Int`) both do — mojo-lite's effect
+/// analysis is deferred, so the two are not distinguished at the call site; a
+/// plain `T: AnyType` grants no length.
+fn has_len_bound(ty: &Ty) -> bool {
+    match ty {
+        Ty::Param { bounds, .. } => bounds
+            .iter()
+            .any(|b| matches!(b.as_str(), "Sized" | "SizedRaising")),
         _ => false,
     }
 }

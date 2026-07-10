@@ -533,6 +533,7 @@ fn parses_trait_with_method_requirements() {
             methods: vec![
                 TraitMethod {
                     name: "quack".into(),
+                    self_convention: None,
                     params: vec![],
                     positional_only: None,
                     keyword_only: None,
@@ -541,6 +542,7 @@ fn parses_trait_with_method_requirements() {
                 },
                 TraitMethod {
                     name: "volume".into(),
+                    self_convention: None,
                     params: vec![fnparam("loud", Type::Bool)],
                     positional_only: None,
                     keyword_only: None,
@@ -551,6 +553,22 @@ fn parses_trait_with_method_requirements() {
             comptime_members: vec![],
         })
     );
+}
+
+#[test]
+fn parses_trait_receiver_conventions() {
+    let stmts = parse(
+        "trait Receivers:\n    def read_it(self):\n        ...\n    def mutate(mut self):\n        ...\n    def consume(owned self):\n        ...\n    def borrow(ref self):\n        ...\n",
+    );
+    match &stmts[0].kind {
+        StmtKind::Trait { methods, .. } => {
+            assert_eq!(methods[0].self_convention, None);
+            assert_eq!(methods[1].self_convention, Some(ArgConvention::Mut));
+            assert_eq!(methods[2].self_convention, Some(ArgConvention::Owned));
+            assert_eq!(methods[3].self_convention, Some(ArgConvention::Ref));
+        }
+        other => panic!("expected a trait, got {:?}", other),
+    }
 }
 
 #[test]

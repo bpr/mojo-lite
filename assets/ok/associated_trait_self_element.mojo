@@ -1,6 +1,6 @@
 trait Iterator:
     comptime Element: AnyType
-    def __next__(self) -> Self.Element:
+    def __next__(mut self) -> Self.Element:
         ...
 
 @fieldwise_init

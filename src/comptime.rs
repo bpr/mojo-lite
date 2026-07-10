@@ -715,8 +715,9 @@ impl<'a> Elab<'a> {
         for (decl, arg) in f.ct_params.iter().zip(param_args) {
             let value = self.resolve_ct_arg(decl, arg, scope)?;
             if let ParamDecl::Value { name } = decl
-                && !matches!(value, CtValue::Type(_)) {
-                    value_params.push((name.clone(), ct_to_vm(&value)?));
+                && !matches!(value, CtValue::Type(_))
+            {
+                value_params.push((name.clone(), ct_to_vm(&value)?));
             }
             locals.insert(decl.name().to_string(), value);
         }

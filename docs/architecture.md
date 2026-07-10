@@ -110,6 +110,10 @@ exports top-level `def`, `struct`, `trait`, and `comptime` declarations, except
 that a module's `main` is not exported. Top-level executable statements from an
 imported module are not run.
 
+An imported overloaded function is still one exported source name. After linking,
+the checker sees all same-name `def` declarations in order and builds the
+overload set in the ordinary flat program scope.
+
 Plain `import module` is parsed but still acts as a no-op because qualified
 `module.Name` lookup is not modeled yet. Aliases are also deferred.
 
@@ -272,6 +276,12 @@ Entry point:
 checker::check(program: &[Stmt]) -> Result<(), TypeError>
 ```
 
+Related entry point used by MIR lowering:
+
+```rust
+checker::resolve_overload_targets(program: &[Stmt]) -> Result<HashMap<Span, String>, TypeError>
+```
+
 The checker consumes the parsed AST and rejects programs that the later compiler
 does not want to reason about.
 
@@ -281,7 +291,9 @@ It is responsible for:
 - builtin scalar types
 - struct declarations and field layouts
 - function and method signatures
+- overload sets and selected overload targets
 - trait declarations and a limited trait-conformance model
+- trait receiver conventions and associated compile-time facts
 - type parameters and value parameters
 - call argument matching
 - default, keyword, and variadic arguments where supported
@@ -298,6 +310,44 @@ semantically implemented, this is where it should normally become
 Examples of syntax that may parse before it is fully implemented include richer
 trait features, `with`, t-strings, and advanced expression/declaration forms that
 the VM does not yet execute.
+
+### Overload Resolution
+
+Top-level functions, methods, trait requirements, and constructors may form
+overload sets. The checker represents a repeated top-level `def` name as
+`Ty::Overload(Vec<Ty>)`; struct and trait methods use a per-name list of
+`MethodSig`s.
+
+Duplicate-equivalent signatures are rejected. Distinct arities are naturally
+different signatures, and same-arity signatures are allowed when their parameter
+types differ.
+
+At a call site the checker:
+
+1. collects the candidates for the source name
+2. filters candidates by call shape, explicit type/value arguments, and argument
+   type compatibility
+3. scores surviving candidates by how many argument coercions they need
+4. accepts the unique lowest-score candidate
+5. rejects no-match and tied-best cases
+
+This deliberately conservative ranking gives useful Mojo-like behavior without
+pretending to implement the complete Mojo overload lattice. For example, a
+typed `String` value selects `f(x: String)` over `f(x: Int)`, and an exact
+`Int` argument selects `f(x: Int)` over a candidate requiring widening. A bare
+integer literal passed to both `f(Int)` and `f(Float64)` is ambiguous because it
+can materialize as either.
+
+The important architecture point is that overload selection is static. The VM
+does not inspect runtime value tags to choose between same-arity candidates.
+Instead, the checker records a side table:
+
+```text
+source span -> lowered callee name
+```
+
+MIR lowering consults that table when it sees an overloaded call expression.
+This preserves the checker-selected callee through lowering and execution.
 
 ### Borrow Checking In The Checker
 
@@ -663,9 +713,43 @@ MIR calls keep the information the VM needs for Mojo-style conventions:
 - keyword argument registers
 - simple caller places for `mut`/`ref` write-back
 - compile-time parameter argument registers for value parameters
+- the resolved lowered callee name when the checker selected an overload
 
 For method calls, MIR also records whether the receiver was a writable place.
 That lets a `mut self` method write the mutated receiver back to the caller.
+For overloaded method calls, MIR also carries the resolved function name, such as
+`Counter.bump$ov$Int`, so the VM does not have to reconstruct type-directed
+dispatch dynamically.
+
+### Overloaded Names In MIR
+
+Overloaded definitions lower to stable signature-based names. The source name is
+kept for non-overloaded declarations, but an overload set uses names of the form:
+
+```text
+function$ov$ParamType$OtherParamType
+Struct.method$ov$ParamType
+Struct.__init__$ov$ParamType
+```
+
+For example:
+
+```mojo
+def choose(x: Int) -> Int: ...
+def choose(x: String) -> String: ...
+```
+
+lowers to functions named roughly:
+
+```text
+choose$ov$Int
+choose$ov$String
+```
+
+This is intentionally a lowered compiler name, not source syntax. It gives MIR
+and the VM a stable identity for each candidate, including same-arity overloads.
+It also keeps arity overloads and type overloads on one mechanism instead of
+special-casing `name#arity`.
 
 ### Try In MIR
 
@@ -883,6 +967,8 @@ The VM builds a `Prog` containing:
 - function signatures
 - default arguments
 - value-parameter declarations
+- signature-mangled overload definitions and fallback lookup for unique arity
+  protocol calls
 
 Some of this metadata is still recovered from the AST because MIR intentionally
 does not yet carry every declaration fact. Over time, more of this should migrate
@@ -904,6 +990,14 @@ Calling a function:
 `mut` and `ref` parameters are implemented by write-back. The caller supplies a
 simple place for such arguments. After the callee returns, the VM copies the
 callee's final parameter value back into the caller place.
+
+Overloaded function calls arrive at the VM already resolved to a lowered
+signature name. For constructor overloads, a direct resolved callee such as
+`Box.__init__$ov$String` still enters the constructor path: the VM creates the
+uninitialized `self` skeleton, invokes the selected `__init__`, and returns the
+initialized struct. Internal dunder/protocol paths that do not have a source call
+span can still ask for a unique overload by source name and arity; this is a
+fallback for compiler-generated calls, not the general overload-ranking engine.
 
 ### Method Calls
 
@@ -1088,6 +1182,9 @@ The main pressure points are:
   entry-helper fact folding
 - the compile-time value universe still needs to grow toward Mojo-style
   type-level values, declaration generation, and richer specialization
+- overload resolution now supports arity and conservative type-directed
+  selection, but Mojo's full ranking, implicit-conversion, and generic-overload
+  ordering rules remain future work
 - more declaration facts should move out of VM-side AST registries
 - the module system is useful but intentionally simple: no qualified
   `import module` lookup, aliases, packages, or imported top-level execution

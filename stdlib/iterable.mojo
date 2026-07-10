@@ -6,7 +6,7 @@ trait Iterator:
     def __len__(self) -> Int:
         ...
 
-    def __next__(self) -> Self.Element:
+    def __next__(mut self) -> Self.Element:
         ...
 
 trait Iterable:

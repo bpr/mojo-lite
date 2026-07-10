@@ -608,6 +608,28 @@ fn accepts_calling_bound_trait_method_on_type_parameter() {
 }
 
 #[test]
+fn accepts_trait_receiver_convention_requirements() {
+    ok(
+        "trait Bumpable:\n    def bump(mut self):\n        ...\n\n@fieldwise_init\nstruct Counter(Bumpable):\n    var n: Int\n\n    def bump(mut self):\n        self.n = self.n + 1\n\ndef inc[T: Bumpable](mut x: T):\n    x.bump()\n",
+    );
+    ok(
+        "trait Consumable:\n    def consume(owned self):\n        ...\n\n@fieldwise_init\nstruct Box(Consumable):\n    var n: Int\n\n    def consume(owned self):\n        pass\n",
+    );
+}
+
+#[test]
+fn rejects_trait_receiver_convention_mismatch() {
+    let e = err(
+        "trait Bumpable:\n    def bump(mut self):\n        ...\n\n@fieldwise_init\nstruct Counter(Bumpable):\n    var n: Int\n\n    def bump(self):\n        pass\n",
+    );
+    assert!(
+        matches!(e, TypeError::TraitMethodMismatch { .. }),
+        "got {:?}",
+        e
+    );
+}
+
+#[test]
 fn rejects_argument_not_conforming_to_bound() {
     let e = err(&format!(
         "{QUACK}@fieldwise_init\nstruct Cat:\n    var n: Int\n\nvar s: String = make_it_quack(Cat(1))\n"
@@ -2137,6 +2159,48 @@ fn generic_hand_written_init() {
         err(
             "struct Box[T: Copyable & Movable]:\n    var v: Self.T\n    def __init__(out self, v: Self.T):\n        self.v = v\n\ndef main():\n    var a: Box[Int] = Box[Int](\"no\")\n"
         ),
+        TypeError::TypeMismatch { .. }
+    ));
+}
+
+#[test]
+fn comparable_bound_permits_ordering() {
+    // `<`/`<=`/`>`/`>=` between equal opaque type parameters type-check when the
+    // parameter is bounded by `Comparable` (Phase 4).
+    ok("def less[T: Comparable](a: T, b: T) -> Bool:\n    return a < b\n");
+    ok(
+        "def ordered[T: Comparable](a: T, b: T) -> Bool:\n    return a < b and a <= b and a > b and a >= b\n",
+    );
+    // `Comparable` implies equality-capable in mojo-lite (as in current Mojo).
+    ok("def eq[T: Comparable](a: T, b: T) -> Bool:\n    return a == b\n");
+}
+
+#[test]
+fn equatable_bound_does_not_permit_ordering() {
+    // A plain `T: Equatable` grants `==`/`!=` but *not* ordering — `<` on such a
+    // `T` is a `BadOperator` (Phase 4).
+    ok("def eq[T: Equatable](a: T, b: T) -> Bool:\n    return a == b\n");
+    assert!(matches!(
+        err("def less[T: Equatable](a: T, b: T) -> Bool:\n    return a < b\n"),
+        TypeError::BadOperator { .. }
+    ));
+}
+
+#[test]
+fn sized_bound_permits_len() {
+    // `len(x)` on an opaque type parameter type-checks when the parameter carries
+    // a `Sized` bound (Phase 5). `SizedRaising` also promises a length.
+    ok("def is_empty[T: Sized](x: T) -> Bool:\n    return len(x) == 0\n");
+    ok("def sz[T: Sized](x: T) -> Int:\n    return len(x)\n");
+    ok("def szr[T: SizedRaising](x: T) -> Int:\n    return len(x)\n");
+}
+
+#[test]
+fn any_type_bound_does_not_permit_len() {
+    // A plain `T: AnyType` promises no length — `len(x)` on it is a type error
+    // (Phase 5 stop point: `Sized` enables container helpers, `AnyType` does not).
+    assert!(matches!(
+        err("def is_empty[T: AnyType](x: T) -> Bool:\n    return len(x) == 0\n"),
         TypeError::TypeMismatch { .. }
     ));
 }

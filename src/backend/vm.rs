@@ -27,7 +27,10 @@
 //! with keyword/default/variadic args, and nested `def`/`struct`.
 
 use super::Backend;
-use crate::ast::{ArgConvention, Expr, ExprKind, ParamKind, PrefixOp, Stmt, StmtKind, Type};
+use crate::ast::{
+    ArgConvention, Expr, ExprKind, FnParam, Method, ParamArg, ParamKind, PrefixOp, Stmt, StmtKind,
+    Type,
+};
 use crate::checker::{ArgSlot, match_call_slots};
 use crate::error::RuntimeError;
 use crate::hir::VarId;
@@ -103,6 +106,26 @@ impl Prog {
     /// decide whether copy/move needs the lifecycle-method path at all.
     fn defines(&self, suffix: &str) -> bool {
         self.mir.functions.iter().any(|(n, _)| n.ends_with(suffix))
+    }
+
+    fn overload_name(&self, name: &str, argc: usize) -> String {
+        if self.index_of(name).is_some() {
+            return name.to_string();
+        }
+        let expected_params = if name.contains('.') { argc + 1 } else { argc };
+        let prefix = format!("{name}$ov$");
+        let mut matches = self
+            .mir
+            .functions
+            .iter()
+            .filter(|(fname, f)| fname.starts_with(&prefix) && f.n_params == expected_params)
+            .map(|(fname, _)| fname.clone())
+            .collect::<Vec<_>>();
+        if matches.len() == 1 {
+            matches.remove(0)
+        } else {
+            name.to_string()
+        }
     }
 }
 
@@ -309,7 +332,8 @@ impl VmBackend {
         method: &str,
         args: Vec<Value>,
     ) -> Result<Value, RuntimeError> {
-        let fname = format!("{sname}.{method}");
+        let source_fname = format!("{sname}.{method}");
+        let fname = prog.overload_name(&source_fname, args.len().saturating_sub(1));
         let idx = prog.index_of(&fname).ok_or_else(|| {
             RuntimeError::Unsupported(format!("vm: struct '{sname}' has no method '{method}'"))
         })?;
@@ -364,7 +388,7 @@ impl VmBackend {
         let Value::Struct { name, .. } = &recv else {
             unreachable!("store_index_dunder is only called on a struct container");
         };
-        let fname = format!("{name}.__setitem__");
+        let fname = prog.overload_name(&format!("{name}.__setitem__"), 2);
         let fidx = prog.index_of(&fname).ok_or_else(|| {
             RuntimeError::Unsupported(format!("vm: struct '{name}' has no method '__setitem__'"))
         })?;
@@ -383,6 +407,7 @@ impl VmBackend {
         &mut self,
         prog: &Prog,
         name: &str,
+        target: Option<&str>,
         args: Vec<Value>,
         param_vals: &[Option<Value>],
     ) -> Result<Value, RuntimeError> {
@@ -405,7 +430,11 @@ impl VmBackend {
             value_params,
         };
         let fidx = prog
-            .index_of(&format!("{name}.__init__"))
+            .index_of(
+                &target
+                    .map(str::to_string)
+                    .unwrap_or_else(|| prog.overload_name(&format!("{name}.__init__"), args.len())),
+            )
             .expect("caller checked __init__ is present");
         let mut call_args = Vec::with_capacity(args.len() + 1);
         call_args.push(skeleton);
@@ -717,6 +746,7 @@ impl VmBackend {
                 dest,
                 recv,
                 method,
+                resolved,
                 args,
                 recv_place,
                 arg_places,
@@ -724,7 +754,15 @@ impl VmBackend {
                 let recv_val = regs[recv.0 as usize].clone();
                 let argv: Vec<Value> = args.iter().map(|r| regs[r.0 as usize].clone()).collect();
                 regs[dest.0 as usize] = self.method_call(
-                    prog, recv_val, method, argv, recv_place, arg_places, regs, vars,
+                    prog,
+                    recv_val,
+                    method,
+                    resolved.as_deref(),
+                    argv,
+                    recv_place,
+                    arg_places,
+                    regs,
+                    vars,
                 )?;
             }
             MirInstr::GetField { dest, base, field } => {
@@ -860,7 +898,10 @@ impl VmBackend {
                         break;
                     };
                     let sname = name.clone();
-                    if prog.index_of(&format!("{sname}.__next__")).is_some() {
+                    if prog
+                        .index_of(&prog.overload_name(&format!("{sname}.__next__"), 0))
+                        .is_some()
+                    {
                         break;
                     }
                     let it = vars[slot].clone();
@@ -908,9 +949,13 @@ impl VmBackend {
                 if let Value::Struct { name, .. } = &vars[slot] {
                     let sname = name.clone();
                     let it = vars[slot].clone();
-                    let fidx = prog.index_of(&format!("{sname}.__next__")).ok_or_else(|| {
-                        RuntimeError::Unsupported(format!("vm: struct '{sname}' has no '__next__'"))
-                    })?;
+                    let fidx = prog
+                        .index_of(&prog.overload_name(&format!("{sname}.__next__"), 0))
+                        .ok_or_else(|| {
+                            RuntimeError::Unsupported(format!(
+                                "vm: struct '{sname}' has no '__next__'"
+                            ))
+                        })?;
                     let (ret, frame_vars) = self.call_frame(prog, fidx, vec![it], &[])?;
                     vars[slot] = frame_vars.into_iter().next().unwrap_or(Value::None);
                     regs[dest.0 as usize] = ret;
@@ -1120,6 +1165,7 @@ impl VmBackend {
         prog: &Prog,
         recv: Value,
         method: &str,
+        resolved: Option<&str>,
         args: Vec<Value>,
         recv_place: &Option<MirPlace>,
         arg_places: &[Option<MirPlace>],
@@ -1150,7 +1196,11 @@ impl VmBackend {
                 ))),
             },
             Value::Struct { name, .. } => {
-                let fname = format!("{name}.{method}");
+                let method_argc = args.len();
+                let source_fname = format!("{name}.{method}");
+                let fname = resolved
+                    .map(str::to_string)
+                    .unwrap_or_else(|| prog.overload_name(&source_fname, method_argc));
                 let fidx = prog.index_of(&fname).ok_or_else(|| {
                     RuntimeError::Unsupported(format!("vm: unknown method '{fname}'"))
                 })?;
@@ -1180,10 +1230,14 @@ impl VmBackend {
                     }
                 }
                 // `mut self`: write the (possibly mutated) receiver back.
-                let is_mut = prog
-                    .structs
-                    .get(name)
-                    .is_some_and(|d| d.mut_self_methods.contains(method));
+                let is_mut = prog.structs.get(name).is_some_and(|d| {
+                    let key = if fname != source_fname {
+                        fname.as_str()
+                    } else {
+                        method
+                    };
+                    d.mut_self_methods.contains(key)
+                });
                 if is_mut && let Some(place) = recv_place {
                     *nav_mut(vars, regs, place)? = frame_vars[0].clone();
                 }
@@ -1245,6 +1299,16 @@ impl VmBackend {
             return Err(RuntimeError::Unsupported(format!(
                 "vm: keyword arguments to '{name}' are not supported"
             )));
+        }
+        if let Some((struct_name, _)) = name.split_once(".__init__$ov$")
+            && prog.structs.contains_key(struct_name)
+        {
+            if !kwargs.is_empty() {
+                return Err(RuntimeError::Unsupported(format!(
+                    "vm: keyword arguments to '{struct_name}' are not supported"
+                )));
+            }
+            return self.construct_via_init(prog, struct_name, Some(name), args, param_vals);
         }
         match name {
             "print" => {
@@ -1311,8 +1375,11 @@ impl VmBackend {
             _ if prog.structs.contains_key(name) => {
                 if !kwargs.is_empty() {
                     self.construct_via_copy(prog, name, args, kwargs, param_vals)
-                } else if prog.index_of(&format!("{name}.__init__")).is_some() {
-                    self.construct_via_init(prog, name, args, param_vals)
+                } else if prog
+                    .index_of(&prog.overload_name(&format!("{name}.__init__"), args.len()))
+                    .is_some()
+                {
+                    self.construct_via_init(prog, name, None, args, param_vals)
                 } else {
                     construct(&prog.structs[name], name, args, param_vals)
                 }
@@ -1418,6 +1485,7 @@ fn build_prog(program: &[Stmt]) -> Prog {
 /// Build the struct registry from the program's top-level `struct` declarations.
 fn build_structs(program: &[Stmt]) -> HashMap<String, StructDef> {
     let mut map = HashMap::new();
+    let method_overloads = method_overloads(program);
     for s in program {
         if let StmtKind::Struct {
             name,
@@ -1431,7 +1499,15 @@ fn build_structs(program: &[Stmt]) -> HashMap<String, StructDef> {
             let mut_self_methods = methods
                 .iter()
                 .filter(|m| matches!(m.self_convention, Some(ArgConvention::Mut)))
-                .map(|m| m.name.clone())
+                .map(|m| {
+                    let method_name = lifecycle_method_name(m);
+                    let source = format!("{name}.{method_name}");
+                    if method_overloads.contains_key(&source) {
+                        overloaded_method_name(&source, &m.params, &method_overloads)
+                    } else {
+                        method_name.to_string()
+                    }
+                })
                 .collect();
             map.insert(
                 name.clone(),
@@ -1453,6 +1529,7 @@ fn build_structs(program: &[Stmt]) -> HashMap<String, StructDef> {
 /// Build the calling-signature registry from the program's top-level `def`s.
 fn build_sigs(program: &[Stmt]) -> HashMap<String, FnSig> {
     let mut map = HashMap::new();
+    let overloads = top_level_overloads(program);
     for s in program {
         if let StmtKind::Def {
             name,
@@ -1469,8 +1546,9 @@ fn build_sigs(program: &[Stmt]) -> HashMap<String, FnSig> {
                 .unwrap_or(params.len());
             let regular = &params[..nreg];
             let required = regular.iter().take_while(|p| p.default.is_none()).count();
+            let lowered_name = overloaded_def_name(name, params, &overloads);
             map.insert(
-                name.clone(),
+                lowered_name,
                 FnSig {
                     param_names: regular.iter().map(|p| p.name.clone()).collect(),
                     param_types: regular.iter().map(|p| p.ty.clone()).collect(),
@@ -1486,6 +1564,151 @@ fn build_sigs(program: &[Stmt]) -> HashMap<String, FnSig> {
         }
     }
     map
+}
+
+fn top_level_overloads(program: &[Stmt]) -> HashMap<String, std::collections::HashSet<usize>> {
+    let mut counts: HashMap<String, Vec<usize>> = HashMap::new();
+    for stmt in program {
+        if let StmtKind::Def { name, params, .. } = &stmt.kind {
+            counts.entry(name.clone()).or_default().push(params.len());
+        }
+    }
+    counts
+        .into_iter()
+        .filter_map(|(name, arities)| {
+            if arities.len() > 1 {
+                Some((name, arities.into_iter().collect()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn method_overloads(program: &[Stmt]) -> HashMap<String, std::collections::HashSet<usize>> {
+    let mut counts: HashMap<String, Vec<usize>> = HashMap::new();
+    for stmt in program {
+        if let StmtKind::Struct { name, methods, .. } = &stmt.kind {
+            for method in methods {
+                let method_name = lifecycle_method_name(method);
+                counts
+                    .entry(format!("{name}.{method_name}"))
+                    .or_default()
+                    .push(method.params.len());
+            }
+        }
+    }
+    counts
+        .into_iter()
+        .filter_map(|(name, arities)| {
+            if arities.len() > 1 {
+                Some((name, arities.into_iter().collect()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn lifecycle_method_name(m: &Method) -> &str {
+    if is_mojo_copy_constructor(m) {
+        "__copyinit__"
+    } else {
+        &m.name
+    }
+}
+
+fn is_mojo_copy_constructor(m: &Method) -> bool {
+    m.name == "__init__"
+        && m.has_self
+        && matches!(m.self_convention, Some(ArgConvention::Out))
+        && m.positional_only.is_none()
+        && m.keyword_only == Some(0)
+        && m.params.len() == 1
+        && m.params[0].name == "copy"
+        && m.params[0].default.is_none()
+        && m.params[0].kind == ParamKind::Regular
+        && m.params[0].convention.is_none()
+        && matches!(m.params[0].ty, Type::SelfType)
+        && m.ret.is_none()
+}
+
+fn overloaded_def_name(
+    name: &str,
+    params: &[FnParam],
+    overloads: &HashMap<String, std::collections::HashSet<usize>>,
+) -> String {
+    if overloads
+        .get(name)
+        .is_some_and(|arities| arities.contains(&params.len()))
+    {
+        format!("{name}{}", signature_suffix(params.iter().map(|p| &p.ty)))
+    } else {
+        name.to_string()
+    }
+}
+
+fn overloaded_method_name(
+    name: &str,
+    params: &[FnParam],
+    overloads: &HashMap<String, std::collections::HashSet<usize>>,
+) -> String {
+    if overloads
+        .get(name)
+        .is_some_and(|arities| arities.contains(&params.len()))
+    {
+        format!("{name}{}", signature_suffix(params.iter().map(|p| &p.ty)))
+    } else {
+        name.to_string()
+    }
+}
+
+fn signature_suffix<'a>(params: impl IntoIterator<Item = &'a Type>) -> String {
+    let parts = params
+        .into_iter()
+        .map(type_mangle)
+        .collect::<Vec<_>>()
+        .join("$");
+    format!("$ov${parts}")
+}
+
+fn type_mangle(ty: &Type) -> String {
+    let raw = match ty {
+        Type::Int => "Int".to_string(),
+        Type::UInt => "UInt".to_string(),
+        Type::Bool => "Bool".to_string(),
+        Type::String => "String".to_string(),
+        Type::Float64 => "Float64".to_string(),
+        Type::None => "None".to_string(),
+        Type::Named(name, args) => {
+            let mut s = name.clone();
+            for arg in args {
+                s.push('$');
+                match arg {
+                    ParamArg::Type(t) => s.push_str(&type_mangle(t)),
+                    ParamArg::Value(v) => s.push_str(&format!("V{}", value_arg_mangle(v))),
+                }
+            }
+            s
+        }
+        Type::SelfParam(name) => format!("SelfParam${name}"),
+        Type::Assoc { base, name } => format!("Assoc${}${name}", type_mangle(base)),
+        Type::SelfType => "Self".to_string(),
+        other => format!("{other:?}"),
+    };
+    raw.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '$' })
+        .collect()
+}
+
+fn value_arg_mangle(expr: &Expr) -> String {
+    match &expr.kind {
+        ExprKind::Int(i) => i.to_string(),
+        ExprKind::Bool(b) => b.to_string(),
+        ExprKind::Str(s) => s.clone(),
+        ExprKind::Identifier(name) => name.clone(),
+        _ => "expr".to_string(),
+    }
 }
 
 /// Const-fold a default-argument expression to a value. Handles the literal forms

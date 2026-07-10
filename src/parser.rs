@@ -888,15 +888,26 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         Ok(crate::ast::TraitComptime { name, ty })
     }
 
-    /// `def name(self [, params]) -> ret:` followed by an indented body that is
-    /// either `...` (a pure requirement) or real statements (a **default
-    /// implementation**, stored in `default_body`).
+    /// `def name([convention] self [, params]) -> ret:` followed by an indented
+    /// body that is either `...` (a pure requirement) or real statements (a
+    /// **default implementation**, stored in `default_body`).
     fn parse_trait_method(&mut self) -> Result<crate::ast::TraitMethod, ParseError> {
         self.expect(Token::Def, "Expected 'def'")?;
         let name = self.expect_identifier("Expected a method name after 'def'")?;
 
         self.expect(Token::LParen, "Expected '(' after the method name")?;
-        let self_name = self.expect_identifier("A method's first parameter must be 'self'")?;
+        let first = self.expect_identifier("A method's first parameter must be 'self'")?;
+        let (self_name, self_convention) = if let Some(conv) = convention_word(&first) {
+            if conv == ArgConvention::Ref {
+                self.parse_optional_origin_specifier()?;
+            }
+            (
+                self.expect_identifier("Expected 'self' after the receiver convention")?,
+                Some(conv),
+            )
+        } else {
+            (first, None)
+        };
         if self_name != "self" {
             return Err(ParseError::UnexpectedToken(
                 Token::Identifier(self_name),
@@ -945,6 +956,7 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
 
         Ok(crate::ast::TraitMethod {
             name,
+            self_convention,
             params,
             positional_only,
             keyword_only,

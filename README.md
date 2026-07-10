@@ -7,21 +7,23 @@ studying the shape of a modern systems programming language: Python-like syntax,
 value semantics, ownership transfer, borrowing, ASAP destruction, generics, and a
 register-VM execution model.
 
-Think of it as a tiny cousin of Rust, C++, and of course, Mojo, striving for at least syntactic compatibility with Mojo. High performance is not a current goal. The current goal is making
-ownership, moves, destructors, borrowing, and control-flow lowering visible in a
-codebase small enough to hold in your head.
+Think of it as a tiny cousin of Rust, C++, and of course, Mojo, striving for at
+least syntactic compatibility with Mojo. High performance is not a current goal.
+The current goal is making ownership, moves, destructors, borrowing, and
+control-flow lowering visible in a codebase small enough to hold in your head.
 
 ## Status
 
 mojo-lite currently has:
 
 - a lexer and Pratt parser for a useful slice of Mojo-like syntax
-- a type checker with structs, functions, methods, traits, generics, value
-  parameters, builtin scalar types, lists, tuples, strings, and SIMD-like values
+- a type checker with structs, functions, methods, overload sets, traits,
+  generics, value parameters, builtin scalar types, lists, tuples, strings, and
+  SIMD-like values
 - a simple module linker for `import` / `from ... import ...` across `.mojo`
   files
 - compile-time elaboration for `comptime if`, `comptime for`, richer compile-time
-  values, and small pure-function CTFE with fuel
+  values, and fuel-bounded pure-function CTFE through the MIR/VM path
 - a HIR control-flow graph lowering pass
 - a MIR/A-normal lowering pass with explicit registers, variables, places, moves,
   drops, calls, method calls, exceptions, and loop control
@@ -33,6 +35,9 @@ mojo-lite currently has:
 - a register VM backend used as the runtime implementation
 - self-hosted standard-library proofs in `stdlib/`, including generic
   `Optional`, `List`, `Set`, and `Dict` implementations
+- basic collection/protocol traits such as `Iterable`, `Iterator`, `Sized`,
+  `Equatable`, and `Comparable` where the current self-hosted library needs
+  them
 - fixture-based tests for accepted programs, parse errors, type errors, runtime
   errors, ownership errors, and ownership-ok cases
 
@@ -49,11 +54,14 @@ Language deficiencies:
 
 - no complete Mojo standard library; a small self-hosted `stdlib/` exists, but it
   is a proof of direction, not a compatible replacement
-- no full trait system; structural conformance, common bounds, and self-hosted
-  collection traits exist, but default methods, refinement, and associated
-  compile-time members remain incomplete
+- no full trait system; structural conformance, common bounds, receiver
+  conventions, and associated compile-time facts exist, but default methods,
+  refinement, and the complete Mojo trait model remain incomplete
 - no full parametric polymorphism story comparable to Mojo; generics and value
   parameters cover the current library, but not the full language
+- overload resolution is useful but intentionally conservative; same-name
+  functions, methods, and constructors can overload by arity and by clearly best
+  argument type, but the full Mojo ranking/coercion model is not implemented
 - no complete effect system; `raises` is only partially modeled
 - no full exception/unwind model beyond the VM-supported subset
 - no complete model of Mojo's ownership, origins, and lifetime semantics
@@ -111,9 +119,9 @@ The major source directories are:
 - `src/lexer.rs`, `src/parser.rs`, `src/ast.rs`: tokens, AST, Pratt parser, and
   statement parsing
 - `src/module.rs`: filesystem-backed module loading/linking
-- `src/comptime.rs`: compile-time elaboration and small CTFE support
-- `src/checker.rs`: type checking, trait checks, call matching, value-parameter
-  checks, and borrow checks
+- `src/comptime.rs`: compile-time elaboration and MIR/VM-backed CTFE support
+- `src/checker.rs`: type checking, trait checks, overload resolution, call
+  matching, value-parameter checks, and borrow checks
 - `src/hir/mod.rs`: control-flow graph lowering
 - `src/mir/mod.rs`: flattened register/place MIR
 - `src/analysis/mod.rs`: move analysis, liveness, and drop insertion
@@ -156,8 +164,8 @@ Commands:
 | ------- | ------------ |
 | `lex` | print the token stream, one token per line |
 | `parse` | print the parsed AST |
-| `check` | parse, type-check, and run ownership analysis |
-| `own` | parse, type-check, and report ownership diagnostics |
+| `check` | parse and type-check |
+| `own` | parse, type-check, and run ownership analysis |
 | `run` | compile and execute on the register VM |
 
 `FILE` is optional. Use a path, `-`, or omit it to read from standard input:
@@ -273,15 +281,36 @@ Supported pieces include:
 - `comptime if` branch selection
 - `comptime for` over `range` and compile-time tuple/list values
 - richer compile-time values such as integers, booleans, strings, tuples, and
-  lists
-- small pure-function CTFE, implemented as a fuel-bounded AST interpreter before
-  checking
+  lists, plus compile-time-only type facts
+- small pure-function CTFE, implemented by cloning/restricting helper bodies,
+  folding compile-time-only facts, and executing the result through MIR/VM with
+  fuel
 - materialization of compile-time values into ordinary runtime code where the
   subset supports it
 
 This is intentionally still a small model of Mojo's comptime system. It is
 powerful enough to support the self-hosted library experiments, but not a full
 replacement for Mojo's compile-time evaluation and specialization machinery.
+
+## Overloading And Dispatch
+
+mojo-lite supports same-name top-level functions, methods, and constructors as
+overload sets. The checker chooses a single best candidate at each call site:
+
+- distinct arities work directly
+- same-arity overloads work when argument types make one candidate uniquely best
+- exact type matches beat candidates that require coercion
+- ambiguous coercion cases are rejected at type-check time
+
+The selected callee is recorded as a checker fact and preserved through MIR
+lowering. Overloaded definitions lower to stable signature-based names such as
+`choose$ov$Int` or `Box.__init__$ov$String`; the source still says
+`choose(x)` or `Box(x)`.
+
+This same mechanism underpins ordinary function calls, method calls, dunder
+operator dispatch, subscript dispatch, and constructor selection. It is not yet a
+complete implementation of Mojo's overload ranking, but it is enough for the
+numeric and container patterns that need ordinary type-directed overloads.
 
 ## Self-Hosted Standard Library
 
@@ -300,6 +329,7 @@ structs now have enough language hooks to behave like real value types:
 
 - dunder operator and builtin dispatch
 - subscript read/write
+- type-directed function, method, and constructor overloading
 - `__len__`
 - user iteration
 - `__init__(out self)`

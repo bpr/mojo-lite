@@ -21,6 +21,7 @@ use crate::ast::{
     ArgConvention, Dtype, Expr, ExprKind, FnParam, InfixOp, Method, ParamArg, PrefixOp, Stmt,
     StmtKind, TStringPart, Type,
 };
+use crate::checker::resolve_overload_targets;
 use crate::token::DUMMY_SPAN;
 use std::collections::HashSet;
 
@@ -205,6 +206,7 @@ pub enum MirInstr {
         dest: Reg,
         recv: Reg,
         method: String,
+        resolved: Option<String>,
         args: Vec<Reg>,
         recv_place: Option<MirPlace>,
         /// Like `Call::arg_places`: `arg_places[i]` is `Some` when ordinary
@@ -459,6 +461,11 @@ struct Flatten<'a> {
     /// rewritten to the mangled function with its captures prepended, and the
     /// nested `def` statement itself lowers to nothing.
     nested: HashMap<String, NestedInfo>,
+    /// Source-level overloaded top-level functions. Kept as a fallback for
+    /// unannotated lowering; normally overload_targets gives the exact callee.
+    overloads: HashMap<String, std::collections::HashSet<usize>>,
+    /// Checker-selected lowered callee names for overloaded call expressions.
+    overload_targets: HashMap<Span, String>,
 }
 
 impl Flatten<'_> {
@@ -471,6 +478,18 @@ impl Flatten<'_> {
 
     fn emit(&mut self, i: MirInstr) {
         self.f.blocks[self.cur].instrs.push(i);
+    }
+
+    fn overloaded_name(&self, name: &str, argc: usize) -> String {
+        if self
+            .overloads
+            .get(name)
+            .is_some_and(|arities| arities.contains(&argc))
+        {
+            format!("{name}#{argc}")
+        } else {
+            name.to_string()
+        }
     }
 
     /// Intern a variable name to a stable `VarId` (matches `hir::Lower::var`).
@@ -756,10 +775,15 @@ impl Flatten<'_> {
                     .iter()
                     .map(|k| (k.name.clone(), self.expr(&k.value)))
                     .collect();
+                let target = self
+                    .overload_targets
+                    .get(&span(e))
+                    .cloned()
+                    .unwrap_or_else(|| self.overloaded_name(name, args.len()));
                 let d = self.fresh(span(e), None);
                 self.emit(MirInstr::Call {
                     dest: d,
-                    func: FuncRef::named(name),
+                    func: FuncRef::named(&target),
                     args: regs,
                     kwargs: kw,
                     arg_places,
@@ -817,6 +841,7 @@ impl Flatten<'_> {
                     dest: d,
                     recv,
                     method: method.clone(),
+                    resolved: self.overload_targets.get(&span(e)).cloned(),
                     args: regs,
                     recv_place,
                     arg_places,
@@ -1139,6 +1164,8 @@ impl Flatten<'_> {
                 next_reg: self.next_reg,
                 vars: region_cfg.vars.clone(),
                 nested: self.nested.clone(), // a `try` region may call a nested `def`
+                overloads: self.overloads.clone(),
+                overload_targets: self.overload_targets.clone(),
             };
             for hb in region_cfg.g.node_indices() {
                 fl.cur = map[&hb];
@@ -1474,13 +1501,18 @@ impl Flatten<'_> {
 /// the register counter, the variable interner (seeded from `cfg.vars` so IDs
 /// agree with the HIR), and the span table across the whole function.
 pub fn lower_cfg(cfg: &Cfg) -> MirFunction {
-    lower_cfg_nested(cfg, &HashMap::new())
+    lower_cfg_nested(cfg, &HashMap::new(), &HashMap::new(), &HashMap::new())
 }
 
 /// [`lower_cfg`] with a nested-`def` registry in scope: a call to a registered
 /// nested `def` is rewritten to its lifted function (captures prepended) and the
 /// nested `def` statement lowers to nothing.
-fn lower_cfg_nested(cfg: &Cfg, nested: &HashMap<String, NestedInfo>) -> MirFunction {
+fn lower_cfg_nested(
+    cfg: &Cfg,
+    nested: &HashMap<String, NestedInfo>,
+    overloads: &HashMap<String, std::collections::HashSet<usize>>,
+    overload_targets: &HashMap<Span, String>,
+) -> MirFunction {
     let mut mir = MirFunction {
         blocks: Vec::new(),
         n_regs: 0,
@@ -1511,6 +1543,8 @@ fn lower_cfg_nested(cfg: &Cfg, nested: &HashMap<String, NestedInfo>) -> MirFunct
             next_reg: 0,
             vars: cfg.vars.clone(),
             nested: nested.clone(),
+            overloads: overloads.clone(),
+            overload_targets: overload_targets.clone(),
         };
         for hb in cfg.g.node_indices() {
             fl.cur = map[&hb];
@@ -1846,6 +1880,8 @@ fn lower_fn_nested(
     owned_params: Vec<bool>,
     ref_params: Vec<bool>,
     body: &[Stmt],
+    overloads: &HashMap<String, std::collections::HashSet<usize>>,
+    overload_targets: &HashMap<Span, String>,
     out: &mut Vec<(String, MirFunction)>,
 ) {
     let mut f_bound: HashSet<String> = param_names.iter().cloned().collect();
@@ -1891,7 +1927,7 @@ fn lower_fn_nested(
     }
 
     let cfg = Cfg::build_fn(param_names, body);
-    let mut f = lower_cfg_nested(&cfg, &registry);
+    let mut f = lower_cfg_nested(&cfg, &registry, overloads, overload_targets);
     f.param_types = param_types;
     f.owned_params = owned_params;
     f.ref_params = ref_params;
@@ -1916,7 +1952,7 @@ fn lower_fn_nested(
             let mut refp2 = vec![true; captures.len()];
             refp2.extend(dparams.iter().map(|p| is_ref(&p.convention)));
             let ncfg = Cfg::build_fn(&names, dbody);
-            let mut nf = lower_cfg_nested(&ncfg, &registry);
+            let mut nf = lower_cfg_nested(&ncfg, &registry, overloads, overload_targets);
             nf.param_types = ptys;
             nf.owned_params = owned2;
             nf.ref_params = refp2;
@@ -1958,6 +1994,9 @@ fn is_mojo_copy_constructor(m: &Method) -> bool {
 pub fn lower_program(program: &[Stmt]) -> MirProgram {
     let mut functions = Vec::new();
     let mut toplevel: Vec<Stmt> = Vec::new();
+    let overloads = top_level_overloads(program);
+    let method_overloads = method_overloads(program);
+    let overload_targets = resolve_overload_targets(program).unwrap_or_default();
 
     for s in program {
         match &s.kind {
@@ -1968,12 +2007,25 @@ pub fn lower_program(program: &[Stmt]) -> MirProgram {
                 let ptys = params.iter().map(|p| p.ty.clone()).collect();
                 let owned = params.iter().map(|p| is_owned(&p.convention)).collect();
                 let refp = params.iter().map(|p| is_ref(&p.convention)).collect();
-                lower_fn_nested(name, &names, ptys, owned, refp, body, &mut functions);
+                let lowered_name = overloaded_def_name(name, params, &overloads);
+                lower_fn_nested(
+                    &lowered_name,
+                    &names,
+                    ptys,
+                    owned,
+                    refp,
+                    body,
+                    &overloads,
+                    &overload_targets,
+                    &mut functions,
+                );
             }
             StmtKind::Struct { name, methods, .. } => {
                 for m in methods {
                     let method_name = lifecycle_method_name(m);
-                    let mangled = format!("{name}.{method_name}");
+                    let source_mangled = format!("{name}.{method_name}");
+                    let mangled =
+                        overloaded_method_name(&source_mangled, &m.params, &method_overloads);
                     // A method's receiver `self` is the implicit first parameter,
                     // followed by the declared params.
                     let mut names: Vec<String> = Vec::new();
@@ -1992,7 +2044,17 @@ pub fn lower_program(program: &[Stmt]) -> MirProgram {
                     ptys.extend(m.params.iter().map(|p| p.ty.clone()));
                     owned.extend(m.params.iter().map(|p| is_owned(&p.convention)));
                     refp.extend(m.params.iter().map(|p| is_ref(&p.convention)));
-                    lower_fn_nested(&mangled, &names, ptys, owned, refp, &m.body, &mut functions);
+                    lower_fn_nested(
+                        &mangled,
+                        &names,
+                        ptys,
+                        owned,
+                        refp,
+                        &m.body,
+                        &overloads,
+                        &overload_targets,
+                        &mut functions,
+                    );
                 }
             }
             // A `trait`'s requirements have no body (`...`); nothing to lower yet.
@@ -2003,7 +2065,134 @@ pub fn lower_program(program: &[Stmt]) -> MirProgram {
 
     functions.push((
         "__toplevel__".to_string(),
-        lower_cfg(&Cfg::build(&toplevel)),
+        lower_cfg_nested(
+            &Cfg::build(&toplevel),
+            &HashMap::new(),
+            &overloads,
+            &overload_targets,
+        ),
     ));
     MirProgram { functions }
+}
+
+fn top_level_overloads(program: &[Stmt]) -> HashMap<String, std::collections::HashSet<usize>> {
+    let mut counts: HashMap<String, Vec<usize>> = HashMap::new();
+    for stmt in program {
+        if let StmtKind::Def { name, params, .. } = &stmt.kind {
+            counts.entry(name.clone()).or_default().push(params.len());
+        }
+    }
+    counts
+        .into_iter()
+        .filter_map(|(name, arities)| {
+            if arities.len() > 1 {
+                Some((name, arities.into_iter().collect()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn method_overloads(program: &[Stmt]) -> HashMap<String, std::collections::HashSet<usize>> {
+    let mut counts: HashMap<String, Vec<usize>> = HashMap::new();
+    for stmt in program {
+        if let StmtKind::Struct { name, methods, .. } = &stmt.kind {
+            for method in methods {
+                let method_name = lifecycle_method_name(method);
+                counts
+                    .entry(format!("{name}.{method_name}"))
+                    .or_default()
+                    .push(method.params.len());
+            }
+        }
+    }
+    counts
+        .into_iter()
+        .filter_map(|(name, arities)| {
+            if arities.len() > 1 {
+                Some((name, arities.into_iter().collect()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn overloaded_def_name(
+    name: &str,
+    params: &[FnParam],
+    overloads: &HashMap<String, std::collections::HashSet<usize>>,
+) -> String {
+    if overloads
+        .get(name)
+        .is_some_and(|arities| arities.contains(&params.len()))
+    {
+        format!("{name}{}", signature_suffix(params.iter().map(|p| &p.ty)))
+    } else {
+        name.to_string()
+    }
+}
+
+fn overloaded_method_name(
+    name: &str,
+    params: &[FnParam],
+    overloads: &HashMap<String, std::collections::HashSet<usize>>,
+) -> String {
+    if overloads
+        .get(name)
+        .is_some_and(|arities| arities.contains(&params.len()))
+    {
+        format!("{name}{}", signature_suffix(params.iter().map(|p| &p.ty)))
+    } else {
+        name.to_string()
+    }
+}
+
+fn signature_suffix<'a>(params: impl IntoIterator<Item = &'a Type>) -> String {
+    let parts = params
+        .into_iter()
+        .map(type_mangle)
+        .collect::<Vec<_>>()
+        .join("$");
+    format!("$ov${parts}")
+}
+
+fn type_mangle(ty: &Type) -> String {
+    let raw = match ty {
+        Type::Int => "Int".to_string(),
+        Type::UInt => "UInt".to_string(),
+        Type::Bool => "Bool".to_string(),
+        Type::String => "String".to_string(),
+        Type::Float64 => "Float64".to_string(),
+        Type::None => "None".to_string(),
+        Type::Named(name, args) => {
+            let mut s = name.clone();
+            for arg in args {
+                s.push('$');
+                match arg {
+                    ParamArg::Type(t) => s.push_str(&type_mangle(t)),
+                    ParamArg::Value(v) => s.push_str(&format!("V{}", value_arg_mangle(v))),
+                }
+            }
+            s
+        }
+        Type::SelfParam(name) => format!("SelfParam${name}"),
+        Type::Assoc { base, name } => format!("Assoc${}${name}", type_mangle(base)),
+        Type::SelfType => "Self".to_string(),
+        other => format!("{other:?}"),
+    };
+    raw.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '$' })
+        .collect()
+}
+
+fn value_arg_mangle(expr: &Expr) -> String {
+    match &expr.kind {
+        ExprKind::Int(i) => i.to_string(),
+        ExprKind::Bool(b) => b.to_string(),
+        ExprKind::Str(s) => s.clone(),
+        ExprKind::Identifier(name) => name.clone(),
+        _ => "expr".to_string(),
+    }
 }
