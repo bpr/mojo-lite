@@ -115,6 +115,34 @@ fn self_hosted_generic_dict_sets_gets_updates_iterates() {
 }
 
 #[test]
+fn self_hosted_hash_backed_set() {
+    // Phase 6: a hash-backed `HashSet[T]` (buckets chosen via `key.__hash__()`)
+    // works for two key types — `Int` (intrinsic scalar hash) and `String`.
+    let d = TempDir::new();
+    d.add_stdlib("hashing.mojo");
+    d.add_stdlib("hashset.mojo");
+    let main = d.write(
+        "main.mojo",
+        "from hashset import HashSet\n\ndef main():\n    var s: HashSet[Int] = HashSet[Int]()\n    s.add(3)\n    s.add(3)\n    s.add(11)\n    s.add(19)\n    print(len(s))\n    print(s.contains(11), s.contains(4))\n    var w: HashSet[String] = HashSet[String]()\n    w.add(\"mojo\")\n    w.add(\"lite\")\n    w.add(\"mojo\")\n    print(len(w))\n    print(w.contains(\"lite\"), w.contains(\"rust\"))\n",
+    );
+    assert_eq!(run(&main).unwrap(), "3\ntrue false\n2\ntrue false\n");
+}
+
+#[test]
+fn self_hosted_math_rounding_helpers() {
+    // Phase 7: the self-hosted `math` module (not prelude — must be imported)
+    // exposes `floor`/`ceil`/`trunc`/`ceildiv`, generic over their trait bounds;
+    // built-in `Int`/`Float64` supply the dunders intrinsically after erasure.
+    let d = TempDir::new();
+    d.add_stdlib("math.mojo");
+    let main = d.write(
+        "main.mojo",
+        "from math import floor, ceil, trunc, ceildiv\n\ndef main():\n    print(floor(3.7), ceil(3.2), trunc(-3.7))\n    print(floor(5), ceil(5))\n    print(ceildiv(7, 2), ceildiv(-7, 2))\n    print(ceildiv(7.0, 2.0))\n",
+    );
+    assert_eq!(run(&main).unwrap(), "3.0 4.0 -3.0\n5 5\n4 -3\n4.0\n");
+}
+
+#[test]
 fn self_hosted_algorithms_use_comptime_facts() {
     let main = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("assets")

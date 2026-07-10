@@ -1,4 +1,4 @@
-use mojo_lite::{BackendKind, Stmt, check, lex, parse};
+use mojo_lite::{BackendKind, ModuleError, ParseError, Stmt, check, lex, parse};
 use std::io::Read;
 use std::path::Path;
 use std::process::ExitCode;
@@ -10,10 +10,14 @@ use std::process::ExitCode;
 /// the program is handed to the checker.
 fn load_program(file: Option<&str>) -> Result<Vec<Stmt>, String> {
     let program = match file {
-        Some(path) if path != "-" => mojo_lite::link(Path::new(path)).map_err(|e| e.to_string())?,
+        Some(path) if path != "-" => {
+            let source = read_source(file).map_err(|e| format!("cannot read input: {e}"))?;
+            mojo_lite::link_source(&source, Path::new(path))
+                .map_err(|e| format_module_error(&e, path, &source))?
+        }
         _ => {
             let source = read_source(file).map_err(|e| format!("cannot read input: {e}"))?;
-            parse(&source).map_err(|e| e.to_string())?
+            parse(&source).map_err(|e| format_parse_error(file.unwrap_or("-"), &source, &e))?
         }
     };
     mojo_lite::elaborate(program).map_err(|e| e.to_string())
@@ -60,7 +64,7 @@ fn main() -> ExitCode {
     match command {
         None => ExitCode::SUCCESS,
         Some("lex") => stage("lex", file, run_lex),
-        Some("parse") => stage("parse", file, run_parse),
+        Some("parse") => stage_parse(file),
         Some("check") => program_stage("check", file, run_check),
         Some("own") => program_stage("own", file, run_own),
         Some("run") => stage_run(file, backend), // ← now backend-aware
@@ -73,6 +77,22 @@ fn main() -> ExitCode {
             print_usage();
             ExitCode::FAILURE
         }
+    }
+}
+
+fn format_module_error(err: &ModuleError, entry_path: &str, entry_source: &str) -> String {
+    match err {
+        ModuleError::Parse { module, err } => {
+            if module == entry_path {
+                format_parse_error(module, entry_source, err)
+            } else {
+                match std::fs::read_to_string(module) {
+                    Ok(source) => format_parse_error(module, &source, err),
+                    Err(_) => format!("in module '{module}': {err}"),
+                }
+            }
+        }
+        _ => err.to_string(),
     }
 }
 
@@ -168,19 +188,65 @@ fn stage(name: &str, file: Option<&str>, f: fn(&str) -> Result<(), String>) -> E
     }
 }
 
+fn stage_parse(file: Option<&str>) -> ExitCode {
+    let source = match read_source(file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("parse: cannot read input: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+    match parse(&source) {
+        Ok(program) => {
+            println!("{:#?}", program);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!(
+                "parse error: {}",
+                format_parse_error(file.unwrap_or("-"), &source, &e)
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn format_parse_error(label: &str, source: &str, err: &ParseError) -> String {
+    let Some(byte) = err.byte_pos() else {
+        return err.to_string();
+    };
+    format_source_error(label, source, byte, &err.to_string())
+}
+
+fn format_source_error(label: &str, source: &str, byte: usize, message: &str) -> String {
+    let byte = byte.min(source.len());
+    let mut line_no = 1usize;
+    let mut line_start = 0usize;
+    for (idx, ch) in source.char_indices() {
+        if idx >= byte {
+            break;
+        }
+        if ch == '\n' {
+            line_no += 1;
+            line_start = idx + 1;
+        }
+    }
+    let line_end = source[line_start..]
+        .find('\n')
+        .map(|n| line_start + n)
+        .unwrap_or(source.len());
+    let line = source[line_start..line_end].trim_end_matches('\r');
+    let col = source[line_start..byte].chars().count() + 1;
+    let caret = format!("{}^", " ".repeat(col.saturating_sub(1)));
+    format!("{label}:{line_no}:{col}: {message}\n{line}\n{caret}")
+}
+
 /// `lex`: print every token, one per line.
 fn run_lex(source: &str) -> Result<(), String> {
     let tokens = lex(source).map_err(|e| e.to_string())?;
     for tok in tokens {
         println!("{:?}", tok);
     }
-    Ok(())
-}
-
-/// `parse`: print the parsed AST.
-fn run_parse(source: &str) -> Result<(), String> {
-    let program = parse(source).map_err(|e| e.to_string())?;
-    println!("{:#?}", program);
     Ok(())
 }
 

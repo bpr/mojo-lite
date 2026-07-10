@@ -37,8 +37,9 @@ use crate::hir::VarId;
 use crate::mir::{Const, MirBlock, MirInstr, MirPlace, MirProgram, MirTerm, Proj, Reg};
 use crate::runtime::{
     Value, apply_infix, apply_list_method, apply_prefix, builtin_abs, builtin_convert,
-    builtin_error, builtin_min_max, builtin_round, coerce, is_list_mutator, list_query,
-    promote_numeric_elems, read_simd_lane, simd_from_values, value_as_index,
+    builtin_divmod, builtin_error, builtin_input, builtin_min_max, builtin_round, coerce,
+    is_list_mutator, list_query, promote_numeric_elems, read_simd_lane, simd_from_values,
+    value_as_index,
 };
 use std::collections::HashMap;
 
@@ -1172,6 +1173,21 @@ impl VmBackend {
         regs: &[Value],
         vars: &mut [Value],
     ) -> Result<Value, RuntimeError> {
+        // Intrinsic dunders on a built-in numeric/hashable value; a struct with
+        // its own implementation still dispatches to its method below.
+        if !matches!(recv, Value::Struct { .. }) {
+            match (method, args.len()) {
+                // `Hashable` — `x.__hash__()`.
+                ("__hash__", 0) => return crate::runtime::builtin_hash(&recv).map(Value::UInt),
+                // `Floorable`/`Ceilable`/`Truncable` — `x.__floor__()` etc. (Phase 7).
+                ("__floor__" | "__ceil__" | "__trunc__", 0) => {
+                    return crate::runtime::builtin_round_dir(method, &recv);
+                }
+                // `CeilDivable` — `x.__ceildiv__(y)`.
+                ("__ceildiv__", 1) => return crate::runtime::builtin_ceildiv(&recv, &args[0]),
+                _ => {}
+            }
+        }
         match &recv {
             Value::List(_) if is_list_mutator(method) => {
                 // Mutate the list at its place so the change persists.
@@ -1367,7 +1383,12 @@ impl VmBackend {
                 builtin_min_max(false, a, b)
             }
             "round" => builtin_round(arg1(name, args)?),
-            "Int" | "UInt" | "Float64" => builtin_convert(name, arg1(name, args)?),
+            "input" => builtin_input(arg1(name, args)?),
+            "Int" | "UInt" | "Float64" | "Bool" => builtin_convert(name, arg1(name, args)?),
+            "divmod" => {
+                let (a, b) = arg2(name, args)?;
+                builtin_divmod(a, b)
+            }
             "Error" => builtin_error(arg1(name, args)?),
             // A struct constructor. A hand-written `def __init__(out self, …)`
             // takes precedence over the fieldwise constructor: build an uninitialized

@@ -18,6 +18,47 @@ pub enum ParseError {
     UnexpectedToken(Token, String),
     UnexpectedEof(String),
     UnknownType(String),
+    At {
+        err: Box<ParseError>,
+        span: crate::token::Span,
+    },
+}
+
+impl LexError {
+    pub fn byte_pos(&self) -> usize {
+        match self {
+            LexError::IndentationError(pos)
+            | LexError::UnmatchedParenthesis(pos)
+            | LexError::UnexpectedCharacter(_, pos)
+            | LexError::InvalidInteger(pos)
+            | LexError::InvalidFloat(pos)
+            | LexError::UnterminatedString(pos)
+            | LexError::InvalidEscape(_, pos) => *pos,
+        }
+    }
+}
+
+impl ParseError {
+    pub fn at(self, span: crate::token::Span) -> Self {
+        if self.byte_pos().is_some() {
+            self
+        } else {
+            ParseError::At {
+                err: Box::new(self),
+                span,
+            }
+        }
+    }
+
+    pub fn byte_pos(&self) -> Option<usize> {
+        match self {
+            ParseError::LexerError(err) => Some(err.byte_pos()),
+            ParseError::At { span, .. } => Some(span.0),
+            ParseError::UnexpectedToken(_, _)
+            | ParseError::UnexpectedEof(_)
+            | ParseError::UnknownType(_) => None,
+        }
+    }
 }
 
 /// Errors from the static type checker (`checker.rs`), which runs after parsing
@@ -55,6 +96,10 @@ pub enum TypeError {
     /// Re-declaring a name already bound in the same scope. Mojo rejects this;
     /// the evaluator used to silently overwrite the binding.
     Redeclaration(String),
+    /// Assignment attempted through an immutable binding, such as an ordinary
+    /// function parameter. Mojo function arguments are immutable unless their
+    /// convention makes them writable (`mut`, `ref`, `out`).
+    ImmutableBinding(String),
     /// A function value tried to escape by being returned (downward funargs
     /// only). The static counterpart of `RuntimeError::ClosureEscape`.
     ClosureEscape,
@@ -270,6 +315,7 @@ impl fmt::Display for ParseError {
             }
             ParseError::UnexpectedEof(msg) => write!(f, "Unexpected EOF: {}", msg),
             ParseError::UnknownType(name) => write!(f, "Unknown type '{}'", name),
+            ParseError::At { err, span } => write!(f, "{err} at byte {}", span.0),
         }
     }
 }
@@ -304,6 +350,9 @@ impl fmt::Display for TypeError {
             }
             TypeError::Redeclaration(name) => {
                 write!(f, "'{}' is already declared in this scope", name)
+            }
+            TypeError::ImmutableBinding(name) => {
+                write!(f, "expression must be mutable in assignment ('{name}')")
             }
             TypeError::ClosureEscape => {
                 write!(

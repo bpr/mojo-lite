@@ -504,6 +504,11 @@ impl<'a> Iterator for Lexer<'a> {
                     self.emit(Token::Comma);
                     continue;
                 }
+                ';' => {
+                    self.pos += 1;
+                    self.emit(Token::Semicolon);
+                    continue;
+                }
                 '.' => {
                     // `...` is the ellipsis (a trait-method requirement); a `.`
                     // adjacent to digits is consumed by number scanning; an

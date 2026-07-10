@@ -25,6 +25,20 @@ small generic algorithms. Import them like any module — `from list import List
   code: type predicates, CTFE-computed constants, value parameters, and associated
   compile-time facts. It includes `first_or[C: Iterable]`, which consumes
   `C.Element` through an opaque iterable bound.
+- `hashing.mojo` — a tiny hash helper: `bucket_index[K: Hashable](key, bucket_count)`
+  maps a key into `[0, bucket_count)` via its `__hash__` (`-> UInt`). Built-in
+  scalar keys hash intrinsically; the hash is deterministic (no per-run seed).
+- `math.mojo` — self-hosted numeric rounding helpers `floor`/`ceil`/`trunc`/`ceildiv`,
+  each generic over its Mojo trait bound (`Floorable`/`Ceilable`/`Truncable`/`CeilDivable`).
+  Unlike `abs`/`round`/`divmod` (Mojo prelude builtins, available bare), these mirror
+  Mojo's `math` module and must be imported: `from math import floor`. Built-in `Int`/`Float64`
+  supply the underlying dunders intrinsically.
+- `hashset.mojo` — an experimental hash-backed `HashSet[T: Hashable & Equatable &
+  Copyable & Movable]`. It keeps a fixed array of buckets and only scans the bucket
+  a key hashes into, so it is genuinely hash-backed (unlike the linear-scan `Set`).
+  `Hashable` does not imply `Equatable`, so both bounds are named — the hash picks a
+  bucket, equality resolves collisions within it. The bucket count is fixed (no
+  rehash yet), so it is a proof of the `Hashable` machinery, not a `Set` replacement.
 
 Underscore-prefixed structs are implementation details, following the Python
 convention that Mojo currently inherits. `_ListIter` and `_DictEntry` are visible

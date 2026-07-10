@@ -90,6 +90,7 @@ pub enum Token {
     Colon,
     ColonEq, // `:=` (the walrus / named-expression operator)
     Comma,
+    Semicolon,
     Dot,      // `.`
     Ellipsis, // `...` (an unimplemented trait-method requirement)
     At,       // `@`

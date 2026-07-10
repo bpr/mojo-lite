@@ -237,6 +237,9 @@ pub fn resolve_overload_targets(stmts: &[Stmt]) -> Result<HashMap<Span, String>,
 pub struct Checker {
     /// Lexical scope chain, innermost last. Starts with the global scope.
     scopes: Vec<HashMap<String, Ty>>,
+    /// Binding mutability, parallel to `scopes`. `var` locals are writable;
+    /// ordinary function parameters are not.
+    mutable_scopes: Vec<HashMap<String, bool>>,
     /// Defined structs, by name (a separate namespace from value bindings).
     structs: HashMap<String, StructInfo>,
     /// Defined traits, by name (their method requirements).
@@ -270,6 +273,7 @@ impl Checker {
     pub fn new() -> Self {
         Self {
             scopes: vec![HashMap::new()],
+            mutable_scopes: vec![HashMap::new()],
             structs: HashMap::new(),
             traits: HashMap::new(),
             tparams: Vec::new(),
@@ -883,9 +887,9 @@ impl Checker {
         ret: Option<&Ty>,
         in_loop: bool,
     ) -> Result<(), TypeError> {
-        self.scopes.push(HashMap::new());
+        self.push_scope();
         let result = self.check_block(stmts, ret, in_loop);
-        self.scopes.pop();
+        self.pop_scope();
         result
     }
 
@@ -924,6 +928,9 @@ impl Checker {
                 match self.lookup(name).cloned() {
                     // Re-assignment: the value must keep the variable's type.
                     Some(target) => {
+                        if !self.is_binding_mutable(name) {
+                            return Err(TypeError::ImmutableBinding(name.clone()));
+                        }
                         // Assigning a closure could move it to an outer binding.
                         if matches!(
                             found,
@@ -996,6 +1003,9 @@ impl Checker {
                     match &target.kind {
                         ExprKind::Identifier(name) => match self.lookup(name).cloned() {
                             Some(existing) => {
+                                if !self.is_binding_mutable(name) {
+                                    return Err(TypeError::ImmutableBinding(name.clone()));
+                                }
                                 if !coerces(elem, &existing) {
                                     return Err(TypeError::TypeMismatch {
                                         expected: existing.to_string(),
@@ -1166,12 +1176,12 @@ impl Checker {
                     return Err(e);
                 }
 
-                self.scopes.push(HashMap::new());
+                self.push_scope();
                 let mut result = Ok(());
                 // Value parameters are ordinary `Int` locals in the body.
                 for d in &decls {
                     if let ParamDecl::Value { name } = d {
-                        result = self.declare(name, Ty::Int);
+                        result = self.declare_immutable(name, Ty::Int);
                         if result.is_err() {
                             break;
                         }
@@ -1187,7 +1197,11 @@ impl Checker {
                             ty.clone()
                         };
                         // Duplicate parameter names are a redeclaration.
-                        result = self.declare(&param.name, bind_ty);
+                        result = self.declare_with_mutability(
+                            &param.name,
+                            bind_ty,
+                            parameter_is_writable(param.convention),
+                        );
                         if result.is_err() {
                             break;
                         }
@@ -1203,7 +1217,7 @@ impl Checker {
                 if result.is_ok() && ret_ty != Ty::None && !definitely_returns(body) {
                     result = Err(TypeError::MissingReturn(name.clone()));
                 }
-                self.scopes.pop();
+                self.pop_scope();
                 self.tparams.pop();
                 result
             }
@@ -1301,7 +1315,7 @@ impl Checker {
             } => {
                 self.check_scoped_block(body, ret, in_loop)?;
                 if let Some((name, ex_body)) = except {
-                    self.scopes.push(HashMap::new());
+                    self.push_scope();
                     // `except e:` binds the caught error as an `Error`.
                     let result = match name {
                         Some(n) => self
@@ -1309,7 +1323,7 @@ impl Checker {
                             .and_then(|()| self.check_block(ex_body, ret, in_loop)),
                         None => self.check_block(ex_body, ret, in_loop),
                     };
-                    self.scopes.pop();
+                    self.pop_scope();
                     result?;
                 }
                 if let Some(body) = orelse {
@@ -1327,12 +1341,12 @@ impl Checker {
                 // the element type of its `__iter__()` iterator (`__next__`'s return).
                 let iter_ty = self.infer(iter)?;
                 let elem_ty = self.iterable_element_ty(&iter_ty)?;
-                self.scopes.push(HashMap::new());
+                self.push_scope();
                 let result = match self.declare(var, elem_ty) {
                     Ok(()) => self.check_block(body, ret, true),
                     Err(e) => Err(e),
                 };
-                self.scopes.pop();
+                self.pop_scope();
                 result
             }
 
@@ -1689,12 +1703,16 @@ impl Checker {
     }
 
     /// Verify that struct `name` (whose `Self` type is `self_ty`) implements
-    /// every method required by trait `tr`, with a matching signature. Built-in
-    /// traits impose no checked requirements.
+    /// every method required by trait `tr`, with a matching signature. A few
+    /// built-in marker traits have real lifecycle semantics; other built-ins
+    /// remain shallow recognized bounds until their corresponding feature grows.
     fn verify_conformance(&self, name: &str, tr: &str, self_ty: &Ty) -> Result<(), TypeError> {
+        if BUILTIN_TRAITS.contains(&tr) {
+            return self.verify_builtin_conformance(name, tr, self_ty);
+        }
         let trait_info = match self.traits.get(tr) {
             Some(info) => info,
-            None => return Ok(()), // a built-in trait — nothing to check
+            None => return Ok(()),
         };
         let struct_info = self
             .structs
@@ -1748,6 +1766,32 @@ impl Checker {
             }
         }
         Ok(())
+    }
+
+    fn verify_builtin_conformance(
+        &self,
+        name: &str,
+        tr: &str,
+        self_ty: &Ty,
+    ) -> Result<(), TypeError> {
+        let ok = match tr {
+            "Copyable" => self.struct_copyable_conformance_ok(name),
+            "ImplicitlyCopyable" => self.struct_implicitly_copyable_conformance_ok(name),
+            "Movable" => self.is_movable(self_ty),
+            "ImplicitlyDeletable" => self.struct_implicitly_deletable_conformance_ok(name),
+            // Layout/backend markers remain accepted-but-shallow until a backend
+            // needs them; operation traits are checked at their operations.
+            _ => true,
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(TypeError::TraitNotSatisfied {
+                param: "Self".to_string(),
+                ty: self_ty.to_string(),
+                trait_name: tr.to_string(),
+            })
+        }
     }
 
     fn ct_member_satisfies(&self, value: &CtValue, req: &CtMemberReq, self_ty: &Ty) -> bool {
@@ -1838,7 +1882,7 @@ impl Checker {
             Some(t) => self.ty_from_anno(t)?,
             None => Ty::None,
         };
-        self.scopes.push(HashMap::new());
+        self.push_scope();
         let mut result = self.bind_and_check_method(self_ty, m, &ret_ty);
         // Definite initialization (conservative, flow-insensitive first pass): an
         // `__init__` must assign every declared field somewhere in its body, so a
@@ -1850,7 +1894,7 @@ impl Checker {
         {
             result = self.check_definite_init(sname, &m.name, &m.body);
         }
-        self.scopes.pop();
+        self.pop_scope();
         result
     }
 
@@ -1887,20 +1931,18 @@ impl Checker {
         m: &Method,
         ret_ty: &Ty,
     ) -> Result<(), TypeError> {
-        self.declare("self", self_ty.clone())?;
+        let self_writable = matches!(
+            m.self_convention,
+            Some(crate::ast::ArgConvention::Mut | crate::ast::ArgConvention::Out)
+        );
+        self.declare_with_mutability("self", self_ty.clone(), self_writable)?;
         for p in &m.params {
             let pty = self.ty_from_anno(&p.ty)?;
-            self.declare(&p.name, pty)?;
+            self.declare_with_mutability(&p.name, pty, parameter_is_writable(p.convention))?;
         }
         // `self` is writable in a `mut self` method, or an `out self` `__init__`
         // (which assigns its fields). Restored after the body.
-        let saved = std::mem::replace(
-            &mut self.self_mutable,
-            matches!(
-                m.self_convention,
-                Some(crate::ast::ArgConvention::Mut | crate::ast::ArgConvention::Out)
-            ),
-        );
+        let saved = std::mem::replace(&mut self.self_mutable, self_writable);
         let result = self.check_block(&m.body, Some(ret_ty), false);
         self.self_mutable = saved;
         result?;
@@ -2178,14 +2220,29 @@ impl Checker {
         Ok((subst, tyargs))
     }
 
-    /// Whether `ty` conforms to trait `tr`. A built-in trait imposes no checked
-    /// requirement (any type is accepted — we don't model, e.g., `Copyable`).
-    /// A user trait is satisfied nominally: a struct must *declare* conformance,
-    /// and a type parameter must carry `tr` among its bounds (so a bounded `T`
-    /// can be forwarded to another `[U: tr]` parameter).
+    /// Whether `ty` conforms to trait `tr`. Lifecycle marker built-ins are tied
+    /// to observable ownership behavior; other built-ins remain recognized but
+    /// shallow unless their feature has a dedicated checker path. A user trait is
+    /// satisfied nominally: a struct must *declare* conformance, and a type
+    /// parameter must carry `tr` among its bounds (so a bounded `T` can be
+    /// forwarded to another `[U: tr]` parameter).
     fn conforms_to(&self, ty: &Ty, tr: &str) -> bool {
         if BUILTIN_TRAITS.contains(&tr) {
-            return true;
+            return match tr {
+                "AnyType" => true,
+                "Copyable" => self.is_copyable(ty),
+                "ImplicitlyCopyable" => self.is_implicitly_copyable(ty),
+                "Movable" => self.is_movable(ty),
+                "ImplicitlyDeletable" => self.is_implicitly_deletable(ty),
+                "Hashable" => self.is_hashable(ty),
+                "Equatable" => has_equality_bound_or_concrete(self, ty),
+                "Comparable" => self.is_comparable(ty),
+                "Absable" | "Roundable" | "Powable" => is_numeric_like(ty),
+                "Intable" => is_numeric_like(ty) || *ty == Ty::Bool,
+                "Floatable" => is_numeric_like(ty),
+                // Layout/backend markers and future operation traits stay shallow.
+                _ => true,
+            };
         }
         match ty {
             Ty::Struct(name, _) => self
@@ -2197,28 +2254,104 @@ impl Checker {
         }
     }
 
-    /// Whether a value of this type may be **copied** (implicitly duplicated). Mojo
-    /// is move-only by default: scalars and the built-in value types are Copyable,
-    /// (see the free [`is_place_expr`] used by [`Self::check_consuming`]).
-    /// but a `struct` is Copyable only if it declares `Copyable` conformance **or
-    /// defines `__copyinit__`** (which is what makes a type copyable), and a type
-    /// parameter only if bounded by `Copyable`.
+    /// Whether a value of this type may be **copied** (implicitly duplicated).
+    /// Mojo is move-only by default: scalars and the built-in value types are
+    /// Copyable, but a `struct` is Copyable only if it declares Copyable/
+    /// ImplicitlyCopyable conformance **or defines `__copyinit__`**, and a type
+    /// parameter only if bounded by Copyable/ImplicitlyCopyable.
     fn is_copyable(&self, ty: &Ty) -> bool {
         match ty {
             Ty::Struct(name, _) => self
                 .structs
                 .get(name)
                 .map(|s| {
-                    s.conforms.iter().any(|c| c == "Copyable")
+                    s.conforms
+                        .iter()
+                        .any(|c| matches!(c.as_str(), "Copyable" | "ImplicitlyCopyable"))
                         || s.methods.contains_key("__copyinit__")
                 })
                 .unwrap_or(true),
-            Ty::Param { bounds, .. } => bounds.iter().any(|b| b == "Copyable"),
+            Ty::Param { bounds, .. } => bounds
+                .iter()
+                .any(|b| matches!(b.as_str(), "Copyable" | "ImplicitlyCopyable")),
             // Scalars, `String`, `List`/`Tuple`/`Simd`/`Range`, `Error`, closures,
             // and `Self` are treated as copyable (element-wise copyability of
             // aggregates is not modeled).
             _ => true,
         }
+    }
+
+    /// `ImplicitlyCopyable` is stronger than `Copyable`: it means the type can be
+    /// copied by the ordinary implicit copy path, not only by an explicit custom
+    /// copy constructor. Structs opt in by declaring the marker, and fieldwise
+    /// conformance requires all fields to be implicitly copyable.
+    fn is_implicitly_copyable(&self, ty: &Ty) -> bool {
+        match ty {
+            Ty::Struct(name, _) => self.structs.get(name).is_some_and(|s| {
+                s.conforms.iter().any(|c| c == "ImplicitlyCopyable")
+                    && self.struct_implicitly_copyable_conformance_ok(name)
+            }),
+            Ty::Param { bounds, .. } => bounds.iter().any(|b| b == "ImplicitlyCopyable"),
+            _ => true,
+        }
+    }
+
+    fn is_movable(&self, _ty: &Ty) -> bool {
+        // The current ownership model supports moving every initialized value.
+        true
+    }
+
+    fn is_implicitly_deletable(&self, ty: &Ty) -> bool {
+        match ty {
+            Ty::Struct(name, _) => self.struct_implicitly_deletable_conformance_ok(name),
+            Ty::Param { bounds, .. } => bounds.iter().any(|b| b == "ImplicitlyDeletable"),
+            _ => true,
+        }
+    }
+
+    fn is_hashable(&self, ty: &Ty) -> bool {
+        match ty {
+            Ty::Struct(name, _) => self.structs.get(name).is_some_and(|s| {
+                s.conforms.iter().any(|c| c == "Hashable") || s.methods.contains_key("__hash__")
+            }),
+            Ty::Param { bounds, .. } => bounds.iter().any(|b| b == "Hashable"),
+            _ => builtin_hashable_ty(ty),
+        }
+    }
+
+    fn is_comparable(&self, ty: &Ty) -> bool {
+        match ty {
+            Ty::Param { bounds, .. } => bounds.iter().any(|b| b == "Comparable"),
+            _ => is_numeric_like(ty),
+        }
+    }
+
+    fn struct_copyable_conformance_ok(&self, name: &str) -> bool {
+        let Some(info) = self.structs.get(name) else {
+            return false;
+        };
+        info.methods.contains_key("__copyinit__")
+            || info.fields.iter().all(|(_, ty)| self.is_copyable(ty))
+    }
+
+    fn struct_implicitly_copyable_conformance_ok(&self, name: &str) -> bool {
+        let Some(info) = self.structs.get(name) else {
+            return false;
+        };
+        !info.methods.contains_key("__copyinit__")
+            && info
+                .fields
+                .iter()
+                .all(|(_, ty)| self.is_implicitly_copyable(ty))
+    }
+
+    fn struct_implicitly_deletable_conformance_ok(&self, name: &str) -> bool {
+        let Some(info) = self.structs.get(name) else {
+            return false;
+        };
+        info.fields
+            .iter()
+            .all(|(_, ty)| self.is_implicitly_deletable(ty))
     }
 
     /// At a **consuming** position (binding a value to a new place, passing it by
@@ -2242,6 +2375,19 @@ impl Checker {
     /// overload set when their call shapes differ; other same-scope repeats remain
     /// redeclarations.
     fn declare(&mut self, name: &str, ty: Ty) -> Result<(), TypeError> {
+        self.declare_with_mutability(name, ty, true)
+    }
+
+    fn declare_immutable(&mut self, name: &str, ty: Ty) -> Result<(), TypeError> {
+        self.declare_with_mutability(name, ty, false)
+    }
+
+    fn declare_with_mutability(
+        &mut self,
+        name: &str,
+        ty: Ty,
+        mutable: bool,
+    ) -> Result<(), TypeError> {
         let scope = self.scopes.last_mut().expect("scope stack is never empty");
         if let Some(existing) = scope.get_mut(name) {
             if let Some(mut candidates) = overload_candidates(existing, &ty) {
@@ -2258,7 +2404,29 @@ impl Checker {
             return Err(TypeError::Redeclaration(name.to_string()));
         }
         scope.insert(name.to_string(), ty);
+        self.mutable_scopes
+            .last_mut()
+            .expect("mutability scope stack is never empty")
+            .insert(name.to_string(), mutable);
         Ok(())
+    }
+
+    fn push_scope(&mut self) {
+        self.scopes.push(HashMap::new());
+        self.mutable_scopes.push(HashMap::new());
+    }
+
+    fn pop_scope(&mut self) {
+        self.scopes.pop();
+        self.mutable_scopes.pop();
+    }
+
+    fn is_binding_mutable(&self, name: &str) -> bool {
+        self.mutable_scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).copied())
+            .unwrap_or(true)
     }
 
     /// The type to declare for an **inferred** binding — `var x = e` (no
@@ -2486,6 +2654,9 @@ impl Checker {
             ExprKind::Identifier(name) => {
                 if name == "self" && !self.self_mutable {
                     return Err(TypeError::ImmutableSelf);
+                }
+                if !self.is_binding_mutable(name) {
+                    return Err(TypeError::ImmutableBinding(name.clone()));
                 }
                 self.lookup(name)
                     .cloned()
@@ -2719,6 +2890,12 @@ impl Checker {
                             None,
                         )
                     })
+            }
+            // `x.__hash__()` on a concrete built-in hashable type (`Int`, `String`,
+            // …) is an intrinsic returning `UInt` — lets a key struct combine
+            // `self.field.__hash__()` values (Phase 6).
+            _ if method == "__hash__" && args.is_empty() && builtin_hashable_ty(&obj_ty) => {
+                Some((vec![], Ty::UInt, false, None))
             }
             _ => None,
         };
@@ -3123,6 +3300,29 @@ impl Checker {
         method: &str,
         argc: usize,
     ) -> Option<MethodSig> {
+        // The built-in `Hashable` trait contributes `__hash__(self) -> UInt`
+        // (Phase 6). A user trait cannot shadow a built-in name, so this is
+        // unambiguous.
+        if method == "__hash__" && argc == 0 && bounds.iter().any(|b| b == "Hashable") {
+            return Some(MethodSig {
+                params: vec![],
+                ret: Ty::UInt,
+                self_convention: None,
+            });
+        }
+        // The built-in numeric-rounding traits contribute a `-> Self` dunder
+        // (Phase 7), used by the self-hosted `math` module: `Floorable`/
+        // `Ceilable`/`Truncable` a nullary `__floor__`/`__ceil__`/`__trunc__`,
+        // and `CeilDivable`/`CeilDivableRaising` a unary `__ceildiv__(Self)`.
+        let accepts = math_dunder_bound(method, argc);
+        if !accepts.is_empty() && bounds.iter().any(|b| accepts.contains(&b.as_str())) {
+            let params = if argc == 1 { vec![Ty::SelfType] } else { vec![] };
+            return Some(MethodSig {
+                params,
+                ret: Ty::SelfType,
+                self_convention: None,
+            });
+        }
         bounds
             .iter()
             .filter_map(|b| self.traits.get(b))
@@ -3192,6 +3392,11 @@ impl Checker {
             And | Or if lt == Ty::Bool && rt == Ty::Bool => Some(Ty::Bool),
             // `+` concatenates String, or adds numbers (result = common type).
             Add if lt == Ty::String && rt == Ty::String => Some(Ty::String),
+            // `**` between equal opaque type parameters bounded by `Powable`
+            // (`__pow__(self, Self) -> Self`); the concrete impl runs after
+            // erasure. Checked before the numeric arm since a `Param` isn't
+            // numeric (so `common` is None here).
+            Pow if lt == rt && param_has_bound(&lt, "Powable") => Some(lt.clone()),
             // Arithmetic that preserves the operand type.
             Add | Sub | Mul | FloorDiv | Mod | Pow => common,
             // True division always yields Float64 (for any numeric operands).
@@ -3398,11 +3603,14 @@ impl Checker {
                 "abs" => return self.infer_abs(args),
                 "min" | "max" => return self.infer_min_max(name, args),
                 "round" => return self.infer_round(args),
+                "input" => return self.infer_input(args),
                 "len" => return self.infer_len(args),
                 "range" => return self.infer_range(args),
                 "Int" => return self.infer_conversion(Ty::Int, args),
                 "UInt" => return self.infer_conversion(Ty::UInt, args),
                 "Float64" => return self.infer_conversion(Ty::Float64, args),
+                "Bool" => return self.infer_conversion(Ty::Bool, args),
+                "divmod" => return self.infer_divmod(args),
                 "SIMD" => return self.infer_simd_construction(param_args, args),
                 "List" => return self.infer_list_construction(param_args, args),
                 "Error" => return self.infer_error_construction(args),
@@ -3617,6 +3825,21 @@ impl Checker {
         Ok(Ty::None)
     }
 
+    /// Type the built-in `input(prompt)`: prompt must be a `String`, result is the
+    /// line read from standard input as a `String`.
+    fn infer_input(&self, args: &[Expr]) -> Result<Ty, TypeError> {
+        let tys = self.builtin_args("input", 1, args)?;
+        if tys[0] == Ty::String {
+            Ok(Ty::String)
+        } else {
+            Err(TypeError::TypeMismatch {
+                expected: "String".to_string(),
+                found: tys[0].to_string(),
+                context: "argument to 'input'".to_string(),
+            })
+        }
+    }
+
     /// Require a built-in call to have exactly `n` arguments, and return the
     /// inferred type of each.
     fn builtin_args(&self, name: &str, n: usize, args: &[Expr]) -> Result<Vec<Ty>, TypeError> {
@@ -3651,7 +3874,9 @@ impl Checker {
     /// Type `abs(x)`: a numeric argument, returning the same numeric type.
     fn infer_abs(&self, args: &[Expr]) -> Result<Ty, TypeError> {
         let tys = self.builtin_args("abs", 1, args)?;
-        if is_numeric(&tys[0]) {
+        // A numeric value, or an opaque `T: Absable` — `abs` returns the same type
+        // (`__abs__(self) -> Self`); the concrete impl runs after type erasure.
+        if is_numeric(&tys[0]) || param_has_bound(&tys[0], "Absable") {
             Ok(tys[0].clone())
         } else {
             Err(TypeError::TypeMismatch {
@@ -3672,11 +3897,15 @@ impl Checker {
         })
     }
 
-    /// Type `round(x)`: a `Float64` argument, returning `Float64`.
+    /// Type `round(x)`: a `Float64` argument returning `Float64`, or an opaque
+    /// `T: Roundable` returning the same type (`__round__(self) -> Self`; the
+    /// concrete impl runs after type erasure).
     fn infer_round(&self, args: &[Expr]) -> Result<Ty, TypeError> {
         let tys = self.builtin_args("round", 1, args)?;
         if matches!(tys[0], Ty::Float64 | Ty::FloatLiteral) {
             Ok(Ty::Float64)
+        } else if param_has_bound(&tys[0], "Roundable") {
+            Ok(tys[0].clone())
         } else {
             Err(TypeError::TypeMismatch {
                 expected: "Float64".to_string(),
@@ -3741,8 +3970,12 @@ impl Checker {
         Ok(Ty::Range)
     }
 
-    /// Type a numeric conversion built-in `Int(x)` / `UInt(x)` / `Float64(x)`:
-    /// exactly one argument of a numeric or `Bool` type, producing `target`.
+    /// Type a conversion built-in `Int(x)` / `UInt(x)` / `Float64(x)` / `Bool(x)`:
+    /// exactly one argument of a numeric or `Bool` type, producing `target`. An
+    /// opaque type parameter is also accepted when its bound promises the
+    /// conversion — `Int(x)` on `T: Intable`, `Float64(x)` on `T: Floatable`,
+    /// `Bool(x)` on `T: Boolable` (`__int__`/`__float__`/`__bool__` run after
+    /// type erasure).
     fn infer_conversion(&self, target: Ty, args: &[Expr]) -> Result<Ty, TypeError> {
         if args.len() != 1 {
             return Err(TypeError::ArityMismatch {
@@ -3752,7 +3985,13 @@ impl Checker {
             });
         }
         let arg_ty = self.infer(&args[0])?;
-        if !(is_numeric(&arg_ty) || arg_ty == Ty::Bool) {
+        let bounded = match target {
+            Ty::Int => param_has_bound(&arg_ty, "Intable"),
+            Ty::Float64 => param_has_bound(&arg_ty, "Floatable"),
+            Ty::Bool => param_has_bound(&arg_ty, "Boolable"),
+            _ => false,
+        };
+        if !(is_numeric(&arg_ty) || arg_ty == Ty::Bool || bounded) {
             return Err(TypeError::TypeMismatch {
                 expected: "a numeric or Bool value".to_string(),
                 found: arg_ty.to_string(),
@@ -3760,6 +3999,23 @@ impl Checker {
             });
         }
         Ok(target)
+    }
+
+    /// Type the prelude built-in `divmod(a, b)` (`DivModable`) → `Tuple[T, T]`:
+    /// two numeric arguments of a common type (like an operator), or two equal
+    /// opaque type parameters bounded by `DivModable`.
+    fn infer_divmod(&self, args: &[Expr]) -> Result<Ty, TypeError> {
+        let tys = self.builtin_args("divmod", 2, args)?;
+        if let Some(common) = common_numeric(&tys[0], &tys[1]) {
+            return Ok(Ty::Tuple(vec![common.clone(), common]));
+        }
+        if tys[0] == tys[1] && param_has_bound(&tys[0], "DivModable") {
+            return Ok(Ty::Tuple(vec![tys[0].clone(), tys[0].clone()]));
+        }
+        Err(TypeError::BadOperator {
+            op: "divmod".to_string(),
+            operands: format!("{} and {}", tys[0], tys[1]),
+        })
     }
 }
 
@@ -3800,8 +4056,15 @@ const BUILTIN_TRAITS: &[&str] = &[
     "Truncable",
     "CeilDivable",
     "CeilDivableRaising",
-    "Divmodable",
+    "DivModable",
 ];
+
+fn parameter_is_writable(convention: Option<ArgConvention>) -> bool {
+    matches!(
+        convention,
+        Some(ArgConvention::Mut | ArgConvention::Ref | ArgConvention::Out)
+    )
+}
 
 /// Solve a type parameter against an actual type, recording it in `subst`. A
 /// numeric literal is defaulted to its concrete type first (`IntLiteral → Int`,
@@ -4407,16 +4670,28 @@ fn is_scalar(ty: &Ty) -> bool {
 
 /// Whether an opaque type parameter carries a bound that promises equality.
 /// Built-in bounds are intentionally shallow today, but `T: Equatable` should at
-/// least let generic library code type-check `T == T`.
+/// least let generic library code type-check `T == T`. `Comparable` refines
+/// equality (Phase 4), so it counts too; `Hashable` deliberately does **not**
+/// (a hash-backed key bounds `K: Hashable & Equatable` when it needs both).
 fn has_equality_bound(ty: &Ty) -> bool {
     match ty {
         Ty::Param { bounds, .. } => bounds.iter().any(|b| {
             matches!(
                 b.as_str(),
-                "Equatable" | "Comparable" | "Hashable" | "EqualityComparable"
+                "Equatable" | "Comparable" | "EqualityComparable"
             )
         }),
         _ => false,
+    }
+}
+
+fn has_equality_bound_or_concrete(checker: &Checker, ty: &Ty) -> bool {
+    match ty {
+        Ty::Struct(name, _) => checker
+            .structs
+            .get(name)
+            .is_some_and(|s| s.conforms.iter().any(|c| c == "Equatable")),
+        _ => has_equality_bound(ty) || is_scalar(ty) || is_numeric_like(ty),
     }
 }
 
@@ -4443,6 +4718,42 @@ fn has_len_bound(ty: &Ty) -> bool {
             .any(|b| matches!(b.as_str(), "Sized" | "SizedRaising")),
         _ => false,
     }
+}
+
+/// Whether `ty` is an opaque type parameter carrying the named trait `bound`.
+/// The numeric-operation traits (Phase 7 — `Absable`/`Roundable`/`Powable`/
+/// `Intable`/`Floatable`/`Boolable`/`DivModable`) gate a corresponding built-in
+/// or operator on an opaque `T` this way: the concrete type's implementation
+/// runs after type erasure.
+fn param_has_bound(ty: &Ty, bound: &str) -> bool {
+    matches!(ty, Ty::Param { bounds, .. } if bounds.iter().any(|b| b == bound))
+}
+
+/// The trait bounds that supply a numeric-rounding dunder (`method`/`argc`),
+/// used by the self-hosted `math` module (Phase 7). `__floor__`/`__ceil__`/
+/// `__trunc__` are nullary (`Floorable`/`Ceilable`/`Truncable`); `__ceildiv__`
+/// is unary and granted by `CeilDivable` or its raising sibling
+/// `CeilDivableRaising` (mojo-lite's deferred effect model does not distinguish
+/// them). A bound satisfies the dunder if it is any of the returned names.
+fn math_dunder_bound(method: &str, argc: usize) -> &'static [&'static str] {
+    match (method, argc) {
+        ("__floor__", 0) => &["Floorable"],
+        ("__ceil__", 0) => &["Ceilable"],
+        ("__trunc__", 0) => &["Truncable"],
+        ("__ceildiv__", 1) => &["CeilDivable", "CeilDivableRaising"],
+        _ => &[],
+    }
+}
+
+/// Whether a *concrete* built-in type has an intrinsic `__hash__` — the scalar
+/// set the VM can hash directly (`Int`/`UInt`/`Bool`/`String`/`Float64`). This
+/// lets a user key struct combine `self.field.__hash__()` values.
+fn builtin_hashable_ty(ty: &Ty) -> bool {
+    matches!(ty, Ty::Int | Ty::UInt | Ty::Bool | Ty::String | Ty::Float64)
+}
+
+fn is_numeric_like(ty: &Ty) -> bool {
+    is_numeric(&default_literal(ty))
 }
 
 /// Collect the field names assigned via `self.FIELD = …` anywhere in a body

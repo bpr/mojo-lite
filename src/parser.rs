@@ -50,6 +50,9 @@ pub struct Parser<I: Iterator<Item = Result<(Token, Span), LexError>>> {
     /// tokens (`Newline`/`Indent`/`Dedent`/`Eof`). Used for statement spans, so a
     /// statement doesn't swallow the trailing newline `expect_stmt_end` consumes.
     last_significant_end: usize,
+    /// Whether the most recent statement terminator was `;` rather than a newline
+    /// or EOF. Used for one-line suites like `def f(): a(); b()`.
+    last_stmt_ended_with_semicolon: bool,
 }
 
 impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
@@ -58,6 +61,7 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
             tokens: tokens.peekable(),
             last_span: (0, 0),
             last_significant_end: 0,
+            last_stmt_ended_with_semicolon: false,
         }
     }
 
@@ -154,52 +158,60 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         // A statement spans from its first token to the last token consumed. Each
         // sub-parser returns a bare `StmtKind`; the span is stamped once, here.
         let start = self.peek_start();
-        let kind = match self.peek_token()? {
-            Some(Token::Var) => self.parse_var_decl()?,
-            Some(Token::Def) => self.parse_def(Vec::new())?,
-            Some(Token::Struct) => self.parse_struct(Vec::new())?,
-            // A decorator list precedes a `def` or `struct`.
-            Some(Token::At) => {
-                let decorators = self.parse_decorators()?;
-                match self.peek_token()? {
-                    Some(Token::Def) => self.parse_def(decorators)?,
-                    Some(Token::Struct) => self.parse_struct(decorators)?,
-                    other => {
-                        return Err(ParseError::UnexpectedToken(
-                            other.cloned().unwrap_or(Token::Eof),
-                            "a decorator must precede a 'def' or 'struct'".into(),
-                        ));
+        let kind = (|| -> Result<StmtKind, ParseError> {
+            Ok(match self.peek_token()? {
+                Some(Token::Var) => self.parse_var_decl()?,
+                Some(Token::Def) => self.parse_def(Vec::new())?,
+                Some(Token::Struct) => self.parse_struct(Vec::new())?,
+                // A decorator list precedes a `def` or `struct`.
+                Some(Token::At) => {
+                    let decorators = self.parse_decorators()?;
+                    match self.peek_token()? {
+                        Some(Token::Def) => self.parse_def(decorators)?,
+                        Some(Token::Struct) => self.parse_struct(decorators)?,
+                        other => {
+                            return Err(ParseError::UnexpectedToken(
+                                other.cloned().unwrap_or(Token::Eof),
+                                "a decorator must precede a 'def' or 'struct'".into(),
+                            ));
+                        }
                     }
                 }
-            }
-            Some(Token::Trait) => self.parse_trait()?,
-            Some(Token::Comptime) => self.parse_comptime()?,
-            Some(Token::If) => self.parse_if()?,
-            Some(Token::While) => self.parse_while()?,
-            Some(Token::For) => self.parse_for()?,
-            Some(Token::With) => self.parse_with()?,
-            Some(Token::Try) => self.parse_try()?,
-            Some(Token::Return) => self.parse_return()?,
-            Some(Token::Raise) => self.parse_raise()?,
-            Some(Token::Import) => self.parse_import()?,
-            Some(Token::From) => self.parse_from_import()?,
-            Some(Token::Pass) => {
-                self.next_token()?;
-                self.expect_stmt_end()?;
-                StmtKind::Pass
-            }
-            Some(Token::Break) => {
-                self.next_token()?;
-                self.expect_stmt_end()?;
-                StmtKind::Break
-            }
-            Some(Token::Continue) => {
-                self.next_token()?;
-                self.expect_stmt_end()?;
-                StmtKind::Continue
-            }
-            _ => self.parse_expr_or_assign()?,
-        };
+                Some(Token::Trait) => self.parse_trait()?,
+                Some(Token::Comptime) => self.parse_comptime()?,
+                Some(Token::If) => self.parse_if()?,
+                Some(Token::While) => self.parse_while()?,
+                Some(Token::For) => self.parse_for()?,
+                Some(Token::With) => self.parse_with()?,
+                Some(Token::Try) => self.parse_try()?,
+                Some(Token::Return) => self.parse_return()?,
+                Some(Token::Raise) => self.parse_raise()?,
+                Some(Token::Import) => self.parse_import()?,
+                Some(Token::From) => self.parse_from_import()?,
+                Some(Token::Pass) => {
+                    self.next_token()?;
+                    self.expect_stmt_end()?;
+                    StmtKind::Pass
+                }
+                Some(Token::Break) => {
+                    self.next_token()?;
+                    self.expect_stmt_end()?;
+                    StmtKind::Break
+                }
+                Some(Token::Continue) => {
+                    self.next_token()?;
+                    self.expect_stmt_end()?;
+                    StmtKind::Continue
+                }
+                Some(Token::Ellipsis) => {
+                    self.next_token()?;
+                    self.expect_stmt_end()?;
+                    StmtKind::Pass
+                }
+                _ => self.parse_expr_or_assign()?,
+            })
+        })()
+        .map_err(|err| err.at(self.last_span))?;
         // End at the last significant token so the trailing newline (consumed by
         // `expect_stmt_end`) isn't included in the statement's span.
         Ok(Stmt::new(kind, (start, self.last_significant_end)))
@@ -220,8 +232,8 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         if matches!(self.peek_token()?, Some(Token::Comma)) {
             let mut targets = vec![expr];
             while matches!(self.peek_token()?, Some(Token::Comma)) {
-                self.next_token()?; // consume ','
                 // A trailing comma before `=` is allowed (`a, = t`, `a, b, = t`).
+                self.next_token()?; // consume ','
                 if matches!(self.peek_token()?, Some(Token::Assign)) {
                     break;
                 }
@@ -393,8 +405,7 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         };
 
         self.expect(Token::Colon, "Expected ':' before the function body")?;
-        self.expect_stmt_end()?;
-        let body = self.parse_block()?;
+        let body = self.parse_suite()?;
 
         Ok(StmtKind::Def {
             name,
@@ -417,8 +428,8 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         if !matches!(self.peek_token()?, Some(Token::Raises)) {
             return Ok(false);
         }
-        self.next_token()?; // consume 'raises'
         // An optional error type follows, unless the next token ends the header.
+        self.next_token()?; // consume 'raises'
         if !matches!(self.peek_token()?, Some(Token::Arrow | Token::Colon)) {
             self.parse_type()?; // discarded
         }
@@ -542,28 +553,25 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
             }
         }
         self.expect(Token::Colon, "Expected ':' after the 'with' items")?;
-        self.expect_stmt_end()?;
-        let body = self.parse_block()?;
+        let body = self.parse_suite()?;
         Ok(StmtKind::With { items, body })
     }
 
     fn parse_try(&mut self) -> Result<StmtKind, ParseError> {
         self.expect(Token::Try, "Expected 'try'")?;
         self.expect(Token::Colon, "Expected ':' after 'try'")?;
-        self.expect_stmt_end()?;
-        let body = self.parse_block()?;
+        let body = self.parse_suite()?;
 
         let except = if matches!(self.peek_token()?, Some(Token::Except)) {
-            self.next_token()?; // consume 'except'
             // An optional name binds the caught error.
+            self.next_token()?; // consume 'except'
             let name = if matches!(self.peek_token()?, Some(Token::Identifier(_))) {
                 Some(self.expect_identifier("unreachable")?)
             } else {
                 None
             };
             self.expect(Token::Colon, "Expected ':' after 'except'")?;
-            self.expect_stmt_end()?;
-            Some((name, self.parse_block()?))
+            Some((name, self.parse_suite()?))
         } else {
             None
         };
@@ -571,8 +579,7 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         let orelse = if matches!(self.peek_token()?, Some(Token::Else)) {
             self.next_token()?; // consume 'else'
             self.expect(Token::Colon, "Expected ':' after 'else'")?;
-            self.expect_stmt_end()?;
-            Some(self.parse_block()?)
+            Some(self.parse_suite()?)
         } else {
             None
         };
@@ -580,8 +587,7 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         let finalbody = if matches!(self.peek_token()?, Some(Token::Finally)) {
             self.next_token()?; // consume 'finally'
             self.expect(Token::Colon, "Expected ':' after 'finally'")?;
-            self.expect_stmt_end()?;
-            Some(self.parse_block()?)
+            Some(self.parse_suite()?)
         } else {
             None
         };
@@ -938,21 +944,9 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         };
 
         self.expect(Token::Colon, "Expected ':' before the method body")?;
-        self.expect_stmt_end()?;
-        self.expect(Token::Indent, "Expected an indented trait-method body")?;
         // A body of exactly `...` is a pure requirement; anything else is a
         // default implementation (parsed, flagged unsupported by the checker).
-        let default_body = if matches!(self.peek_token()?, Some(Token::Ellipsis)) {
-            self.next_token()?; // consume '...'
-            self.expect_stmt_end()?;
-            self.expect(
-                Token::Dedent,
-                "Expected the trait-method body to end after '...'",
-            )?;
-            None
-        } else {
-            Some(self.parse_block_body()?)
-        };
+        let default_body = self.parse_trait_method_body()?;
 
         Ok(crate::ast::TraitMethod {
             name,
@@ -988,8 +982,8 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
                 Some(Token::Identifier(id)) => convention_word(id),
                 _ => None,
             };
-            self.next_token()?; // consume the convention word
             // `ref self` may carry an origin specifier: `ref[origin] self`.
+            self.next_token()?; // consume the convention word
             if conv == Some(ArgConvention::Ref) {
                 self.parse_optional_origin_specifier()?;
             }
@@ -1037,8 +1031,7 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         };
 
         self.expect(Token::Colon, "Expected ':' before the method body")?;
-        self.expect_stmt_end()?;
-        let body = self.parse_block()?;
+        let body = self.parse_suite()?;
 
         Ok(Method {
             name,
@@ -1059,8 +1052,7 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
     fn parse_condition_block(&mut self, ctx: &str) -> Result<(Expr, Vec<Stmt>), ParseError> {
         let cond = self.parse_expression(Precedence::Lowest)?;
         self.expect(Token::Colon, ctx)?;
-        self.expect_stmt_end()?;
-        let body = self.parse_block()?;
+        let body = self.parse_suite()?;
         Ok((cond, body))
     }
 
@@ -1085,8 +1077,7 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         let orelse = if matches!(self.peek_token()?, Some(Token::Else)) {
             self.next_token()?; // consume 'else'
             self.expect(Token::Colon, "Expected ':' after 'else'")?;
-            self.expect_stmt_end()?;
-            Some(self.parse_block()?)
+            Some(self.parse_suite()?)
         } else {
             None
         };
@@ -1115,8 +1106,7 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         self.expect(Token::In, "Expected 'in' after the loop variable")?;
         let iter = self.parse_expression(Precedence::Lowest)?;
         self.expect(Token::Colon, "Expected ':' after the for-loop iterable")?;
-        self.expect_stmt_end()?;
-        let body = self.parse_block()?;
+        let body = self.parse_suite()?;
         Ok((var, iter, body))
     }
 
@@ -1135,6 +1125,60 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
     fn parse_block(&mut self) -> Result<Vec<Stmt>, ParseError> {
         self.expect(Token::Indent, "Expected an indented block")?;
         self.parse_block_body()
+    }
+
+    /// Parses a Mojo/Python suite after `:`: either a newline followed by an
+    /// indented block, or one simple statement on the same physical line.
+    fn parse_suite(&mut self) -> Result<Vec<Stmt>, ParseError> {
+        if matches!(self.peek_token()?, Some(Token::Newline)) {
+            self.next_token()?; // consume the newline after ':'
+            self.parse_block()
+        } else {
+            let mut body = Vec::new();
+            loop {
+                body.push(self.parse_statement()?);
+                if !self.last_stmt_ended_with_semicolon {
+                    break;
+                }
+                if matches!(self.peek_token()?, Some(Token::Newline)) {
+                    self.next_token()?; // consume the logical line after trailing ';'
+                    self.last_stmt_ended_with_semicolon = false;
+                    break;
+                }
+                if matches!(self.peek_token()?, Some(Token::Eof) | None) {
+                    self.last_stmt_ended_with_semicolon = false;
+                    break;
+                }
+            }
+            Ok(body)
+        }
+    }
+
+    /// Parses a trait method body, preserving `...` as a pure requirement.
+    fn parse_trait_method_body(&mut self) -> Result<Option<Vec<Stmt>>, ParseError> {
+        if matches!(self.peek_token()?, Some(Token::Ellipsis)) {
+            self.next_token()?; // consume same-line '...'
+            self.expect_stmt_end()?;
+            return Ok(None);
+        }
+
+        if matches!(self.peek_token()?, Some(Token::Newline)) {
+            self.next_token()?; // consume the newline after ':'
+            self.expect(Token::Indent, "Expected an indented trait-method body")?;
+            if matches!(self.peek_token()?, Some(Token::Ellipsis)) {
+                self.next_token()?; // consume indented '...'
+                self.expect_stmt_end()?;
+                self.expect(
+                    Token::Dedent,
+                    "Expected the trait-method body to end after '...'",
+                )?;
+                Ok(None)
+            } else {
+                Ok(Some(self.parse_block_body()?))
+            }
+        } else {
+            Ok(Some(vec![self.parse_statement()?]))
+        }
     }
 
     /// The statements of a block up to (and consuming) the closing `DEDENT`; the
@@ -1521,8 +1565,8 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         // or a plain subscript (`obj '[' index ']'`). A top-level `:` inside the
         // brackets marks a slice; otherwise `(` following decides call vs subscript.
         if matches!(self.peek_token()?, Some(Token::LBracket)) {
-            self.next_token()?; // consume '['
             // A leading `:` is a slice with no lower bound (`obj[:j]`, `obj[::2]`).
+            self.next_token()?; // consume '['
             if matches!(self.peek_token()?, Some(Token::Colon)) {
                 return self.parse_slice_rest(left, None);
             }
@@ -1877,10 +1921,17 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
     fn expect_stmt_end(&mut self) -> Result<(), ParseError> {
         let token = self.next_token()?;
         match token {
-            Token::Newline | Token::Eof => Ok(()),
+            Token::Semicolon => {
+                self.last_stmt_ended_with_semicolon = true;
+                Ok(())
+            }
+            Token::Newline | Token::Eof => {
+                self.last_stmt_ended_with_semicolon = false;
+                Ok(())
+            }
             _ => Err(ParseError::UnexpectedToken(
                 token,
-                "Expected newline or EOF at the end of statement".into(),
+                "Expected newline, ';', or EOF at the end of statement".into(),
             )),
         }
     }

@@ -618,6 +618,14 @@ fn accepts_trait_receiver_convention_requirements() {
 }
 
 #[test]
+fn rejects_assignment_to_immutable_parameter_but_allows_mut_parameter() {
+    let e = err("def f(a: Int):\n    a = a + 1\n");
+    assert_eq!(e, TypeError::ImmutableBinding("a".into()));
+
+    ok("def f(mut a: Int):\n    a = a + 1\n");
+}
+
+#[test]
 fn rejects_trait_receiver_convention_mismatch() {
     let e = err(
         "trait Bumpable:\n    def bump(mut self):\n        ...\n\n@fieldwise_init\nstruct Counter(Bumpable):\n    var n: Int\n\n    def bump(self):\n        pass\n",
@@ -2202,5 +2210,103 @@ fn any_type_bound_does_not_permit_len() {
     assert!(matches!(
         err("def is_empty[T: AnyType](x: T) -> Bool:\n    return len(x) == 0\n"),
         TypeError::TypeMismatch { .. }
+    ));
+}
+
+#[test]
+fn hashable_bound_permits_hash() {
+    // `x.__hash__()` type-checks (→ `UInt`) on an opaque `K: Hashable` (Phase 6),
+    // and on concrete hashable built-ins (so a key struct can combine fields).
+    ok("def h[K: Hashable](k: K) -> UInt:\n    return k.__hash__()\n");
+    ok("def hi(n: Int) -> UInt:\n    return n.__hash__()\n");
+    ok("def hs(s: String) -> UInt:\n    return s.__hash__()\n");
+}
+
+#[test]
+fn hashable_bound_does_not_permit_equality() {
+    // Design decision: `Hashable` does *not* imply `Equatable` — `==` on a
+    // `K: Hashable` (without an `Equatable` bound) is a `BadOperator` (Phase 6).
+    assert!(matches!(
+        err("def eq[K: Hashable](a: K, b: K) -> Bool:\n    return a == b\n"),
+        TypeError::BadOperator { .. }
+    ));
+    // Naming both bounds restores equality (a hash-backed key's typical bound).
+    ok("def eq[K: Hashable & Equatable](a: K, b: K) -> Bool:\n    return a == b\n");
+}
+
+#[test]
+fn any_type_bound_does_not_permit_hash() {
+    // A plain `T: AnyType` promises no hash — `x.__hash__()` on it is rejected.
+    assert!(matches!(
+        err("def h[T: AnyType](x: T) -> UInt:\n    return x.__hash__()\n"),
+        TypeError::NoSuchMethod { .. }
+    ));
+}
+
+#[test]
+fn numeric_operation_traits_permit_their_operation() {
+    // Phase 7: a numeric-operation bound enables the matching builtin/operator on
+    // an opaque `T`, returning the operation's result type.
+    ok("def absolute[T: Absable](x: T) -> T:\n    return abs(x)\n");
+    ok("def rounded[T: Roundable](x: T) -> T:\n    return round(x)\n");
+    ok("def powit[T: Powable](x: T, y: T) -> T:\n    return x ** y\n");
+    ok("def to_int[T: Intable](x: T) -> Int:\n    return Int(x)\n");
+    ok("def to_flt[T: Floatable](x: T) -> Float64:\n    return Float64(x)\n");
+    // `Boolable` -> `Bool(x)`, and `DivModable` -> `divmod(a, b)` (prelude
+    // builtins), plus the `math`-module rounding dunders on their bounds.
+    ok("def to_bool[T: Boolable](x: T) -> Bool:\n    return Bool(x)\n");
+    ok("def dm[T: DivModable](a: T, b: T) -> Tuple[T, T]:\n    return divmod(a, b)\n");
+    ok("def flr[T: Floorable](x: T) -> T:\n    return x.__floor__()\n");
+    ok("def cl[T: Ceilable](x: T) -> T:\n    return x.__ceil__()\n");
+    ok("def tr[T: Truncable](x: T) -> T:\n    return x.__trunc__()\n");
+    ok("def cd[T: CeilDivable](a: T, b: T) -> T:\n    return a.__ceildiv__(b)\n");
+    // The raising sibling grants `__ceildiv__` too (effect model is deferred).
+    ok("def cdr[T: CeilDivableRaising](a: T, b: T) -> T:\n    return a.__ceildiv__(b)\n");
+    // Concrete numerics also convert/divmod directly.
+    ok("def main():\n    print(Bool(0), divmod(7, 2)[0])\n");
+}
+
+#[test]
+fn any_type_bound_does_not_permit_numeric_operations() {
+    // A plain `T: AnyType` grants none of the numeric operations.
+    assert!(matches!(
+        err("def absolute[T: AnyType](x: T) -> T:\n    return abs(x)\n"),
+        TypeError::TypeMismatch { .. }
+    ));
+    assert!(matches!(
+        err("def rounded[T: AnyType](x: T) -> T:\n    return round(x)\n"),
+        TypeError::TypeMismatch { .. }
+    ));
+    assert!(matches!(
+        err("def powit[T: AnyType](x: T, y: T) -> T:\n    return x ** y\n"),
+        TypeError::BadOperator { .. }
+    ));
+    assert!(matches!(
+        err("def to_int[T: AnyType](x: T) -> Int:\n    return Int(x)\n"),
+        TypeError::TypeMismatch { .. }
+    ));
+    // A bound also does not grant an *unrelated* operation: `Absable` gives `abs`
+    // but not `**`.
+    assert!(matches!(
+        err("def powit[T: Absable](x: T, y: T) -> T:\n    return x ** y\n"),
+        TypeError::BadOperator { .. }
+    ));
+    // `Bool(x)`/`divmod` and the rounding dunders are likewise gated.
+    assert!(matches!(
+        err("def to_bool[T: AnyType](x: T) -> Bool:\n    return Bool(x)\n"),
+        TypeError::TypeMismatch { .. }
+    ));
+    assert!(matches!(
+        err("def dm[T: AnyType](a: T, b: T) -> Tuple[T, T]:\n    return divmod(a, b)\n"),
+        TypeError::BadOperator { .. }
+    ));
+    assert!(matches!(
+        err("def flr[T: AnyType](x: T) -> T:\n    return x.__floor__()\n"),
+        TypeError::NoSuchMethod { .. }
+    ));
+    // `Floorable` grants `__floor__` but not `__ceildiv__`.
+    assert!(matches!(
+        err("def cd[T: Floorable](a: T, b: T) -> T:\n    return a.__ceildiv__(b)\n"),
+        TypeError::NoSuchMethod { .. }
     ));
 }

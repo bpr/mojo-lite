@@ -556,6 +556,55 @@ fn parses_trait_with_method_requirements() {
 }
 
 #[test]
+fn parses_single_line_trait_method_requirement() {
+    let stmts = parse("trait Animal:\n    def make_sound(self): ...\n");
+    match &stmts[0].kind {
+        StmtKind::Trait { methods, .. } => {
+            assert_eq!(methods.len(), 1);
+            assert_eq!(methods[0].name, "make_sound");
+            assert_eq!(methods[0].default_body, None);
+        }
+        other => panic!("expected a trait, got {:?}", other),
+    }
+}
+
+#[test]
+fn parses_single_line_pass_suite() {
+    let stmts = parse("def noop(): pass\n");
+    match &stmts[0].kind {
+        StmtKind::Def { body, .. } => {
+            assert_eq!(body, &vec![Stmt::from(StmtKind::Pass)]);
+        }
+        other => panic!("expected a def, got {:?}", other),
+    }
+}
+
+#[test]
+fn parses_placeholder_and_semicolon_function_styles() {
+    let stmts = parse(concat!(
+        "def func1(r: Int): ...\n",
+        "def func2(): pass\n",
+        "def func3(): print(\"Hello World!\"); print(\"Good bye!\")\n",
+        "def func4():\n",
+        "    pass\n",
+        "def main(): func3()\n",
+    ));
+    assert_eq!(stmts.len(), 5);
+    match &stmts[0].kind {
+        StmtKind::Def { body, .. } => assert_eq!(body, &vec![Stmt::from(StmtKind::Pass)]),
+        other => panic!("expected a def, got {:?}", other),
+    }
+    match &stmts[2].kind {
+        StmtKind::Def { body, .. } => assert_eq!(body.len(), 2),
+        other => panic!("expected a def, got {:?}", other),
+    }
+    match &stmts[4].kind {
+        StmtKind::Def { body, .. } => assert_eq!(body.len(), 1),
+        other => panic!("expected a def, got {:?}", other),
+    }
+}
+
+#[test]
 fn parses_trait_receiver_conventions() {
     let stmts = parse(
         "trait Receivers:\n    def read_it(self):\n        ...\n    def mutate(mut self):\n        ...\n    def consume(owned self):\n        ...\n    def borrow(ref self):\n        ...\n",

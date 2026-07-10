@@ -4,6 +4,7 @@
 //! backend consumes.
 
 use std::fmt;
+use std::io::{self, Write};
 
 use crate::ast::{Dtype, InfixOp, PrefixOp, Type};
 use crate::error::RuntimeError;
@@ -275,6 +276,38 @@ pub(crate) fn values_equal(a: &Value, b: &Value) -> Result<bool, RuntimeError> {
             type_name(b)
         ))),
     }
+}
+
+/// Intrinsic `__hash__` for a built-in hashable value (Phase 6) — a
+/// **deterministic**, no-seed FNV-1a over the value's bytes, returning `UInt`
+/// (mojo-lite's native u64). Determinism across runs is a deliberate design
+/// decision: no per-process salt. A user struct provides its own `__hash__`
+/// (typically combining `self.field.__hash__()` values); only these scalars are
+/// hashed intrinsically.
+pub(crate) fn builtin_hash(value: &Value) -> Result<u64, RuntimeError> {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    fn mix(mut h: u64, bytes: &[u8]) -> u64 {
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        h
+    }
+    let h = match value {
+        Value::Int(n) => mix(FNV_OFFSET, &n.to_le_bytes()),
+        Value::UInt(n) => mix(FNV_OFFSET, &n.to_le_bytes()),
+        Value::Bool(b) => mix(FNV_OFFSET, &[*b as u8]),
+        Value::Float64(x) => mix(FNV_OFFSET, &x.to_bits().to_le_bytes()),
+        Value::Str(s) => mix(FNV_OFFSET, s.as_bytes()),
+        other => {
+            return Err(RuntimeError::TypeError(format!(
+                "cannot hash {}",
+                type_name(other)
+            )));
+        }
+    };
+    Ok(h)
 }
 
 /// A numeric value lifted out of `Value` for arithmetic. Operands are promoted to
@@ -897,15 +930,44 @@ pub(crate) fn builtin_round(v: Value) -> Result<Value, RuntimeError> {
     Ok(Value::Float64(value_to_float(&v)?.round()))
 }
 
-/// `Int(x)` / `UInt(x)` / `Float64(x)`: convert one numeric-or-`Bool` value
-/// between concrete numeric types (`Float64`→integer truncates toward zero,
-/// `Bool` is 0/1), following Mojo.
+/// `input(prompt)`: write the prompt immediately, read one line from standard
+/// input, and return it without the trailing line ending. EOF returns `""`, which
+/// keeps noninteractive asset runs from blocking forever.
+pub(crate) fn builtin_input(prompt: Value) -> Result<Value, RuntimeError> {
+    let Value::Str(prompt) = prompt else {
+        return Err(RuntimeError::TypeError(format!(
+            "input() expects a String prompt, got {}",
+            type_name(&prompt)
+        )));
+    };
+
+    print!("{prompt}");
+    io::stdout()
+        .flush()
+        .map_err(|e| RuntimeError::Unsupported(format!("input(): failed to flush stdout: {e}")))?;
+
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| RuntimeError::Unsupported(format!("input(): failed to read stdin: {e}")))?;
+    if line.ends_with('\n') {
+        line.pop();
+        if line.ends_with('\r') {
+            line.pop();
+        }
+    }
+    Ok(Value::Str(line))
+}
+
+/// `Int(x)` / `UInt(x)` / `Float64(x)` / `Bool(x)`: convert one numeric-or-`Bool`
+/// value (`Float64`→integer truncates toward zero, `Bool` is 0/1, `Bool(x)` is
+/// truthiness — a nonzero value is `True`), following Mojo.
 pub(crate) fn builtin_convert(name: &str, v: Value) -> Result<Value, RuntimeError> {
-    let (as_i, as_u, as_f) = match v {
-        Value::Int(n) => (n, n as u64, n as f64),
-        Value::UInt(n) => (n as i64, n, n as f64),
-        Value::Float64(x) => (x as i64, x as u64, x),
-        Value::Bool(b) => (b as i64, b as u64, if b { 1.0 } else { 0.0 }),
+    let (as_i, as_u, as_f, as_bool) = match v {
+        Value::Int(n) => (n, n as u64, n as f64, n != 0),
+        Value::UInt(n) => (n as i64, n, n as f64, n != 0),
+        Value::Float64(x) => (x as i64, x as u64, x, x != 0.0),
+        Value::Bool(b) => (b as i64, b as u64, if b { 1.0 } else { 0.0 }, b),
         other => {
             return Err(RuntimeError::TypeError(format!(
                 "{}() expects a numeric or Bool value, got {}",
@@ -917,8 +979,58 @@ pub(crate) fn builtin_convert(name: &str, v: Value) -> Result<Value, RuntimeErro
     Ok(match name {
         "Int" => Value::Int(as_i),
         "UInt" => Value::UInt(as_u),
+        "Bool" => Value::Bool(as_bool),
         _ => Value::Float64(as_f), // "Float64"
     })
+}
+
+/// The intrinsic behind `math.floor`/`ceil`/`trunc` — i.e. the `Floorable`/
+/// `Ceilable`/`Truncable` dunders on a built-in numeric value (Phase 7). An
+/// integer is already whole, so it is returned unchanged; a `Float64` rounds
+/// toward the requested direction, preserving its type (`__floor__(self) -> Self`).
+pub(crate) fn builtin_round_dir(method: &str, v: &Value) -> Result<Value, RuntimeError> {
+    match v {
+        Value::Int(_) | Value::UInt(_) => Ok(v.clone()),
+        Value::Float64(x) => Ok(Value::Float64(match method {
+            "__floor__" => x.floor(),
+            "__ceil__" => x.ceil(),
+            _ => x.trunc(), // "__trunc__"
+        })),
+        other => Err(RuntimeError::TypeError(format!(
+            "{}() expects a numeric value, got {}",
+            method,
+            type_name(other)
+        ))),
+    }
+}
+
+/// The intrinsic behind `math.ceildiv` — the `CeilDivable` dunder
+/// (`__ceildiv__(self, denominator) -> Self`, Phase 7): ceiling division,
+/// preserving the operand type. Integer ceildiv rounds toward +∞
+/// (`ceildiv(-7, 2) == -3`); float ceildiv is `ceil(a / b)`.
+pub(crate) fn builtin_ceildiv(a: &Value, b: &Value) -> Result<Value, RuntimeError> {
+    match (a, b) {
+        // Ceiling = negated floor of the negated numerator (Python flooring).
+        (Value::Int(x), Value::Int(y)) => Ok(Value::Int(-floor_div(-*x, nonzero(*y)?))),
+        (Value::UInt(x), Value::UInt(y)) => {
+            let y = nonzero_u(*y)?;
+            Ok(Value::UInt(x / y + u64::from(x % y != 0)))
+        }
+        (Value::Float64(x), Value::Float64(y)) => Ok(Value::Float64((x / y).ceil())),
+        _ => Err(RuntimeError::TypeError(format!(
+            "__ceildiv__ expects two numeric values of the same type, got {} and {}",
+            type_name(a),
+            type_name(b)
+        ))),
+    }
+}
+
+/// `divmod(a, b)` (a prelude built-in, `DivModable`): the pair `(a // b, a % b)`
+/// as a `Tuple`, using the same Python flooring `//`/`%` as the operators.
+pub(crate) fn builtin_divmod(a: Value, b: Value) -> Result<Value, RuntimeError> {
+    let q = apply_infix(InfixOp::FloorDiv, a.clone(), b.clone())?;
+    let r = apply_infix(InfixOp::Mod, a, b)?;
+    Ok(Value::Tuple(vec![q, r]))
 }
 
 /// `Error(msg)`: wrap a `String` into an `Error` value.
