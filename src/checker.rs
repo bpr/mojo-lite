@@ -80,7 +80,7 @@ fn fixed_callable_arity(ty: &Ty) -> Option<usize> {
             required,
             variadic: None,
             ..
-        } if *required == params.len() => Some(params.len()),
+        } if required.iter().all(|r| *r) => Some(params.len()),
         Ty::GenericFunc { params, .. } => Some(params.len()),
         _ => None,
     }
@@ -485,15 +485,19 @@ impl Checker {
                 ret,
                 required,
                 variadic,
+                positional_only,
+                keyword_only,
                 conventions,
             } => Ty::Func {
                 params: params.iter().map(|p| self.resolve_assoc_ty(p)).collect(),
                 names: names.clone(),
                 ret: Box::new(self.resolve_assoc_ty(ret)),
-                required: *required,
+                required: required.clone(),
                 variadic: variadic
                     .as_ref()
                     .map(|v| Box::new(self.resolve_assoc_ty(v))),
+                positional_only: *positional_only,
+                keyword_only: *keyword_only,
                 conventions: conventions.clone(),
             },
             Ty::GenericFunc { decls, params, ret } => Ty::GenericFunc {
@@ -1071,8 +1075,8 @@ impl Checker {
                 raises: _,
                 decorators: _,
             } => {
-                // Conventions / markers / `**kwargs` are parsed but not implemented;
-                // **default values** and a trailing **`*args`** are supported on
+                // Conventions / `**kwargs` are parsed but not all implemented;
+                // default values, `/`, bare `*`, and `*args` are supported on
                 // non-generic functions.
                 if let Some(feature) = Self::advanced_param_feature(
                     params,
@@ -1089,26 +1093,31 @@ impl Checker {
                         "default values on generic functions".to_string(),
                     ));
                 }
-                // A `*args` variadic must be a single, trailing parameter, on a
-                // non-generic function.
+                if keyword_only.is_some() && !type_params.is_empty() {
+                    return Err(TypeError::Unsupported(
+                        "keyword-only parameters on generic functions".to_string(),
+                    ));
+                }
+                // A `*args` variadic is supported on non-generic functions; any
+                // regular parameters after it are keyword-only.
                 let variadic_idx = params
                     .iter()
                     .position(|p| p.kind == crate::ast::ParamKind::Variadic);
-                if let Some(vi) = variadic_idx {
+                if variadic_idx.is_some() {
                     if !type_params.is_empty() {
                         return Err(TypeError::Unsupported(
                             "variadic parameters on generic functions".to_string(),
                         ));
                     }
-                    if vi != params.len() - 1 {
-                        return Err(TypeError::Unsupported(
-                            "a parameter after '*args' (keyword-only) is not supported".to_string(),
-                        ));
-                    }
                 }
                 // Regular (non-variadic) parameters, over which arity is computed.
-                let regular = &params[..variadic_idx.unwrap_or(params.len())];
-                let required = required_count(regular)?;
+                let regular: Vec<&crate::ast::FnParam> = params
+                    .iter()
+                    .filter(|p| p.kind == crate::ast::ParamKind::Regular)
+                    .collect();
+                let pos_only = regular_marker_index(params, *positional_only);
+                let kw_only = effective_keyword_only_index(params, *keyword_only, variadic_idx);
+                let required = required_mask(&regular, kw_only)?;
                 let decls = self.classify_params(type_params)?;
                 // Type parameters are in scope while resolving the signature and
                 // checking the body (as bare `T`).
@@ -1155,13 +1164,21 @@ impl Checker {
                 // body, so it can call itself (recursion). A generic `def`
                 // becomes a `GenericFunc` (its call sites infer/supply parameters).
                 let fn_ty = if decls.is_empty() {
-                    let nreg = variadic_idx.unwrap_or(params.len());
+                    let regular_tys: Vec<Ty> = params
+                        .iter()
+                        .zip(&param_tys)
+                        .filter_map(|(p, ty)| {
+                            (p.kind == crate::ast::ParamKind::Regular).then(|| ty.clone())
+                        })
+                        .collect();
                     Ty::Func {
-                        params: param_tys[..nreg].to_vec(),
+                        params: regular_tys,
                         names: regular.iter().map(|p| p.name.clone()).collect(),
                         ret: Box::new(ret_ty.clone()),
                         required,
                         variadic: variadic_idx.map(|vi| Box::new(param_tys[vi].clone())),
+                        positional_only: pos_only,
+                        keyword_only: kw_only,
                         conventions: regular.iter().map(|p| p.convention).collect(),
                     }
                 } else {
@@ -1411,14 +1428,13 @@ impl Checker {
     }
 
     /// The name of the first advanced parameter feature used by a signature (a
-    /// default value, a `*args`/`**kwargs` variadic, an argument convention, or a
-    /// `/`/`*` marker), or `None` if the signature is a plain list of typed
-    /// parameters. These are **parsed** but not implemented, so a signature using
-    /// any of them is flagged unsupported.
+    /// default value, a `*args`/`**kwargs` variadic, or an argument convention, or
+    /// `None` if the signature is supported by this checking path. `/` and bare
+    /// `*` markers are modeled by call matching and are not advanced anymore.
     fn advanced_param_feature(
         params: &[crate::ast::FnParam],
-        positional_only: Option<usize>,
-        keyword_only: Option<usize>,
+        _positional_only: Option<usize>,
+        _keyword_only: Option<usize>,
         flag_defaults: bool,
         flag_variadic: bool,
     ) -> Option<&'static str> {
@@ -1441,12 +1457,6 @@ impl Checker {
             .any(|p| matches!(p.convention, Some(ArgConvention::Out)))
         {
             return Some("the 'out' argument convention");
-        }
-        if positional_only.is_some() {
-            return Some("positional-only '/' parameters");
-        }
-        if keyword_only.is_some() {
-            return Some("keyword-only '*' parameters");
         }
         None
     }
@@ -1546,6 +1556,11 @@ impl Checker {
                     true,
                 ) {
                     return Err(TypeError::Unsupported(feature.to_string()));
+                }
+                if m.positional_only.is_some() || m.keyword_only.is_some() {
+                    return Err(TypeError::Unsupported(
+                        "positional-only/keyword-only markers on trait methods".to_string(),
+                    ));
                 }
                 let sig = MethodSig {
                     params: self.param_tys(&m.params)?,
@@ -1848,6 +1863,11 @@ impl Checker {
             )
         {
             return Err(TypeError::Unsupported(feature.to_string()));
+        }
+        if !is_mojo_copy_constructor(m) && m.keyword_only.is_some() {
+            return Err(TypeError::Unsupported(
+                "keyword-only parameters on methods".to_string(),
+            ));
         }
         // A `@staticmethod` (no `self`) is parsed but its semantics are deferred.
         if !m.has_self {
@@ -3659,7 +3679,8 @@ impl Checker {
         args: &[Expr],
         kwargs: &[crate::ast::KwArg],
     ) -> Result<(Ty, usize), TypeError> {
-        let (params, names, ret, required, variadic, conventions) = match ty {
+        let (params, names, ret, required, variadic, positional_only, keyword_only, conventions) =
+            match ty {
             // A non-generic function takes no compile-time parameters.
             Ty::Func {
                 params,
@@ -3667,6 +3688,8 @@ impl Checker {
                 ret,
                 required,
                 variadic,
+                positional_only,
+                keyword_only,
                 conventions,
             } => {
                 if !param_args.is_empty() {
@@ -3676,7 +3699,16 @@ impl Checker {
                         got: param_args.len(),
                     });
                 }
-                (params, names, ret, required, variadic, conventions)
+                (
+                    params,
+                    names,
+                    ret,
+                    required,
+                    variadic,
+                    positional_only,
+                    keyword_only,
+                    conventions,
+                )
             }
             // A generic function infers or is supplied its parameters. Keyword
             // arguments to a generic function are deferred.
@@ -3705,8 +3737,9 @@ impl Checker {
         let kw_names: Vec<&str> = kwargs.iter().map(|k| k.name.as_str()).collect();
         let (slots, overflow) = match_call_slots(
             &names,
-            params.len(),
-            required,
+            &required,
+            positional_only,
+            keyword_only,
             args.len(),
             &kw_names,
             variadic.is_some(),
@@ -4248,13 +4281,17 @@ fn substitute(ty: &Ty, subst: &HashMap<String, Ty>) -> Ty {
             ret,
             required,
             variadic,
+            positional_only,
+            keyword_only,
             conventions,
         } => Ty::Func {
             params: params.iter().map(|p| substitute(p, subst)).collect(),
             names: names.clone(),
             ret: Box::new(substitute(ret, subst)),
-            required: *required,
+            required: required.clone(),
             variadic: variadic.as_ref().map(|v| Box::new(substitute(v, subst))),
+            positional_only: *positional_only,
+            keyword_only: *keyword_only,
             conventions: conventions.clone(),
         },
         Ty::Overload(candidates) => Ty::Overload(
@@ -4294,6 +4331,8 @@ fn substitute_self(ty: &Ty, replacement: &Ty) -> Ty {
             ret,
             required,
             variadic,
+            positional_only,
+            keyword_only,
             conventions,
         } => Ty::Func {
             params: params
@@ -4302,10 +4341,12 @@ fn substitute_self(ty: &Ty, replacement: &Ty) -> Ty {
                 .collect(),
             names: names.clone(),
             ret: Box::new(substitute_self(ret, replacement)),
-            required: *required,
+            required: required.clone(),
             variadic: variadic
                 .as_ref()
                 .map(|v| Box::new(substitute_self(v, replacement))),
+            positional_only: *positional_only,
+            keyword_only: *keyword_only,
             conventions: conventions.clone(),
         },
         Ty::Overload(candidates) => Ty::Overload(
@@ -4497,6 +4538,7 @@ pub(crate) enum ArgSlot {
 pub(crate) enum MatchError {
     TooManyPositional { expected: usize, got: usize },
     UnknownKeyword(String),
+    PositionalOnly(String),
     Duplicate(String),
     Missing(String),
 }
@@ -4512,6 +4554,10 @@ impl MatchError {
             MatchError::UnknownKeyword(k) => TypeError::BadCall {
                 func: func.to_string(),
                 reason: format!("unexpected keyword argument '{}'", k),
+            },
+            MatchError::PositionalOnly(k) => TypeError::BadCall {
+                func: func.to_string(),
+                reason: format!("argument '{}' is positional-only", k),
             },
             MatchError::Duplicate(k) => TypeError::BadCall {
                 func: func.to_string(),
@@ -4538,6 +4584,10 @@ impl MatchError {
                 "'{}' got an unexpected keyword argument '{}'",
                 func, k
             )),
+            MatchError::PositionalOnly(k) => RuntimeError::TypeError(format!(
+                "'{}' got positional-only argument '{}' passed as keyword",
+                func, k
+            )),
             MatchError::Duplicate(k) => {
                 RuntimeError::TypeError(format!("'{}' got argument '{}' more than once", func, k))
             }
@@ -4553,24 +4603,33 @@ impl MatchError {
 /// indices of any extra positional arguments (which a `*args` parameter collects;
 /// only possible when `has_variadic`). Shared by the checker (over argument
 /// *types*) and the evaluator (over argument *values*) so the two agree.
-/// `required` is the number of leading regular parameters that must be bound.
+/// `required[i]` says whether regular parameter `i` must be bound.
 pub(crate) fn match_call_slots(
     param_names: &[String],
-    nparams: usize,
-    required: usize,
+    required: &[bool],
+    positional_only: Option<usize>,
+    keyword_only: Option<usize>,
     npos: usize,
     kw_names: &[&str],
     has_variadic: bool,
 ) -> Result<(Vec<ArgSlot>, Vec<usize>), MatchError> {
-    if npos > nparams && !has_variadic {
+    let nparams = param_names.len();
+    debug_assert_eq!(required.len(), nparams);
+    let positional_limit = keyword_only.unwrap_or(nparams).min(nparams);
+    if npos > positional_limit && !has_variadic {
         return Err(MatchError::TooManyPositional {
-            expected: nparams,
+            expected: positional_limit,
             got: npos + kw_names.len(),
         });
     }
-    // Positional arguments beyond the regular parameters overflow into `*args`.
-    let n_regular_pos = npos.min(nparams);
-    let overflow: Vec<usize> = (nparams..npos).collect();
+    // Positional arguments beyond the positional regular parameters overflow into
+    // `*args`; regular params at/after `keyword_only` must be supplied by name.
+    let n_regular_pos = npos.min(positional_limit);
+    let overflow: Vec<usize> = if has_variadic {
+        (positional_limit..npos).collect()
+    } else {
+        Vec::new()
+    };
     let mut slots: Vec<Option<ArgSlot>> = vec![None; nparams];
     for (i, s) in slots.iter_mut().enumerate().take(n_regular_pos) {
         *s = Some(ArgSlot::Positional(i));
@@ -4580,6 +4639,9 @@ pub(crate) fn match_call_slots(
             .iter()
             .position(|n| n == kwname)
             .ok_or_else(|| MatchError::UnknownKeyword((*kwname).to_string()))?;
+        if positional_only.is_some_and(|limit| idx < limit) {
+            return Err(MatchError::PositionalOnly((*kwname).to_string()));
+        }
         if slots[idx].is_some() {
             return Err(MatchError::Duplicate((*kwname).to_string()));
         }
@@ -4589,15 +4651,69 @@ pub(crate) fn match_call_slots(
     for (i, s) in slots.into_iter().enumerate() {
         match s {
             Some(slot) => out.push(slot),
-            None if i < required => return Err(MatchError::Missing(param_names[i].clone())),
+            None if required[i] => return Err(MatchError::Missing(param_names[i].clone())),
             None => out.push(ArgSlot::Default),
         }
     }
     Ok((out, overflow))
 }
 
-/// The number of **required** parameters (those with no default). Defaults must
-/// be trailing, so a required parameter after a defaulted one is an error.
+pub(crate) fn regular_marker_index(
+    params: &[crate::ast::FnParam],
+    marker: Option<usize>,
+) -> Option<usize> {
+    marker.map(|idx| {
+        params[..idx]
+            .iter()
+            .filter(|p| p.kind == crate::ast::ParamKind::Regular)
+            .count()
+    })
+}
+
+pub(crate) fn effective_keyword_only_index(
+    params: &[crate::ast::FnParam],
+    keyword_only: Option<usize>,
+    variadic_idx: Option<usize>,
+) -> Option<usize> {
+    [regular_marker_index(params, keyword_only), regular_marker_index(params, variadic_idx)]
+        .into_iter()
+        .flatten()
+        .min()
+}
+
+/// The per-slot **required** mask for regular parameters. Defaults must be
+/// trailing within the positional-or-keyword section and within the keyword-only
+/// section, but an optional positional parameter may be followed by a required
+/// keyword-only parameter.
+fn required_mask(
+    params: &[&crate::ast::FnParam],
+    keyword_only: Option<usize>,
+) -> Result<Vec<bool>, TypeError> {
+    let kw_start = keyword_only.unwrap_or(params.len()).min(params.len());
+    let mut required = Vec::with_capacity(params.len());
+    validate_required_order(&params[..kw_start])?;
+    validate_required_order(&params[kw_start..])?;
+    for p in params {
+        required.push(p.default.is_none());
+    }
+    Ok(required)
+}
+
+fn validate_required_order(params: &[&crate::ast::FnParam]) -> Result<(), TypeError> {
+    let mut seen_default = false;
+    for p in params {
+        if p.default.is_some() {
+            seen_default = true;
+        } else if seen_default {
+            return Err(TypeError::Unsupported(format!(
+                "a required parameter ('{}') cannot follow one with a default value",
+                p.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn lifecycle_method_name(m: &Method) -> &str {
     if is_mojo_copy_constructor(m) {
         "__copyinit__"
@@ -4623,24 +4739,6 @@ fn is_copy_param(p: &FnParam) -> bool {
         && p.kind == crate::ast::ParamKind::Regular
         && p.convention.is_none()
         && matches!(p.ty, Type::SelfType)
-}
-
-fn required_count(params: &[crate::ast::FnParam]) -> Result<usize, TypeError> {
-    let mut seen_default = false;
-    let mut required = 0;
-    for p in params {
-        if p.default.is_some() {
-            seen_default = true;
-        } else if seen_default {
-            return Err(TypeError::Unsupported(format!(
-                "a required parameter ('{}') cannot follow one with a default value",
-                p.name
-            )));
-        } else {
-            required += 1;
-        }
-    }
-    Ok(required)
 }
 
 /// A call using keyword arguments (`name=value`) is parsed but not implemented.

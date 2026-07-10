@@ -1,8 +1,8 @@
 # Phase 7: the self-hosted `math` module supplies `floor`/`ceil`/`trunc`/
-# `ceildiv` (not prelude — imported here via a relative stdlib path, as the
-# self-host algorithms fixture does). Each is generic over its trait bound; the
+# `ceildiv` (not prelude — imported here through the stdlib search root).
+# Each is generic over its trait bound; the
 # concrete `Int`/`Float64` dunders run after type erasure.
-from ...stdlib.math import floor, ceil, trunc, ceildiv
+from std.math import floor, ceil, trunc, ceildiv
 
 def main():
     print(floor(3.7), ceil(3.2), trunc(-3.7))

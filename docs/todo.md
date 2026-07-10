@@ -49,7 +49,7 @@ The first checkpoint should be mechanical and bounded:
 
 ## Module System And Stdlib Layout
 
-Status: high priority.
+Status: implemented foundation; compatibility cleanup remains.
 
 The current module linker is useful but too path-shaped. It supports
 `from module import Name` and relative imports, then hoists declarations into one
@@ -86,28 +86,34 @@ That syntax is a symptom that the linker has no standard-library search root.
 
 ### Tasks
 
-- Status: pending.
+- Status: implemented.
   Add a module search path concept to `src/module.rs`.
 
-- Status: pending.
+- Status: implemented.
   Make the default search roots include the directory of the importing file and
   the repository/compiler stdlib root.
 
-- Status: pending.
+- Status: implemented.
   Move or mirror the current self-hosted library into a Mojo-like layout under
   `stdlib/std/`.
 
-- Status: pending.
+- Status: implemented.
   Update self-hosted fixtures to import through `std...` paths instead of
   relative-dot paths.
 
-- Status: pending.
+- Status: decided for now.
   Decide whether old imports such as `from list import List` remain supported as
-  compatibility shims or disappear once the stdlib layout moves.
+  compatibility shims or disappear once the stdlib layout moves. Keep the flat
+  files for now as compatibility mirrors; prefer `std...` imports in docs and
+  new fixtures.
 
-- Status: pending.
+- Status: implemented foundation.
   Add module tests for stdlib-root lookup, dotted paths, transitive imports, and
   missing imported names.
+
+- Status: pending.
+  Add a CLI/module-path option if users need a custom stdlib or project-wide
+  import path outside tests.
 
 ### Likely Implementation Shape
 
@@ -129,11 +135,12 @@ absolute import:
   then try configured stdlib roots
 ```
 
-The public API can stay small. One option:
+The public API now stays small:
 
 ```rust
 pub fn link(entry_path: &Path) -> Result<Vec<Stmt>, ModuleError>
 pub fn link_with_options(entry_path: &Path, options: LinkOptions) -> Result<Vec<Stmt>, ModuleError>
+pub fn link_source_with_options(...)
 
 pub struct LinkOptions {
     pub search_roots: Vec<PathBuf>,
@@ -175,6 +182,37 @@ remain no-ops, and imported names fail later as undefined variables.
 Keep this behavior. It lets `assets/ok/*.mojo` files exercise modules the same
 way CLI file execution does.
 
+## Function Argument Semantics
+
+Status: partially implemented.
+
+Ordinary free functions now support Mojo-style `/`, bare `*`, homogeneous
+`*args`, keyword calls, default values, required keyword-only arguments, and
+regular parameters after `*args`.
+
+- Status: implemented.
+  Enforce positional-only arguments before `/`.
+
+- Status: implemented.
+  Enforce keyword-only arguments after bare `*`.
+
+- Status: implemented.
+  Treat regular parameters after `*args` as keyword-only and bind the collected
+  variadic list into the correct VM frame slot.
+
+- Status: deferred.
+  Implement `**kwargs`. This likely needs a real keyword-dictionary value shape
+  rather than another ad hoc call-binding branch.
+
+- Status: deferred.
+  Extend keyword/default argument binding to ordinary method calls. Today methods
+  still mostly use positional binding, apart from special constructor/copy paths.
+
+- Status: deferred.
+  Extend generic function calls to use the same keyword/default marker-aware
+  binding as non-generic functions. The current generic call path remains
+  positional-only.
+
 ## Self-Hosted Collections
 
 Status: active.
@@ -206,6 +244,11 @@ Next useful work:
   Add a hash-backed `Dict` only after the stabilization checkpoint. Use the
   existing list-backed `Dict` as the behavior oracle and keep collision
   resolution explicit and testable.
+
+- Status: pending.
+  Make nested self-hosted `List[List[T]]` behave well enough that
+  `std.collections.hashset` can import `std.collections.list` explicitly instead
+  of leaning on the built-in `List` runtime behavior for its bucket array.
 
 ## Comptime Stress Tests
 
@@ -288,7 +331,7 @@ Status: ongoing.
   Update `docs/architecture.md` once module search roots and the stdlib layout
   exist.
 
-- Status: pending.
+- Status: implemented.
   Update `stdlib/README.md` after the stdlib moves to `stdlib/std/...`.
 
 - Status: pending.

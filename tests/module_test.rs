@@ -3,7 +3,7 @@
 //! multi-file layout into a unique temp directory, link the entry file, then check
 //! + run it on the VM.
 
-use mojo_lite::{BackendKind, check, link};
+use mojo_lite::{BackendKind, LinkOptions, check, link, link_with_options};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -89,6 +89,41 @@ fn transitive_and_dotted_imports() {
         "from mid import mid\n\ndef main():\n    print(mid(4))\n",
     );
     assert_eq!(run(&main).unwrap(), "50\n");
+}
+
+#[test]
+fn bundled_stdlib_root_supports_mojo_shaped_imports() {
+    let d = TempDir::new();
+    let main = d.write(
+        "main.mojo",
+        "from std.optional import Optional\nfrom std.collections.list import List\n\ndef main():\n    var o: Optional[Int] = Optional[Int](9, True)\n    var xs: List[Int] = List[Int]()\n    xs.append(o.or_else(0))\n    print(xs[0])\n",
+    );
+    assert_eq!(run(&main).unwrap(), "9\n");
+}
+
+#[test]
+fn custom_search_root_is_used_after_importer_directory() {
+    let d = TempDir::new();
+    d.write(
+        "lib/pkg/tool.mojo",
+        "def answer() -> Int:\n    return 42\n",
+    );
+    let main = d.write(
+        "src/main.mojo",
+        "from pkg.tool import answer\n\ndef main():\n    print(answer())\n",
+    );
+    let program = link_with_options(
+        &main,
+        LinkOptions {
+            search_roots: vec![d.0.join("lib")],
+        },
+    )
+    .map_err(|e| e.to_string())
+    .unwrap();
+    check(&program).unwrap();
+    let mut backend = BackendKind::Vm.make();
+    backend.run(&program).unwrap();
+    assert_eq!(backend.output(), "42\n");
 }
 
 #[test]

@@ -1,6 +1,6 @@
-from ...stdlib.algorithms import StaticSized, type_tag, default_capacity, capacity_blocks, static_size, first_or
-from ...stdlib.list import List
-from ...stdlib.set import Set
+from std.algorithms import StaticSized, type_tag, default_capacity, capacity_blocks, static_size, first_or
+from std.collections.list import List
+from std.collections.set import Set
 
 struct Tiny(StaticSized):
     comptime size = 4

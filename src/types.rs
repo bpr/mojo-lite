@@ -27,13 +27,16 @@ pub enum Ty {
     /// The flexible type of a float literal: coerces to `Float64`.
     FloatLiteral,
     /// A non-generic function. `params`/`names` describe the regular parameters;
-    /// `required` is the number of leading regular params without a default.
+    /// `required[i]` is true when regular parameter `i` has no default. The
+    /// marker fields are indexes into this regular-parameter list.
     Func {
         params: Vec<Ty>,
         names: Vec<String>,
         ret: Box<Ty>,
-        required: usize,
+        required: Vec<bool>,
         variadic: Option<Box<Ty>>,
+        positional_only: Option<usize>,
+        keyword_only: Option<usize>,
         /// The argument convention of each regular parameter.
         conventions: Vec<Option<ArgConvention>>,
     },

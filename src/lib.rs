@@ -25,7 +25,9 @@ pub use comptime::{ComptimeError, elaborate};
 pub use ct::CtValue;
 pub use error::{LexError, OwnershipError, ParseError, RuntimeError, TypeError};
 pub use lexer::Lexer;
-pub use module::{ModuleError, link, link_source};
+pub use module::{
+    LinkOptions, ModuleError, link, link_source, link_source_with_options, link_with_options,
+};
 pub use parser::Parser;
 pub use runtime::Value;
 pub use token::Token;

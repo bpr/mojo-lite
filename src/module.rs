@@ -9,10 +9,12 @@
 //! - **`from module import Name, …`** and **`from module import *`** are resolved.
 //!   A plain **`import module`** is left as a no-op (qualified `module.Name` access
 //!   isn't modeled yet).
-//! - Module paths resolve to files relative to the importing file's directory:
-//!   `from collections import List` → `collections.mojo`; dotted `from a.b import X`
-//!   → `a/b.mojo`; **relative** `from .m import X` / `from ..pkg import X` climb from
-//!   the importing directory (each leading dot beyond the first goes up one level).
+//! - Relative module paths resolve from the importing file's directory:
+//!   `from .m import X` / `from ..pkg import X` climb from the importing directory
+//!   (each leading dot beyond the first goes up one level). Absolute imports first
+//!   try the importing directory, then configured search roots such as the bundled
+//!   `stdlib/`, so `from std.collections.list import List` works without
+//!   repository-relative dot paths.
 //! - A module's imports are resolved first (its dependencies' declarations land
 //!   ahead of its own), with **dedup + cycle-breaking** by canonical path. A
 //!   module's top-level executable statements and its `main()` are **not** hoisted.
@@ -36,6 +38,24 @@ pub enum ModuleError {
     NameNotFound { module: String, name: String },
     /// An import with no module path (e.g. `from . import x`), not yet supported.
     EmptyModulePath,
+}
+
+/// Options for module linking.
+#[derive(Debug, Clone)]
+pub struct LinkOptions {
+    /// Additional roots searched for absolute imports after the importing file's
+    /// own directory. Each root is a directory containing module files/packages.
+    pub search_roots: Vec<PathBuf>,
+}
+
+impl Default for LinkOptions {
+    fn default() -> Self {
+        let mut search_roots = Vec::new();
+        if let Some(root) = option_env!("CARGO_MANIFEST_DIR") {
+            search_roots.push(Path::new(root).join("stdlib"));
+        }
+        LinkOptions { search_roots }
+    }
 }
 
 impl std::fmt::Display for ModuleError {
@@ -64,7 +84,17 @@ impl std::fmt::Display for ModuleError {
 /// the imported declarations (dependencies first), then the entry file's own
 /// statements (with its `from … import …` statements removed).
 pub fn link(entry_path: &Path) -> Result<Vec<Stmt>, ModuleError> {
-    let mut linker = Linker::default();
+    link_with_options(entry_path, LinkOptions::default())
+}
+
+/// Link with explicit module search options. The entry file's directory is
+/// always searched first for absolute imports; `options.search_roots` are tried
+/// after that.
+pub fn link_with_options(
+    entry_path: &Path,
+    options: LinkOptions,
+) -> Result<Vec<Stmt>, ModuleError> {
+    let mut linker = Linker::new(options);
     let program = read_and_parse(entry_path)?;
     let dir = entry_path.parent().unwrap_or_else(|| Path::new("."));
     let body = linker.resolve_entry(program, dir)?;
@@ -76,11 +106,20 @@ pub fn link(entry_path: &Path) -> Result<Vec<Stmt>, ModuleError> {
 /// Link a program that was already read from `source` at `entry_path` (so the CLI
 /// doesn't read the file twice). Equivalent to [`link`] otherwise.
 pub fn link_source(source: &str, entry_path: &Path) -> Result<Vec<Stmt>, ModuleError> {
+    link_source_with_options(source, entry_path, LinkOptions::default())
+}
+
+/// Link an already-read source string with explicit module search options.
+pub fn link_source_with_options(
+    source: &str,
+    entry_path: &Path,
+    options: LinkOptions,
+) -> Result<Vec<Stmt>, ModuleError> {
     let program = parse(source).map_err(|err| ModuleError::Parse {
         module: display(entry_path),
         err,
     })?;
-    let mut linker = Linker::default();
+    let mut linker = Linker::new(options);
     let dir = entry_path.parent().unwrap_or_else(|| Path::new("."));
     let body = linker.resolve_entry(program, dir)?;
     let mut result = linker.decls;
@@ -88,8 +127,8 @@ pub fn link_source(source: &str, entry_path: &Path) -> Result<Vec<Stmt>, ModuleE
     Ok(result)
 }
 
-#[derive(Default)]
 struct Linker {
+    options: LinkOptions,
     /// Module files already hoisted (canonical path) — dedup + cycle break.
     loaded: HashSet<PathBuf>,
     /// The top-level declaration names each loaded module exposes (for validating
@@ -100,6 +139,15 @@ struct Linker {
 }
 
 impl Linker {
+    fn new(options: LinkOptions) -> Self {
+        Linker {
+            options,
+            loaded: HashSet::new(),
+            exports: HashMap::new(),
+            decls: Vec::new(),
+        }
+    }
+
     /// Resolve the entry program's imports (loading their modules) and return its
     /// own non-import statements (declarations + top-level code + `main`).
     fn resolve_entry(&mut self, program: Vec<Stmt>, dir: &Path) -> Result<Vec<Stmt>, ModuleError> {
@@ -107,7 +155,7 @@ impl Linker {
         for stmt in program {
             match &stmt.kind {
                 StmtKind::FromImport { level, path, names } => {
-                    let (module_path, module_name) = module_file(dir, *level, path)?;
+                    let (module_path, module_name) = self.resolve_module(dir, *level, path)?;
                     self.load_module(&module_path, &module_name)?;
                     self.check_names(&module_path, &module_name, names)?;
                 }
@@ -134,7 +182,7 @@ impl Linker {
                 level, path: mpath, ..
             } = &stmt.kind
             {
-                let (dep_path, dep_name) = module_file(dir, *level, mpath)?;
+                let (dep_path, dep_name) = self.resolve_module(dir, *level, mpath)?;
                 self.load_module(&dep_path, &dep_name)?;
             }
         }
@@ -175,6 +223,15 @@ impl Linker {
         }
         Ok(())
     }
+
+    fn resolve_module(
+        &self,
+        from_dir: &Path,
+        level: usize,
+        path: &[String],
+    ) -> Result<(PathBuf, String), ModuleError> {
+        module_file(from_dir, level, path, &self.options.search_roots)
+    }
 }
 
 /// The declared name of a top-level declaration statement (`def`/`struct`/`trait`/
@@ -196,19 +253,39 @@ fn module_file(
     from_dir: &Path,
     level: usize,
     path: &[String],
+    search_roots: &[PathBuf],
 ) -> Result<(PathBuf, String), ModuleError> {
     if path.is_empty() {
         return Err(ModuleError::EmptyModulePath);
     }
-    let mut base = from_dir.to_path_buf();
-    for _ in 1..level {
-        base.pop();
+    let display_name = path.join(".");
+    if level > 0 {
+        let mut base = from_dir.to_path_buf();
+        for _ in 1..level {
+            base.pop();
+        }
+        return Ok((module_path_under(base, path), display_name));
     }
+
+    let local = module_path_under(from_dir.to_path_buf(), path);
+    if local.exists() {
+        return Ok((local, display_name));
+    }
+    for root in search_roots {
+        let candidate = module_path_under(root.clone(), path);
+        if candidate.exists() {
+            return Ok((candidate, display_name));
+        }
+    }
+    Ok((local, display_name))
+}
+
+fn module_path_under(mut base: PathBuf, path: &[String]) -> PathBuf {
     for part in path {
         base.push(part);
     }
     base.set_extension("mojo");
-    Ok((base, path.join(".")))
+    base
 }
 
 fn read_and_parse(path: &Path) -> Result<Vec<Stmt>, ModuleError> {

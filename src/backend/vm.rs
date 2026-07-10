@@ -31,7 +31,9 @@ use crate::ast::{
     ArgConvention, Expr, ExprKind, FnParam, Method, ParamArg, ParamKind, PrefixOp, Stmt, StmtKind,
     Type,
 };
-use crate::checker::{ArgSlot, match_call_slots};
+use crate::checker::{
+    ArgSlot, effective_keyword_only_index, match_call_slots, regular_marker_index,
+};
 use crate::error::RuntimeError;
 use crate::hir::VarId;
 use crate::mir::{Const, MirBlock, MirInstr, MirPlace, MirProgram, MirTerm, Proj, Reg};
@@ -82,8 +84,14 @@ struct FnSig {
     /// Const-evaluated default per regular parameter (`None` = no default, or a
     /// non-constant default the VM can't fold — using such a slot errors).
     defaults: Vec<Option<Value>>,
-    required: usize,
+    required: Vec<bool>,
     variadic: Option<Type>,
+    /// Where the collected `*args` list belongs among source parameters. For a
+    /// signature like `def f(a, *xs, b)`, this is `Some(1)`.
+    variadic_index: Option<usize>,
+    /// Indexes into the regular-parameter list.
+    positional_only: Option<usize>,
+    keyword_only: Option<usize>,
     /// The function's compile-time parameters (`def f[...]`), each `(name,
     /// is_value)` — a value parameter is reified as a frame-local `Int` at the call.
     param_decls: Vec<(String, bool)>,
@@ -1556,17 +1564,19 @@ fn build_sigs(program: &[Stmt]) -> HashMap<String, FnSig> {
             name,
             type_params,
             params,
+            positional_only,
+            keyword_only,
             ..
         } = &s.kind
         {
-            // Split the regular parameters from a trailing `*args` (mirrors the
-            // checker / evaluator).
-            let nreg = params
+            let variadic_idx = params.iter().position(|p| p.kind == ParamKind::Variadic);
+            let regular: Vec<_> = params
                 .iter()
-                .position(|p| p.kind == ParamKind::Variadic)
-                .unwrap_or(params.len());
-            let regular = &params[..nreg];
-            let required = regular.iter().take_while(|p| p.default.is_none()).count();
+                .filter(|p| p.kind == ParamKind::Regular)
+                .collect();
+            let pos_only = regular_marker_index(params, *positional_only);
+            let kw_only = effective_keyword_only_index(params, *keyword_only, variadic_idx);
+            let required = regular.iter().map(|p| p.default.is_none()).collect();
             let lowered_name = overloaded_def_name(name, params, &overloads);
             map.insert(
                 lowered_name,
@@ -1578,7 +1588,10 @@ fn build_sigs(program: &[Stmt]) -> HashMap<String, FnSig> {
                         .map(|p| p.default.as_ref().and_then(const_default))
                         .collect(),
                     required,
-                    variadic: params.get(nreg).map(|p| p.ty.clone()),
+                    variadic: variadic_idx.map(|vi| params[vi].ty.clone()),
+                    variadic_index: regular_marker_index(params, variadic_idx),
+                    positional_only: pos_only,
+                    keyword_only: kw_only,
                     param_decls: crate::runtime::classify_param_decls(type_params),
                 },
             );
@@ -1763,15 +1776,16 @@ fn bind_args(
     let kw_names: Vec<&str> = kwargs.iter().map(|(n, _)| n.as_str()).collect();
     let (slots, overflow) = match_call_slots(
         &sig.param_names,
-        sig.param_names.len(),
-        sig.required,
+        &sig.required,
+        sig.positional_only,
+        sig.keyword_only,
         argv.len(),
         &kw_names,
         sig.variadic.is_some(),
     )
     .map_err(|e| e.into_runtime_error(name))?;
 
-    let mut out = Vec::with_capacity(slots.len() + 1);
+    let mut regular_values = Vec::with_capacity(slots.len());
     for (i, slot) in slots.iter().enumerate() {
         let value = match slot {
             ArgSlot::Positional(p) => argv[*p].clone(),
@@ -1783,17 +1797,28 @@ fn bind_args(
                 ))
             })?,
         };
-        out.push(coerce(value, &sig.param_types[i]));
+        regular_values.push(coerce(value, &sig.param_types[i]));
     }
     // Collect overflow positional args into the `*args` list.
-    if let Some(elem_ty) = &sig.variadic {
+    let (out, frame_slots) = if let Some(elem_ty) = &sig.variadic {
         let items = overflow
             .iter()
             .map(|&idx| coerce(argv[idx].clone(), elem_ty))
             .collect();
+        let idx = sig.variadic_index.unwrap_or(regular_values.len());
+        let mut out = Vec::with_capacity(regular_values.len() + 1);
+        out.extend(regular_values[..idx].iter().cloned());
         out.push(Value::List(items));
-    }
-    Ok((out, slots))
+        out.extend(regular_values[idx..].iter().cloned());
+        let mut frame_slots = Vec::with_capacity(slots.len() + 1);
+        frame_slots.extend(slots[..idx].iter().copied());
+        frame_slots.push(ArgSlot::Default);
+        frame_slots.extend(slots[idx..].iter().copied());
+        (out, frame_slots)
+    } else {
+        (regular_values, slots)
+    };
+    Ok((out, frame_slots))
 }
 
 /// Build a struct instance (fieldwise), coercing each argument to its field type.

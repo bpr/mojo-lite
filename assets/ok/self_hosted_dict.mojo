@@ -1,4 +1,4 @@
-from ...stdlib.dict import Dict
+from std.collections.dict import Dict
 
 def main():
     var d: Dict[String, String] = Dict[String, String]()
