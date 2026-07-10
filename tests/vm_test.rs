@@ -223,6 +223,11 @@ fn vm_runs_every_ok_fixture() {
         if path.extension().and_then(|e| e.to_str()) != Some("mojo") {
             continue;
         }
+        // This fixture intentionally reads stdin; an integration test inherits
+        // Cargo's terminal and would wait for user input forever.
+        if path.file_name().and_then(|n| n.to_str()) == Some("input.mojo") {
+            continue;
+        }
         let program = link(&path)
             .unwrap_or_else(|e| panic!("link failed on ok fixture {}: {e}", path.display()));
         let program = elaborate(program)

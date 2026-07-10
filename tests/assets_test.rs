@@ -98,6 +98,11 @@ fn check_category(category: &str, expected: Outcome) {
     let mut failures = Vec::new();
     for path in fixtures(category) {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        // `input.mojo` is an interactive smoke fixture. Running it from an
+        // integration test inherits Cargo's stdin and can block indefinitely.
+        if category == "ok" && name == "input.mojo" {
+            continue;
+        }
         let source = fs::read_to_string(&path).expect("read fixture");
         let (got, message) = classify(&path);
         let shown = if message.is_empty() {

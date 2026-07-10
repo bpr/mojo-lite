@@ -751,6 +751,18 @@ fn parses_comptime_constant() {
 }
 
 #[test]
+fn parses_annotated_comptime_constant() {
+    let stmts = parse("comptime counter: Int = 1\n");
+    assert_eq!(
+        stmts[0],
+        Stmt::from(StmtKind::Comptime {
+            name: "counter".into(),
+            value: Expr::from(ExprKind::Int(1)),
+        })
+    );
+}
+
+#[test]
 fn parses_comptime_if_with_else() {
     // `comptime if` mirrors a normal `if` (branches + optional else).
     match &parse("comptime if N > 4:\n    pass\nelse:\n    pass\n")[0].kind {

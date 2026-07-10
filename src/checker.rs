@@ -240,6 +240,8 @@ pub struct Checker {
     /// Binding mutability, parallel to `scopes`. `var` locals are writable;
     /// ordinary function parameters are not.
     mutable_scopes: Vec<HashMap<String, bool>>,
+    /// Index of the local scope for each function currently being checked.
+    function_bases: Vec<usize>,
     /// Defined structs, by name (a separate namespace from value bindings).
     structs: HashMap<String, StructInfo>,
     /// Defined traits, by name (their method requirements).
@@ -274,6 +276,7 @@ impl Checker {
         Self {
             scopes: vec![HashMap::new()],
             mutable_scopes: vec![HashMap::new()],
+            function_bases: Vec::new(),
             structs: HashMap::new(),
             traits: HashMap::new(),
             tparams: Vec::new(),
@@ -929,7 +932,38 @@ impl Checker {
             StmtKind::Assign { name, value } => {
                 let found = self.infer(value)?;
                 self.check_consuming(value, &found, &format!("assignment to '{name}'"))?;
-                match self.lookup(name).cloned() {
+                // Mojo treats a bare assignment in a function as a local
+                // introduction unless that name is already local to this
+                // function. Its initializer may still read an outer binding.
+                let target = if let Some(&base) = self.function_bases.last() {
+                    self.scopes[base..]
+                        .iter()
+                        .rev()
+                        .find_map(|s| s.get(name))
+                        .cloned()
+                        .or_else(|| {
+                            // A mutable captured variable is updated by reference;
+                            // an immutable capture (notably `comptime`) is instead
+                            // shadowed by a new function-local binding.
+                            let mutable = self.mutable_scopes[..base]
+                                .iter()
+                                .rev()
+                                .find_map(|s| s.get(name))
+                                .copied()
+                                .unwrap_or(false);
+                            mutable.then(|| {
+                                self.scopes[..base]
+                                    .iter()
+                                    .rev()
+                                    .find_map(|s| s.get(name))
+                                    .expect("parallel scope stacks")
+                                    .clone()
+                            })
+                        })
+                } else {
+                    self.lookup(name).cloned()
+                };
+                match target {
                     // Re-assignment: the value must keep the variable's type.
                     Some(target) => {
                         if !self.is_binding_mutable(name) {
@@ -1194,6 +1228,7 @@ impl Checker {
                 }
 
                 self.push_scope();
+                self.function_bases.push(self.scopes.len() - 1);
                 let mut result = Ok(());
                 // Value parameters are ordinary `Int` locals in the body.
                 for d in &decls {
@@ -1235,6 +1270,7 @@ impl Checker {
                     result = Err(TypeError::MissingReturn(name.clone()));
                 }
                 self.pop_scope();
+                self.function_bases.pop();
                 self.tparams.pop();
                 result
             }
@@ -1273,12 +1309,12 @@ impl Checker {
                 match self.eval_ct(value) {
                     Ok(v) => {
                         self.comptimes.insert(name.clone(), v);
-                        self.declare(name, Ty::Int)
+                        self.declare_immutable(name, Ty::Int)
                     }
                     Err(_) => {
                         let ty = self.infer(value)?;
                         let declared = self.inferred_binding_ty(&ty, name)?;
-                        self.declare(name, declared)
+                        self.declare_immutable(name, declared)
                     }
                 }
             }

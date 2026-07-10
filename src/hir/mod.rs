@@ -11,9 +11,29 @@
 use crate::ast::{Expr, ExprKind, Stmt, StmtKind, Type};
 use crate::token::DUMMY_SPAN;
 use petgraph::stable_graph::{NodeIndex, StableGraph};
+use std::collections::{HashMap, HashSet};
 
 pub type BlockId = NodeIndex;
 pub type VarId = u32;
+
+fn rename_expr(e: &mut Expr, resolve: &impl Fn(&str) -> String) {
+    match &mut e.kind {
+        ExprKind::Identifier(n) => *n = resolve(n),
+        ExprKind::Prefix(_, x) | ExprKind::Transfer(x) => rename_expr(x, resolve),
+        ExprKind::Infix(_, l, r) => { rename_expr(l, resolve); rename_expr(r, resolve); }
+        ExprKind::Compare { first, rest } => { rename_expr(first, resolve); for (_, x) in rest { rename_expr(x, resolve); } }
+        ExprKind::Call { args, kwargs, .. } => { for x in args { rename_expr(x, resolve); } for x in kwargs { rename_expr(&mut x.value, resolve); } }
+        ExprKind::Member { object, .. } => rename_expr(object, resolve),
+        ExprKind::MethodCall { object, args, kwargs, .. } => { rename_expr(object, resolve); for x in args { rename_expr(x, resolve); } for x in kwargs { rename_expr(&mut x.value, resolve); } }
+        ExprKind::Index { object, index } => { rename_expr(object, resolve); rename_expr(index, resolve); }
+        ExprKind::Slice { object, lower, upper, step } => { rename_expr(object, resolve); for x in [lower, upper, step].into_iter().flatten() { rename_expr(x, resolve); } }
+        ExprKind::ListLit(xs) | ExprKind::TupleLit(xs) => for x in xs { rename_expr(x, resolve); },
+        ExprKind::Named { value, .. } => rename_expr(value, resolve),
+        ExprKind::IfExpr { cond, then_branch, else_branch } => { rename_expr(cond, resolve); rename_expr(then_branch, resolve); rename_expr(else_branch, resolve); }
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Str(_)
+        | ExprKind::None | ExprKind::TString { .. } | ExprKind::TypeApply { .. } => {}
+    }
+}
 
 /// One straight-line instruction inside a basic block. Control flow lives in the
 /// block's [`Terminator`], never here.
@@ -117,6 +137,10 @@ impl Cfg {
     /// parameters — the call ABI the MIR/VM rely on to bind arguments. The final
     /// fall-through block gets an implicit `return None`.
     pub fn build_fn(params: &[String], body: &[Stmt]) -> Cfg {
+        Self::build_fn_with_captures(params, HashSet::new(), body)
+    }
+
+    pub(crate) fn build_fn_with_captures(params: &[String], shadow_captures: HashSet<String>, body: &[Stmt]) -> Cfg {
         let mut g = StableGraph::new();
         let entry = g.add_node(BasicBlock::default());
         let mut lower = Lower {
@@ -124,6 +148,8 @@ impl Cfg {
             cur: entry,
             loops: Vec::new(),
             vars: params.to_vec(),
+            scopes: vec![params.iter().map(|n| (n.clone(), n.clone())).collect()],
+            captures: shadow_captures,
             is_function: true,
         };
         for s in body {
@@ -171,6 +197,8 @@ impl Cfg {
             g,
             cur: entry,
             loops,
+            scopes: vec![seed_vars.iter().map(|n| (n.clone(), n.clone())).collect()],
+            captures: HashSet::new(),
             vars: seed_vars,
             is_function: false,
         };
@@ -231,6 +259,8 @@ struct Lower {
     loops: Vec<LoopFrame>,
     /// Interner: a variable name's first appearance assigns its `VarId`.
     vars: Vec<String>,
+    scopes: Vec<HashMap<String, String>>,
+    captures: HashSet<String>,
     /// Whether this is a function-body CFG (vs. a seeded `try` region). A
     /// function's own loops are function-level, so a `try` inside one can escape to
     /// them; a region's own loops are region-local and cannot be escape targets.
@@ -282,6 +312,31 @@ impl Lower {
         }
     }
 
+    fn resolved(&self, name: &str) -> String {
+        self.scopes.iter().rev().find_map(|s| s.get(name)).cloned()
+            .unwrap_or_else(|| name.to_string())
+    }
+
+    fn declare_var(&mut self, name: &str) -> VarId {
+        let runtime = if self.scopes.iter().rev().skip(1).any(|s| s.contains_key(name)) {
+            format!("{name}$shadow{}", self.vars.len())
+        } else { name.to_string() };
+        self.scopes.last_mut().unwrap().insert(name.to_string(), runtime.clone());
+        self.var(&runtime)
+    }
+
+    fn expr(&self, e: &Expr) -> Expr {
+        let mut e = e.clone();
+        rename_expr(&mut e, &|n| self.resolved(n));
+        e
+    }
+
+    fn scoped_block(&mut self, body: &[Stmt]) {
+        self.scopes.push(HashMap::new());
+        self.block(body);
+        self.scopes.pop();
+    }
+
     fn block(&mut self, body: &[Stmt]) {
         for s in body {
             self.stmt(s);
@@ -296,17 +351,17 @@ impl Lower {
                     let then_b = self.new_block();
                     let else_b = self.new_block();
                     self.seal(Terminator::Branch {
-                        cond: cond.clone(),
+                        cond: self.expr(cond),
                         then_b,
                         else_b,
                     });
                     self.cur = then_b;
-                    self.block(body);
+                    self.scoped_block(body);
                     self.seal(Terminator::Jump(join));
                     self.cur = else_b; // the next elif/else lowers into this block
                 }
                 if let Some(body) = orelse {
-                    self.block(body);
+                    self.scoped_block(body);
                 }
                 self.seal(Terminator::Jump(join));
                 self.cur = join;
@@ -415,22 +470,34 @@ impl Lower {
             StmtKind::Return(e) => self.seal(Terminator::Return(e.clone())),
 
             StmtKind::VarDecl { name, ty, value } => {
-                let v = self.var(name);
+                let value = self.expr(value);
+                let v = self.declare_var(name);
                 self.push(HirInstr::Bind {
                     dest: v,
-                    expr: value.clone(),
+                    expr: value,
                     ty: ty.clone(), // annotation drives literal coercion
                 });
             }
             StmtKind::Assign { name, value } => {
-                let v = self.var(name);
+                let value = self.expr(value);
+                let captured = self.captures.remove(name);
+                if !self.scopes.iter().any(|s| s.contains_key(name)) {
+                    self.scopes.last_mut().unwrap().insert(name.clone(), name.clone());
+                }
+                let v = if captured {
+                    let runtime = format!("{name}$shadow{}", self.vars.len());
+                    self.scopes.last_mut().unwrap().insert(name.clone(), runtime.clone());
+                    self.var(&runtime)
+                } else {
+                    self.var(&self.resolved(name))
+                };
                 self.push(HirInstr::Bind {
                     dest: v,
-                    expr: value.clone(),
+                    expr: value,
                     ty: None, // reassignment keeps the binding's existing type
                 });
             }
-            StmtKind::Expr(e) => self.push(HirInstr::Eval(e.clone())),
+            StmtKind::Expr(e) => self.push(HirInstr::Eval(self.expr(e))),
 
             // A `try`: snapshot the enclosing loop stack so a `break`/`continue`
             // inside it can escape to an outer loop. Supported only when every

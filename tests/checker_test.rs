@@ -2030,7 +2030,7 @@ fn borrow_check_is_place_sensitive() {
     ));
 
     let whole_vs_field = format!(
-        "{common}def g(mut x: P, y: Int):\n    y = y\n\ndef main():\n    var p: P = P(1, 2)\n    g(p, p.a)\n    print(p.a)\n"
+        "{common}def g(mut x: P, y: Int):\n    pass\n\ndef main():\n    var p: P = P(1, 2)\n    g(p, p.a)\n    print(p.a)\n"
     );
     assert!(matches!(
         check_source(&whole_vs_field),

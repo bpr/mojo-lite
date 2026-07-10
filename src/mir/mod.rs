@@ -1951,7 +1951,17 @@ fn lower_fn_nested(
             // variable — reference-capture semantics).
             let mut refp2 = vec![true; captures.len()];
             refp2.extend(dparams.iter().map(|p| is_ref(&p.convention)));
-            let ncfg = Cfg::build_fn(&names, dbody);
+            let immutable_captures: HashSet<String> = captures
+                .iter()
+                .filter(|capture| {
+                    body.iter().any(|stmt| matches!(
+                        &stmt.kind,
+                        StmtKind::Comptime { name, .. } if name == *capture
+                    ))
+                })
+                .cloned()
+                .collect();
+            let ncfg = Cfg::build_fn_with_captures(&names, immutable_captures, dbody);
             let mut nf = lower_cfg_nested(&ncfg, &registry, overloads, overload_targets);
             nf.param_types = ptys;
             nf.owned_params = owned2;

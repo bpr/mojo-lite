@@ -326,11 +326,11 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         Ok(StmtKind::VarDecl { name, ty, value })
     }
 
-    /// `comptime NAME = value` — a compile-time constant.
+    /// `comptime NAME[: Type] = value` — a compile-time constant.
     /// `comptime`, which introduces one of three forms: a compile-time constant
-    /// `comptime NAME = expr`, a compile-time conditional `comptime if …`, or a
-    /// compile-time (unrolled) loop `comptime for …` (Mojo's modern spellings —
-    /// the older `@parameter if`/`@parameter for` are deprecated).
+    /// `comptime NAME[: Type] = expr`, a compile-time conditional `comptime if …`,
+    /// or a compile-time (unrolled) loop `comptime for …` (Mojo's modern spellings
+    /// — the older `@parameter if`/`@parameter for` are deprecated).
     fn parse_comptime(&mut self) -> Result<StmtKind, ParseError> {
         self.expect(Token::Comptime, "Expected 'comptime'")?;
         match self.peek_token()? {
@@ -345,9 +345,17 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
             _ => {
                 let name =
                     self.expect_identifier("Expected a name, 'if', or 'for' after 'comptime'")?;
+                // Mojo permits an optional annotation (`comptime N: Int = 1`).
+                // The current AST stores the folded value only; parsing the type
+                // here keeps syntax compatibility and validates that the annotation
+                // itself is well formed.
+                if matches!(self.peek_token()?, Some(Token::Colon)) {
+                    self.next_token()?; // consume ':'
+                    self.parse_type()?;
+                }
                 self.expect(
                     Token::Assign,
-                    "Expected '=' after the comptime constant name",
+                    "Expected '=' after the comptime constant name (or its ': Type')",
                 )?;
                 let value = self.parse_expression(Precedence::Lowest)?;
                 self.expect_stmt_end()?;
