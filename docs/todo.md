@@ -54,7 +54,7 @@ Status: implemented foundation; compatibility cleanup remains.
 The current module linker is useful but too path-shaped. It supports
 `from module import Name` and relative imports, then hoists declarations into one
 flat program. That was enough to get self-hosted `stdlib/` files working, but it
-is not the organization mojo-lite wants long-term.
+is not the organization mojito wants long-term.
 
 The next direction should follow Mojo's file organization more closely:
 
@@ -175,7 +175,7 @@ leading dots.
 
 Status: implemented.
 
-The file-based asset harness should run fixtures through `mojo_lite::link(path)`
+The file-based asset harness should run fixtures through `mojito::link(path)`
 instead of parse-only `parse(source)`. Otherwise imports parse successfully but
 remain no-ops, and imported names fail later as undefined variables.
 

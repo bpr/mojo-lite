@@ -17,7 +17,7 @@
 //! and `vm_refuses_mut_ref_via_non_place_argument`: the VM must error cleanly, never
 //! diverge.
 
-use mojo_lite::{BackendKind, check, elaborate, link, parse};
+use mojito::{BackendKind, check, elaborate, link, parse};
 
 /// Run `src` through the VM backend (the sole executor) and return its captured
 /// output, or a stage error string.
@@ -431,7 +431,7 @@ fn unsafe_pointer_alloc_load_store_alias() {
 
 #[test]
 fn self_hosted_vec_over_unsafe_pointer() {
-    // A heap-owning container written in mojo-lite: `push` mutates storage through
+    // A heap-owning container written in mojito: `push` mutates storage through
     // the pointer (aliased across the value-type copy); the size is written back.
     let src = "struct IntVec:\n    var data: UnsafePointer[Int]\n    var size: Int\n    def __init__(out self, cap: Int):\n        self.data = UnsafePointer[Int].alloc(cap)\n        self.size = 0\n    def push(mut self, v: Int):\n        self.data[self.size] = v\n        self.size = self.size + 1\n    def get(self, i: Int) -> Int:\n        return self.data[i]\n\ndef main():\n    var xs: IntVec = IntVec(8)\n    xs.push(7)\n    xs.push(8)\n    xs.push(9)\n    print(xs.size, xs.get(0), xs.get(2))\n";
     assert_eq!(parity(src), "3 7 9\n");

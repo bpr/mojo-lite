@@ -2,9 +2,9 @@
 //! A-Normal Form, that writes lower through places, and that the program driver
 //! produces one function per `def` / method.
 
-use mojo_lite::hir::Cfg;
-use mojo_lite::mir::{MirInstr, MirPlace, MirTerm, Proj, lower_cfg, lower_program};
-use mojo_lite::parse;
+use mojito::hir::Cfg;
+use mojito::mir::{MirInstr, MirPlace, MirTerm, Proj, lower_cfg, lower_program};
+use mojito::parse;
 
 /// Lower a single-block snippet and return that block's instructions.
 fn instrs(src: &str) -> Vec<MirInstr> {
@@ -133,7 +133,7 @@ fn transfer_lowers_to_a_move_use() {
     assert!(is.iter().any(|i| matches!(
         i,
         MirInstr::UseVar {
-            mode: mojo_lite::mir::UseMode::Move,
+            mode: mojito::mir::UseMode::Move,
             ..
         }
     )));
@@ -298,7 +298,7 @@ fn partial_move_lowers_to_a_move_place() {
 
 #[test]
 fn break_crossing_try_lowers_to_escape_jump() {
-    use mojo_lite::mir::{MirInstr, MirTerm, lower_program};
+    use mojito::mir::{MirInstr, MirTerm, lower_program};
     // `break` inside a `try` in a `for` loop lowers to a `MirTerm::EscapeJump` in
     // the try's body region — not a `MirInstr::Unsupported`.
     let src = "def main():\n    for i in range(3):\n        try:\n            break\n        finally:\n            print(i)\n";

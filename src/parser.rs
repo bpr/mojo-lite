@@ -422,7 +422,7 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
 
     /// Parses an optional `raises` effect after a function's parameter list. An
     /// error type may follow (`raises ValidationError`); it is parsed and
-    /// discarded (mojo-lite models a single `Error` type). Returns whether the
+    /// discarded (mojito models a single `Error` type). Returns whether the
     /// effect was present.
     fn parse_raises_effect(&mut self) -> Result<bool, ParseError> {
         if !matches!(self.peek_token()?, Some(Token::Raises)) {

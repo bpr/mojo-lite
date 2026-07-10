@@ -1,10 +1,10 @@
 //! Self-hosting proof (Phase 6, first installment): the `stdlib/` collection types
-//! are written **in mojo-lite itself** — ordinary *generic* structs (`List[T]`,
+//! are written **in mojito itself** — ordinary *generic* structs (`List[T]`,
 //! `Optional[T]`, `Set[T]`, `Dict[K, V]`), no compiler intrinsic. Each test writes
 //! a small entry program that imports through the bundled `stdlib/std/...` search
 //! root and runs on the VM.
 
-use mojo_lite::{BackendKind, check, elaborate, link};
+use mojito::{BackendKind, check, elaborate, link};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -15,7 +15,7 @@ impl TempDir {
         static N: AtomicUsize = AtomicUsize::new(0);
         let id = N.fetch_add(1, Ordering::Relaxed);
         let dir =
-            std::env::temp_dir().join(format!("mojo_lite_selfhost_{}_{}", std::process::id(), id));
+            std::env::temp_dir().join(format!("mojito_selfhost_{}_{}", std::process::id(), id));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         TempDir(dir)
     }

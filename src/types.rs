@@ -10,7 +10,7 @@ use std::fmt;
 use crate::ast::{ArgConvention, Dtype};
 use crate::ct::CtValue;
 
-/// A type in mojo-lite's semantic lattice. Scalars mirror `ast::Type`; `Func` is
+/// A type in mojito's semantic lattice. Scalars mirror `ast::Type`; `Func` is
 /// synthesized from a `def` signature. The annotation grammar has no function
 /// types yet, so `Func` only ever arises from a `def`, never from an annotation.
 #[derive(Debug, Clone, PartialEq, Eq)]

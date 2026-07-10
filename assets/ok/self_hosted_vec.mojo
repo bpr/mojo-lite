@@ -1,4 +1,4 @@
-# A growable integer vector written in mojo-lite itself, backed by an
+# A growable integer vector written in mojito itself, backed by an
 # `UnsafePointer[Int]` — the first proof that the language can express a
 # heap-owning container (the Phase 2 / self-hosting milestone). `push` mutates the
 # shared storage *through* the pointer (which aliases across the value-type copy).

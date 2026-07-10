@@ -2,8 +2,8 @@
 //! graph — block count, edges, and terminators — for each control-flow construct,
 //! since Phase 1 is about structure, not instruction contents.
 
-use mojo_lite::hir::{Cfg, Terminator};
-use mojo_lite::parse;
+use mojito::hir::{Cfg, Terminator};
+use mojito::parse;
 
 /// Parse a source snippet and lower it to a CFG.
 fn cfg(src: &str) -> Cfg {
@@ -197,9 +197,9 @@ fn seeded_region_break_continue_escape_to_external_loops() {
     // A region seeded with an enclosing function loop lowers an outward `break` to
     // `EscapeJump(exit)` and `continue` to `EscapeJump(header)` — carrying the
     // enclosing block ids (not region-local nodes).
-    let body = mojo_lite::parse("break\n").expect("parse");
-    let header = mojo_lite::hir::BlockId::new(41);
-    let exit = mojo_lite::hir::BlockId::new(42);
+    let body = mojito::parse("break\n").expect("parse");
+    let header = mojito::hir::BlockId::new(41);
+    let exit = mojito::hir::BlockId::new(42);
     let region = Cfg::build_seeded_with_loops(Vec::new(), &body, &[(header, exit)]);
     let esc = region
         .g
@@ -211,7 +211,7 @@ fn seeded_region_break_continue_escape_to_external_loops() {
         .expect("break should escape as EscapeJump");
     assert_eq!(esc, exit, "break escapes to the enclosing loop exit");
 
-    let cont_body = mojo_lite::parse("continue\n").expect("parse");
+    let cont_body = mojito::parse("continue\n").expect("parse");
     let region2 = Cfg::build_seeded_with_loops(Vec::new(), &cont_body, &[(header, exit)]);
     let esc2 = region2
         .g
@@ -231,9 +231,9 @@ fn seeded_region_break_continue_escape_to_external_loops() {
 fn nested_loop_in_region_absorbs_its_own_break() {
     // A loop declared *inside* the region absorbs its own `break` (a local `Jump`),
     // so no `EscapeJump` is produced.
-    let body = mojo_lite::parse("while True:\n    break\n").expect("parse");
-    let header = mojo_lite::hir::BlockId::new(7);
-    let exit = mojo_lite::hir::BlockId::new(8);
+    let body = mojito::parse("while True:\n    break\n").expect("parse");
+    let header = mojito::hir::BlockId::new(7);
+    let exit = mojito::hir::BlockId::new(8);
     let region = Cfg::build_seeded_with_loops(Vec::new(), &body, &[(header, exit)]);
     let has_escape = region
         .g

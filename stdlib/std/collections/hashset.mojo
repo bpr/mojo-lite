@@ -1,4 +1,4 @@
-# An experimental hash-backed `HashSet[T]` (Phase 6), written in mojo-lite.
+# An experimental hash-backed `HashSet[T]` (Phase 6), written in mojito.
 #
 # Unlike the list-backed `Set[T]` (which linearly scans every element on each
 # `contains`/`add`), this keeps a fixed array of buckets and only scans the one

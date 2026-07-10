@@ -280,7 +280,7 @@ pub(crate) fn values_equal(a: &Value, b: &Value) -> Result<bool, RuntimeError> {
 
 /// Intrinsic `__hash__` for a built-in hashable value (Phase 6) — a
 /// **deterministic**, no-seed FNV-1a over the value's bytes, returning `UInt`
-/// (mojo-lite's native u64). Determinism across runs is a deliberate design
+/// (mojito's native u64). Determinism across runs is a deliberate design
 /// decision: no per-process salt. A user struct provides its own `__hash__`
 /// (typically combining `self.field.__hash__()` values); only these scalars are
 /// hashed intrinsically.

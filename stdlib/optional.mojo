@@ -1,4 +1,4 @@
-# A self-hosted, generic `Optional[T]` — an ordinary mojo-lite struct (no compiler
+# A self-hosted, generic `Optional[T]` — an ordinary mojito struct (no compiler
 # intrinsic). A present value or an absent one.
 struct Optional[T: Copyable & Movable]:
     var present: Bool

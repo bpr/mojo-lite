@@ -1,9 +1,9 @@
-use mojo_lite::ast::{
+use mojito::ast::{
     ArgConvention, Decorator, Expr, ExprKind, FnParam, ImportName, ImportNames, InfixOp, KwArg,
     Method, Param, ParamArg, ParamKind, PrefixOp, Stmt, StmtKind, StructComptime, TStringPart,
     TraitComptime, TraitMethod, Type, TypeParam, WithItem,
 };
-use mojo_lite::{Lexer, Parser};
+use mojito::{Lexer, Parser};
 
 /// Box an `ExprKind` into a `Box<Expr>` child (dummy span; equality ignores it).
 fn bx(kind: ExprKind) -> Box<Expr> {
@@ -1278,12 +1278,12 @@ fn rejects_non_place_unpacking_target() {
 #[test]
 fn parse_helper_matches_parser() {
     let src = "var x: Int = 1\n";
-    assert_eq!(mojo_lite::parse(src).unwrap(), parse(src));
+    assert_eq!(mojito::parse(src).unwrap(), parse(src));
 }
 
 #[test]
 fn parse_helper_surfaces_errors() {
-    assert!(mojo_lite::parse("var x: Int =\n").is_err());
+    assert!(mojito::parse("var x: Int =\n").is_err());
 }
 
 // --- Augmented assignment ---

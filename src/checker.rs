@@ -1,6 +1,6 @@
 //! Static type checker: the pass between parsing and evaluation.
 //!
-//! mojo-lite's evaluator is dynamically typed — annotations are parsed but
+//! mojito's evaluator is dynamically typed — annotations are parsed but
 //! ignored at runtime. This pass enforces them so that the errors real Mojo
 //! reports at compile time are reported here, before evaluation. It is a *sound*
 //! approximation: if [`check`] succeeds, evaluating the program will not raise
@@ -952,7 +952,7 @@ impl Checker {
                         Ok(())
                     }
                     // `x = e` on an undeclared name is a **var-less introduction**
-                    // (implicit declaration). Mojo allows it; mojo-lite parses and
+                    // (implicit declaration). Mojo allows it; mojito parses and
                     // type-checks it (binding the materialized type) but the
                     // evaluator flags it as unsupported. Binding here keeps the rest
                     // of the program type-checking.
@@ -4052,7 +4052,7 @@ impl Checker {
     }
 }
 
-/// Mojo's built-in traits that mojo-lite recognizes in a type-parameter bound.
+/// Mojo's built-in traits that mojito recognizes in a type-parameter bound.
 /// User-defined traits (and conformance checking) are a later phase, so a bound
 /// must name one of these. `AnyType` is the least restrictive.
 const BUILTIN_TRAITS: &[&str] = &[
@@ -4123,7 +4123,7 @@ fn is_place_expr(e: &Expr) -> bool {
 /// Any number of shared accesses to overlapping places is fine, but an exclusive
 /// access requires no *overlapping* place elsewhere in the call — so `f(mut a, a)`,
 /// `f(mut a, mut a)`, `f(a, a^)`, and `f(mut p, p.a)` are rejected, while
-/// `f(mut p.a, mut p.b)` (disjoint fields) is allowed. mojo-lite's borrows are
+/// `f(mut p.a, mut p.b)` (disjoint fields) is allowed. mojito's borrows are
 /// call-scoped (no references persist in variables), so this per-call check is
 /// complete — no cross-block loan dataflow is needed.
 fn check_call_aliasing(
@@ -4806,7 +4806,7 @@ fn has_order_bound(ty: &Ty) -> bool {
 
 /// Whether an opaque type parameter carries a bound that promises a length, so
 /// `len(x)` is well-typed on it. `Sized` (`__len__(self) -> Int`) and
-/// `SizedRaising` (`__len__(self) raises -> Int`) both do — mojo-lite's effect
+/// `SizedRaising` (`__len__(self) raises -> Int`) both do — mojito's effect
 /// analysis is deferred, so the two are not distinguished at the call site; a
 /// plain `T: AnyType` grants no length.
 fn has_len_bound(ty: &Ty) -> bool {
@@ -4831,7 +4831,7 @@ fn param_has_bound(ty: &Ty, bound: &str) -> bool {
 /// used by the self-hosted `math` module (Phase 7). `__floor__`/`__ceil__`/
 /// `__trunc__` are nullary (`Floorable`/`Ceilable`/`Truncable`); `__ceildiv__`
 /// is unary and granted by `CeilDivable` or its raising sibling
-/// `CeilDivableRaising` (mojo-lite's deferred effect model does not distinguish
+/// `CeilDivableRaising` (mojito's deferred effect model does not distinguish
 /// them). A bound satisfies the dunder if it is any of the returned names.
 fn math_dunder_bound(method: &str, argc: usize) -> &'static [&'static str] {
     match (method, argc) {

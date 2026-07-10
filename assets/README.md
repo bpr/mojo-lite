@@ -14,8 +14,8 @@ right folder**; no code changes.
 | `type_error/`     | parses, but the checker rejects it                            |
 | `runtime_error/`  | type-checks, but fails at eval — includes the `Unsupported` "parse now, run later" gaps |
 
-Grab a Mojo file off the net, decide where mojo-lite should currently land on it,
-and drop it in that folder. When mojo-lite gains a feature, a file "graduates" to an
+Grab a Mojo file off the net, decide where mojito should currently land on it,
+and drop it in that folder. When mojito gains a feature, a file "graduates" to an
 earlier-passing folder (e.g. `parse_error/ → ok/`) — a nice, greppable diff.
 
 ## Optional: pin the exact error
@@ -32,6 +32,6 @@ The harness then also asserts the error contains that substring.
 
 ## Note
 
-mojo-lite runs **top-level statements**, then — like Mojo — calls a zero-argument
+mojito runs **top-level statements**, then — like Mojo — calls a zero-argument
 `main()` if the file defines one (see `ok/defines_main.mojo`). So a fixture can put
 its work in `main()` and it will actually execute.

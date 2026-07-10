@@ -1,5 +1,5 @@
-use mojo_lite::Lexer;
-use mojo_lite::token::Token;
+use mojito::Lexer;
+use mojito::token::Token;
 
 /// Collect all tokens, panicking if the lexer reports an error.
 fn lex_all(source: &str) -> Vec<Token> {
@@ -335,7 +335,7 @@ fn keyword_table_and_lex_helper() {
     assert_eq!(Token::keyword("True"), Some(Token::BoolLiteral(true)));
     assert_eq!(Token::keyword("mut"), None); // soft word, stays an identifier
     assert_eq!(Token::keyword("point"), None);
-    assert_eq!(mojo_lite::lex("var\n").unwrap()[0], Token::Var);
+    assert_eq!(mojito::lex("var\n").unwrap()[0], Token::Var);
 }
 
 // --- Augmented-assignment operators ---
@@ -423,7 +423,7 @@ fn lexes_single_and_triple_quoted_strings() {
 
 #[test]
 fn lexes_tstring_chunks() {
-    use mojo_lite::token::TStringChunk;
+    use mojito::token::TStringChunk;
     assert_eq!(
         lex_literal("t\"n={n}, sum={a+b}!\""),
         Token::TString {

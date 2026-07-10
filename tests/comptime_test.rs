@@ -3,7 +3,7 @@
 //! the phase-distinction semantics: unselected branches are dropped before checking,
 //! and `comptime for` unrolls with the loop variable substituted as a literal.
 
-use mojo_lite::{BackendKind, CtValue, Ty, check, elaborate, parse};
+use mojito::{BackendKind, CtValue, Ty, check, elaborate, parse};
 
 fn run(src: &str) -> Result<String, String> {
     let program = parse(src).map_err(|e| format!("parse: {e}"))?;

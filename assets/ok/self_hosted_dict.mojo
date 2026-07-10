@@ -2,7 +2,7 @@ from std.collections.dict import Dict
 
 def main():
     var d: Dict[String, String] = Dict[String, String]()
-    d["name"] = "mojo-lite"
+    d["name"] = "mojito"
     d["phase"] = "self-host"
     print(d["name"], " : ",d["phase"])
     d["phase"] = "stdlib" # Overwrite existing value

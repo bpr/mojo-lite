@@ -1,6 +1,6 @@
 # Architecture After Parsing
 
-This document describes mojo-lite after parsing. Its simplest input is the parsed
+This document describes mojito after parsing. Its simplest input is the parsed
 program:
 
 ```rust
@@ -74,7 +74,7 @@ The architecture prioritizes:
 - a small compiler that is still recognizable as a systems-language
   implementation
 
-mojo-lite is not trying to be Mojo's production architecture. It has no MLIR
+mojito is not trying to be Mojo's production architecture. It has no MLIR
 backend, no GPU pipeline, and no optimizer stack. The register VM is the concrete
 execution model and the executable specification for the supported subset.
 
@@ -248,7 +248,7 @@ elaboration fails with a compile-time quota error.
 The goal is to prevent compile-time execution from hanging the compiler. A bad
 `while True` in a CTFE function or an enormous generated loop should fail
 deterministically instead of making compilation unbounded. This is similar in
-spirit to Zig's compile-time branch quota, though mojo-lite keeps the mechanism
+spirit to Zig's compile-time branch quota, though mojito keeps the mechanism
 small and fixed for now.
 
 ### Checker Interaction
@@ -1099,7 +1099,7 @@ Preferred behavior:
 - VM reports a clean `RuntimeError::Unsupported`
 - tests assert unsupported behavior instead of allowing panics
 
-This is important because mojo-lite parses more syntax than it fully implements.
+This is important because mojito parses more syntax than it fully implements.
 A clean unsupported error is part of the architecture.
 
 ## Fixture And Test Relationship
@@ -1211,4 +1211,4 @@ Read the compiler from the middle outward:
 6. Analysis proves ownership and inserts destruction.
 7. The VM executes what MIR says.
 
-That is the core architecture of mojo-lite after parsing.
+That is the core architecture of mojito after parsing.

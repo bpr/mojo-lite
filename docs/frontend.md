@@ -1,6 +1,6 @@
 # Frontend: Lexer And Parser
 
-This document describes mojo-lite's lexer and parser. It stops at the parsed AST.
+This document describes mojito's lexer and parser. It stops at the parsed AST.
 The compiler stages after parsing are described in `architecture.md`.
 
 The frontend is intentionally straightforward:
@@ -114,7 +114,7 @@ Token::keyword(text: &str) -> Option<Token>
 
 ## Indentation And The Offside Rule
 
-Mojo uses indentation-sensitive blocks. mojo-lite handles that in the lexer, not
+Mojo uses indentation-sensitive blocks. mojito handles that in the lexer, not
 the parser.
 
 The lexer keeps:
@@ -526,7 +526,7 @@ Parenthesized expressions are disambiguated syntactically:
 - `(x, y)` is a tuple
 
 List literals parse as bracketed expression lists. Empty list literals are
-rejected because mojo-lite cannot infer their element type; use `List[T]()` for
+rejected because mojito cannot infer their element type; use `List[T]()` for
 an empty list.
 
 ## Infix And Postfix Parsing
@@ -658,5 +658,5 @@ The lexer/parser split is intentionally plain:
 - spans are preserved without turning every parser function into a diagnostics
   framework
 
-That is enough frontend machinery for mojo-lite's goals. The deeper language
+That is enough frontend machinery for mojito's goals. The deeper language
 semantics begin after parsing, in the checker and compiler pipeline.

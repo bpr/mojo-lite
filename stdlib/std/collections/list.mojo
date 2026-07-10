@@ -1,5 +1,5 @@
 # A self-hosted, generic growable `List[T]`, backed by an `UnsafePointer[T]` and
-# written entirely in mojo-lite. Exercises the whole language stack: parametric
+# written entirely in mojito. Exercises the whole language stack: parametric
 # types, heap pointers, the value-type lifecycle (init/copy/move), the operator/
 # subscript/len dunders, and the iterator protocol.
 

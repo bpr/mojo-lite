@@ -1361,7 +1361,7 @@ impl Flatten<'_> {
                 let var = self.var(name);
                 self.emit(MirInstr::DefVar { var, src, ty: None });
             }
-            // No runtime effect: `pass`, and imports (mojo-lite has no module system,
+            // No runtime effect: `pass`, and imports (mojito has no module system,
             // so imports are no-ops — matching the checker/evaluator).
             StmtKind::Pass | StmtKind::Import { .. } | StmtKind::FromImport { .. } => {}
 

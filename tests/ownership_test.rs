@@ -7,7 +7,7 @@
 //! the file fixtures under `assets/ownership_error/` (each pinned with `# expect:`)
 //! and `assets/ownership_ok/`.
 
-use mojo_lite::{OwnershipError, check, check_ownership, parse};
+use mojito::{OwnershipError, check, check_ownership, parse};
 
 /// Type-check `src`, then run the ownership analysis.
 fn own(src: &str) -> Result<(), OwnershipError> {

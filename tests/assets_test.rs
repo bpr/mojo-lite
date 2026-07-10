@@ -11,7 +11,7 @@
 //! `# expect: <substring>` (valid Mojo, skipped by the lexer): the reported error
 //! must then contain `<substring>`.
 
-use mojo_lite::{BackendKind, check, check_ownership};
+use mojito::{BackendKind, check, check_ownership};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -39,16 +39,16 @@ impl Outcome {
 
 /// Run the full pipeline, returning where it first fails and the message.
 fn classify(path: &Path) -> (Outcome, String) {
-    let program = match mojo_lite::link(path) {
+    let program = match mojito::link(path) {
         Ok(p) => p,
-        Err(mojo_lite::ModuleError::Parse { err, .. }) => {
+        Err(mojito::ModuleError::Parse { err, .. }) => {
             return (Outcome::ParseError, err.to_string());
         }
         Err(e) => return (Outcome::TypeError, e.to_string()),
     };
     // Compile-time elaboration (resolve `comptime if`/`comptime for`) — its errors
     // are compile-time rejections, classified with the type-error stage.
-    let program = match mojo_lite::elaborate(program) {
+    let program = match mojito::elaborate(program) {
         Ok(p) => p,
         Err(e) => return (Outcome::TypeError, e.to_string()),
     };

@@ -1,4 +1,4 @@
-use mojo_lite::{BackendKind, RuntimeError, Value, parse};
+use mojito::{BackendKind, RuntimeError, Value, parse};
 
 /// Run a program on the VM backend (the sole executor), returning its global
 /// (top-level) bindings for value inspection. No type-checking — these tests
@@ -614,8 +614,8 @@ fn uncaught_raise_propagates_across_a_call() {
 
 #[test]
 fn print_writes_to_the_output_buffer() {
-    let e = output("print(\"Hello, mojo-lite!\")\n");
-    assert_eq!(e, "Hello, mojo-lite!\n");
+    let e = output("print(\"Hello, mojito!\")\n");
+    assert_eq!(e, "Hello, mojito!\n");
 }
 
 #[test]
@@ -1016,7 +1016,7 @@ fn augmented_assignment_evaluates_the_place_once() {
 fn lane(v: &Value, i: usize) -> i128 {
     match v {
         Value::Simd {
-            lanes: mojo_lite::runtime::SimdLanes::Int(l),
+            lanes: mojito::runtime::SimdLanes::Int(l),
             ..
         } => l[i],
         _ => panic!("not an int SIMD"),
@@ -1100,8 +1100,8 @@ fn float64_keeps_full_precision_unlike_float32() {
     assert_ne!(
         binding(&f32, "s"),
         Value::Simd {
-            dtype: mojo_lite::Dtype::Float32,
-            lanes: mojo_lite::runtime::SimdLanes::Float(vec![0.1])
+            dtype: mojito::Dtype::Float32,
+            lanes: mojito::runtime::SimdLanes::Float(vec![0.1])
         }
     );
 }

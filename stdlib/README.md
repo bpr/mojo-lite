@@ -1,6 +1,6 @@
-# stdlib — the standard library, written in mojo-lite itself
+# stdlib — the standard library, written in mojito itself
 
-These are ordinary mojo-lite `.mojo` files (no compiler intrinsic): the north-star
+These are ordinary mojito `.mojo` files (no compiler intrinsic): the north-star
 proof that the language is expressive enough to author its own collections and
 small generic algorithms.
 
@@ -55,7 +55,7 @@ remain as compatibility mirrors for now, so legacy examples such as
 
 Underscore-prefixed structs are implementation details, following the Python
 convention that Mojo currently inherits. `_ListIter` and `_DictEntry` are visible
-to the compiler because mojo-lite does not yet have private declarations, but
+to the compiler because mojito does not yet have private declarations, but
 callers should not treat them as stable public API. `Dict` iteration returns
 entries today because there are not yet separate key/value/item view types.
 

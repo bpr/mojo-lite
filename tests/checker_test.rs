@@ -1,4 +1,4 @@
-use mojo_lite::{Lexer, Parser, TypeError, check};
+use mojito::{Lexer, Parser, TypeError, check};
 
 /// Parse `source` and run the type checker, returning its result.
 fn check_source(source: &str) -> Result<(), TypeError> {
@@ -879,8 +879,8 @@ fn rejects_wrong_parameter_count() {
 fn rejects_non_comptime_constant_definition() {
     // A `comptime NAME = <runtime value>` is now rejected by the compile-time
     // elaborator (the comptime validator), not the checker directly.
-    let program = mojo_lite::parse("var x: Int = 1\ncomptime N = x\n").unwrap();
-    assert!(mojo_lite::elaborate(program).is_err());
+    let program = mojito::parse("var x: Int = 1\ncomptime N = x\n").unwrap();
+    assert!(mojito::elaborate(program).is_err());
 }
 
 #[test]
@@ -2147,7 +2147,7 @@ fn copyinit_makes_type_copyable_and_checks_di() {
         "struct P:\n    var a: Int\n    def __init__(out self):\n        self.a = 1\n    def __copyinit__(out self, e: P):\n        self.a = e.a\n\ndef main():\n    var p: P = P()\n    var q: P = p\n    print(q.a)\n",
     );
     // Current Mojo spells the copy constructor as an `__init__` overload with a
-    // keyword-only `copy: Self`; mojo-lite registers that as the lifecycle copy
+    // keyword-only `copy: Self`; mojito registers that as the lifecycle copy
     // initializer internally.
     ok(
         "struct Q:\n    var a: Int\n    def __init__(out self):\n        self.a = 1\n    def __init__(out self, *, copy: Self):\n        self.a = copy.a\n\ndef main():\n    var p: Q = Q()\n    var q: Q = Q(copy: p)\n    print(q.a)\n",
@@ -2197,7 +2197,7 @@ fn comparable_bound_permits_ordering() {
     ok(
         "def ordered[T: Comparable](a: T, b: T) -> Bool:\n    return a < b and a <= b and a > b and a >= b\n",
     );
-    // `Comparable` implies equality-capable in mojo-lite (as in current Mojo).
+    // `Comparable` implies equality-capable in mojito (as in current Mojo).
     ok("def eq[T: Comparable](a: T, b: T) -> Bool:\n    return a == b\n");
 }
 

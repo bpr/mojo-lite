@@ -34,7 +34,7 @@ pub use token::Token;
 pub use types::{ParamDecl, Ty, TyArg};
 
 /// Lex `source` into its full token stream (a convenience for the **lex-only**
-/// use of mojo-lite as a syntax-analysis tool). Stops at the first `LexError`.
+/// use of mojito as a syntax-analysis tool). Stops at the first `LexError`.
 pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
     Lexer::new(source).map(|r| r.map(|(t, _)| t)).collect()
 }

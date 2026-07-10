@@ -9,7 +9,7 @@
 //! `__del__` uses Mojo's real `def __del__(deinit self)` signature (now recognized (current Mojo spelling; the older `owned self` is also accepted)
 //! by the checker); the VM treats a method named `__del__` as the destructor.
 
-use mojo_lite::{BackendKind, check, parse};
+use mojito::{BackendKind, check, parse};
 
 fn vm(src: &str) -> String {
     let program = parse(src).expect("parse error");

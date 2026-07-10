@@ -1,4 +1,4 @@
-use mojo_lite::{BackendKind, ModuleError, ParseError, Stmt, check, lex, parse};
+use mojito::{BackendKind, ModuleError, ParseError, Stmt, check, lex, parse};
 use std::io::Read;
 use std::path::Path;
 use std::process::ExitCode;
@@ -12,7 +12,7 @@ fn load_program(file: Option<&str>) -> Result<Vec<Stmt>, String> {
     let program = match file {
         Some(path) if path != "-" => {
             let source = read_source(file).map_err(|e| format!("cannot read input: {e}"))?;
-            mojo_lite::link_source(&source, Path::new(path))
+            mojito::link_source(&source, Path::new(path))
                 .map_err(|e| format_module_error(&e, path, &source))?
         }
         _ => {
@@ -20,19 +20,19 @@ fn load_program(file: Option<&str>) -> Result<Vec<Stmt>, String> {
             parse(&source).map_err(|e| format_parse_error(file.unwrap_or("-"), &source, &e))?
         }
     };
-    mojo_lite::elaborate(program).map_err(|e| e.to_string())
+    mojito::elaborate(program).map_err(|e| e.to_string())
 }
 
-/// mojo-lite doubles as a small **syntax-analysis tool**. With no arguments it
+/// mojito doubles as a small **syntax-analysis tool**. With no arguments it
 /// runs the built-in demo; otherwise the first argument selects a pipeline stage
 /// to run over a file (or stdin), so you can inspect the tokens or the AST:
 ///
 /// ```text
-/// mojo-lite lex   [FILE]   # the token stream, one per line
-/// mojo-lite parse [FILE]   # the parsed AST (pretty-printed)
-/// mojo-lite check [FILE]   # lex + parse + type-check; report ok / the error
-/// mojo-lite run   [FILE]   # the full pipeline; print output + final bindings
-/// mojo-lite demo           # the built-in showcase (also the no-arg default)
+/// mojito lex   [FILE]   # the token stream, one per line
+/// mojito parse [FILE]   # the parsed AST (pretty-printed)
+/// mojito check [FILE]   # lex + parse + type-check; report ok / the error
+/// mojito run   [FILE]   # the full pipeline; print output + final bindings
+/// mojito demo           # the built-in showcase (also the no-arg default)
 /// ```
 ///
 /// A `FILE` of `-`, or its absence, reads from standard input.
@@ -130,7 +130,7 @@ fn run_program(file: Option<&str>, backend: BackendKind) -> Result<(), String> {
     let program = load_program(file)?;
     check(&program).map_err(|e| e.to_string())?;
     // Ownership (move) analysis is a real compile stage: reject use-after-move.
-    mojo_lite::check_ownership(&program).map_err(|e| e.to_string())?;
+    mojito::check_ownership(&program).map_err(|e| e.to_string())?;
     let mut backend = backend.make(); // Box<dyn Backend>
     backend.run(&program).map_err(|e| e.to_string())?;
     let output = backend.output();
@@ -145,8 +145,8 @@ fn run_program(file: Option<&str>, backend: BackendKind) -> Result<(), String> {
 
 fn print_usage() {
     eprint!(
-        "mojo-lite — a lexer/parser/checker/evaluator for a subset of Mojo\n\n\
-         usage: mojo-lite [COMMAND] [FILE]\n\n\
+        "mojito — a lexer/parser/checker/evaluator for a subset of Mojo\n\n\
+         usage: mojito [COMMAND] [FILE]\n\n\
          commands:\n\
          \x20 lex   [FILE]   print the token stream (one per line)\n\
          \x20 parse [FILE]   print the parsed AST\n\
@@ -254,7 +254,7 @@ fn run_lex(source: &str) -> Result<(), String> {
 fn run_check(program: &[Stmt]) -> Result<(), String> {
     check(program).map_err(|e| e.to_string())?;
     // The ownership analysis is part of a full check.
-    mojo_lite::check_ownership(program).map_err(|e| e.to_string())?;
+    mojito::check_ownership(program).map_err(|e| e.to_string())?;
     println!("ok");
     Ok(())
 }
@@ -263,7 +263,7 @@ fn run_check(program: &[Stmt]) -> Result<(), String> {
 /// first move violation with its source byte range.
 fn run_own(program: &[Stmt]) -> Result<(), String> {
     check(program).map_err(|e| e.to_string())?;
-    match mojo_lite::check_ownership(program) {
+    match mojito::check_ownership(program) {
         Ok(()) => {
             println!("ok");
             Ok(())

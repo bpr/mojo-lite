@@ -3,7 +3,7 @@
 //! multi-file layout into a unique temp directory, link the entry file, then check
 //! + run it on the VM.
 
-use mojo_lite::{BackendKind, LinkOptions, check, link, link_with_options};
+use mojito::{BackendKind, LinkOptions, check, link, link_with_options};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -14,7 +14,7 @@ impl TempDir {
     fn new() -> Self {
         static N: AtomicUsize = AtomicUsize::new(0);
         let id = N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("mojo_lite_mod_{}_{}", std::process::id(), id));
+        let dir = std::env::temp_dir().join(format!("mojito_mod_{}_{}", std::process::id(), id));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         TempDir(dir)
     }

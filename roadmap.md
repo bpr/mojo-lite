@@ -1,4 +1,4 @@
-# mojo-lite Roadmap
+# mojito Roadmap
 
 Status: active planning document.
 
@@ -173,7 +173,7 @@ from std.collections.dict import Dict
 
 def main():
     var d: Dict[String, String] = Dict[String, String]()
-    d["name"] = "mojo-lite"
+    d["name"] = "mojito"
     d["phase"] = "self-host"
     d["phase"] = "stdlib"
     print(d["name"])
@@ -404,7 +404,7 @@ when a library helper needs it.
   `BadOperator` (`has_order_bound` accepts only `Comparable`).
 
 - Status: implemented.
-  `Comparable` implies equality-capable behavior in mojo-lite (as in current
+  `Comparable` implies equality-capable behavior in mojito (as in current
   Mojo): `has_equality_bound` already accepts `Comparable`, so a `T: Comparable`
   parameter type-checks both ordering and `==`/`!=`.
 
@@ -636,7 +636,7 @@ slot matcher, so a call accepted by the checker binds the same way at runtime.
   such as `def f(*xs: Int, scale: Int)`.
 
 - Status: deferred.
-  Implement `**kwargs` once mojo-lite has a real keyword mapping/value story.
+  Implement `**kwargs` once mojito has a real keyword mapping/value story.
 
 - Status: deferred.
   Extend keyword/default argument binding to ordinary method calls. The current
@@ -691,7 +691,7 @@ simple, inspectable, and useful as a reference implementation.
 
 - Status: decided (implemented as `UInt`).
   Mojo's own `Hashable` doc comment specifies `__hash__(self) -> UInt` (the free
-  `hash()` returns `UInt64`). mojo-lite models `__hash__(self) -> UInt` because
+  `hash()` returns `UInt64`). mojito models `__hash__(self) -> UInt` because
   its native `UInt` is a word-sized unsigned integer with full modular
   arithmetic, whereas its `UInt64` is SIMD-backed and lacks `% // **`. So the
   hash *result* is `UInt` — matching the trait signature and keeping bucketing
@@ -718,7 +718,7 @@ simple, inspectable, and useful as a reference implementation.
   (`method_call` intercepts `__hash__` on non-struct values). A user key struct
   writes its own `__hash__`. This deliberately routes around general trait
   default methods — a universal default `__hash__` needs field reflection Mojo
-  gets from `@fieldwise`/compiler magic that mojo-lite does not model, and the
+  gets from `@fieldwise`/compiler magic that mojito does not model, and the
   hashing proof did not require it.
 
 - Status: deferred.

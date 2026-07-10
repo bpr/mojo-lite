@@ -1,11 +1,14 @@
-# mojo-lite
+# mojito
 
-mojo-lite is a small Rust implementation of a strict, experimental subset of
+mojito is a small Rust implementation of a strict, experimental subset of
 [Mojo](https://www.modular.com/mojo). It is not Mojo, and it is not trying to
 compete with Mojo's production compiler. It is a compact compiler playground for
 studying the shape of a modern systems programming language: Python-like syntax,
 value semantics, ownership transfer, borrowing, ASAP destruction, generics, and a
 register-VM execution model.
+
+Formerly named `mojo-lite`; the rename is only a project-name change, not a
+change in language goals.
 
 Think of it as a tiny cousin of Rust, C++, and of course, Mojo, striving for at
 least syntactic compatibility with Mojo. High performance is not a current goal.
@@ -14,7 +17,7 @@ control-flow lowering visible in a codebase small enough to hold in your head.
 
 ## Status
 
-mojo-lite currently has:
+mojito currently has:
 
 - a lexer and Pratt parser for a useful slice of Mojo-like syntax
 - a type checker with structs, functions, methods, overload sets, traits,
@@ -46,7 +49,7 @@ tooling; the compiler is not wrapped in a large framework.
 
 ## Not Mojo Proper
 
-mojo-lite is much smaller than real Mojo. Its gaps fall into two different
+mojito is much smaller than real Mojo. Its gaps fall into two different
 categories: language subset work that belongs on the near-term roadmap, and
 larger infrastructure work that may or may not ever be part of this project.
 
@@ -87,9 +90,9 @@ Infrastructure and backend deficiencies:
   at the VM value level
 - no performance claim beyond "useful as a reference implementation"
 
-The language deficiencies are the ones most likely to shrink as mojo-lite grows.
+The language deficiencies are the ones most likely to shrink as mojito grows.
 The infrastructure deficiencies are larger bets: interesting, but not necessary
-for mojo-lite to be useful as a model implementation of ownership, borrowing,
+for mojito to be useful as a model implementation of ownership, borrowing,
 ASAP destruction, and a register-VM compiler.
 
 The goal is honest subset semantics. A feature is usually parsed before it is
@@ -127,7 +130,7 @@ The major source directories are:
 - `src/analysis/mod.rs`: move analysis, liveness, and drop insertion
 - `src/backend/vm.rs`: register VM execution
 - `src/runtime/mod.rs`: shared runtime values and builtin operations
-- `stdlib/`: self-hosted mojo-lite library types
+- `stdlib/`: self-hosted mojito library types
 - `assets/`: executable and negative test fixtures
 - `tests/`: parser, checker, HIR, MIR, VM, ownership, and drop tests
 
@@ -182,7 +185,7 @@ is usable in scripts.
 
 ## Writing Programs
 
-mojo-lite executes top-level statements. If a file defines a zero-argument
+mojito executes top-level statements. If a file defines a zero-argument
 `main()`, `main()` is called after top-level evaluation.
 
 Example:
@@ -248,7 +251,7 @@ See [`assets/README.md`](assets/README.md) for the fixture rules.
 
 ## Ownership, Borrowing, And Destruction
 
-mojo-lite treats `^` as an ownership transfer. Moving a value leaves the source
+mojito treats `^` as an ownership transfer. Moving a value leaves the source
 uninitialized. Later use is rejected by analysis before the VM runs.
 
 Examples of modeled behavior:
@@ -294,7 +297,7 @@ replacement for Mojo's compile-time evaluation and specialization machinery.
 
 ## Overloading And Dispatch
 
-mojo-lite supports same-name top-level functions, methods, and constructors as
+mojito supports same-name top-level functions, methods, and constructors as
 overload sets. The checker chooses a single best candidate at each call site:
 
 - distinct arities work directly
@@ -314,7 +317,7 @@ numeric and container patterns that need ordinary type-directed overloads.
 
 ## Self-Hosted Standard Library
 
-mojo-lite includes a small `stdlib/` written in mojo-lite itself. These are
+mojito includes a small `stdlib/` written in mojito itself. These are
 ordinary `.mojo` modules imported by programs and executed by the VM.
 
 Current self-hosted proof types include:
@@ -373,20 +376,20 @@ features.
 The frontend stages are also available as library functions:
 
 ```rust
-let tokens = mojo_lite::lex(source)?;
-let ast = mojo_lite::parse(source)?;
-mojo_lite::check(&ast)?;
-mojo_lite::check_ownership(&ast)?;
+let tokens = mojito::lex(source)?;
+let ast = mojito::parse(source)?;
+mojito::check(&ast)?;
+mojito::check_ownership(&ast)?;
 ```
 
 For execution, use the backend trait:
 
 ```rust
-use mojo_lite::{BackendKind, Backend};
+use mojito::{BackendKind, Backend};
 
-let program = mojo_lite::parse(source)?;
-mojo_lite::check(&program)?;
-mojo_lite::check_ownership(&program)?;
+let program = mojito::parse(source)?;
+mojito::check(&program)?;
+mojito::check_ownership(&program)?;
 
 let mut backend = BackendKind::Vm.make();
 backend.run(&program)?;
@@ -395,7 +398,7 @@ println!("{}", backend.output());
 
 ## Philosophy
 
-mojo-lite is deliberately modest. It should be small enough to read, strict
+mojito is deliberately modest. It should be small enough to read, strict
 enough to be meaningful, and honest enough to say "unsupported" when a feature
 has not earned its semantics yet.
 

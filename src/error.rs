@@ -229,7 +229,7 @@ pub enum TypeError {
     /// returning (does not return on every path).
     MissingReturn(String),
     /// A mutating `List` method (`append`/`pop`) was called on something other
-    /// than a plain list variable (mojo-lite has no general member-write, so the
+    /// than a plain list variable (mojito has no general member-write, so the
     /// receiver must be a variable whose list can be mutated in place).
     MutationRequiresVariable(String),
     /// A field of `self` was written (`self.x = e`) in a method whose receiver is
@@ -238,7 +238,7 @@ pub enum TypeError {
     /// The left side of an assignment is not a valid place (a variable, or a
     /// field/index chain rooted at one).
     InvalidAssignTarget(String),
-    /// A valid-Mojo construct that mojo-lite **parses** (and the AST carries) but
+    /// A valid-Mojo construct that mojito **parses** (and the AST carries) but
     /// does not implement — flagged at check time because it can't be
     /// meaningfully type-checked (e.g. a `def` with `*args`, `**kwargs`, argument
     /// conventions, or `/`/`*` markers; a keyword-argument call to a method).
@@ -273,7 +273,7 @@ pub enum RuntimeError {
     /// propagates through the evaluator via `?` and, if it reaches the top, is
     /// reported here. Carries the error message.
     Raised(String),
-    /// A valid-Mojo construct that mojo-lite **parses** (and the AST/checker carry)
+    /// A valid-Mojo construct that mojito **parses** (and the AST/checker carry)
     /// but the evaluator does not implement yet — the "parse now, run later"
     /// gaps (e.g. `var`-less variable introduction, the walrus operator `:=`).
     /// Carries a message describing the feature.

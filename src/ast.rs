@@ -85,7 +85,7 @@ pub enum ParamArg {
     Value(Expr),
 }
 
-/// A SIMD element type — the `<dt>` in `SIMD[DType.<dt>, width]`. mojo-lite
+/// A SIMD element type — the `<dt>` in `SIMD[DType.<dt>, width]`. mojito
 /// supports the fixed-width integers, `float32`, and `bool` (real Mojo has more:
 /// `float64`, wider integers, low-precision floats).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

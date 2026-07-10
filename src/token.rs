@@ -12,7 +12,7 @@ pub const DUMMY_SPAN: Span = (0, 0);
 ///
 /// Keywords are split the way the reference tree-sitter Mojo grammar splits them
 /// — into the ones Mojo **shares with Python** and the **Mojo-only** ones — since
-/// mojo-lite is a strict subset of Mojo, which is itself (largely) a superset of
+/// mojito is a strict subset of Mojo, which is itself (largely) a superset of
 /// Python's surface syntax. `Token::keyword` is the single lookup table.
 /// One piece of a lexed t-string: either literal text or the raw source text of
 /// an interpolation `{…}` (which the parser later parses into an `Expr`).
