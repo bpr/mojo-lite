@@ -387,6 +387,18 @@ fn nested_def_calling_sibling_is_refused_cleanly() {
 }
 
 #[test]
+fn overload_symbols_distinguish_stropped_type_names() {
+    let src = "@fieldwise_init\nstruct `A-B`:\n    var x: Int\n\n@fieldwise_init\nstruct `A_B`:\n    var x: Int\n\ndef choose(x: `A-B`) -> Int:\n    return 1\n\ndef choose(x: `A_B`) -> Int:\n    return 2\n\ndef main():\n    print(choose(`A-B`(0)))\n    print(choose(`A_B`(0)))\n";
+    assert_eq!(vm(src), "1\n2\n");
+}
+
+#[test]
+fn overload_symbols_fold_comptime_value_arguments() {
+    let src = "@fieldwise_init\nstruct FixedBuffer[size: Int]:\n    var value: Int\n\ncomptime N = 2 + 6\n\ndef choose(x: FixedBuffer[N]) -> Int:\n    return 1\n\ndef choose(x: Int) -> Int:\n    return 2\n\ndef main():\n    print(choose(FixedBuffer[8](7)))\n";
+    assert!(vm(src).lines().any(|line| line == "1"));
+}
+
+#[test]
 fn dunder_operator_and_builtin_dispatch() {
     // Operators + `len`/`String`/subscript/`in` on a user struct dispatch to its
     // dunder methods (operator overloading), running on the VM.

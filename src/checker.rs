@@ -45,6 +45,17 @@ struct StructInfo {
     fieldwise_init: bool,
 }
 
+/// The source-level pieces of a struct declaration passed through checking.
+struct StructDeclaration<'a> {
+    name: &'a str,
+    type_params: &'a [crate::ast::TypeParam],
+    conforms: &'a [String],
+    fields: &'a [crate::ast::Param],
+    associated: &'a [StructComptime],
+    methods: &'a [Method],
+    fieldwise_init: bool,
+}
+
 /// The checked signature of a trait: required methods plus associated
 /// compile-time facts. A method requirement's signature may mention
 /// `Ty::SelfType` (the conforming type).
@@ -102,72 +113,44 @@ fn same_callable_signature(a: &Ty, b: &Ty) -> bool {
     }
 }
 
+/// The lowered symbol the checker records as the resolved callee of an
+/// overloaded free-function call — formatted by the canonical symbol module so
+/// it names exactly the `MirFunction` the MIR emits for that definition.
 fn callable_lowered_name(name: &str, ty: &Ty) -> Option<String> {
-    Some(format!("{name}{}", callable_signature_suffix(ty)?))
-}
-
-fn method_lowered_name(type_name: &str, method: &str, sig: &MethodSig) -> String {
-    format!("{type_name}.{method}{}", method_signature_suffix(sig))
-}
-
-fn method_signature_suffix(sig: &MethodSig) -> String {
-    signature_suffix(sig.params.iter())
-}
-
-fn callable_signature_suffix(ty: &Ty) -> Option<String> {
-    match ty {
-        Ty::Func { params, .. } | Ty::GenericFunc { params, .. } => {
-            Some(signature_suffix(params.iter()))
-        }
-        _ => None,
-    }
-}
-
-fn signature_suffix<'a>(params: impl IntoIterator<Item = &'a Ty>) -> String {
-    let parts = params
-        .into_iter()
-        .map(type_mangle)
-        .collect::<Vec<_>>()
-        .join("$");
-    format!("$ov${parts}")
-}
-
-fn type_mangle(ty: &Ty) -> String {
-    let raw = match ty {
-        Ty::Int | Ty::IntLiteral => "Int".to_string(),
-        Ty::UInt => "UInt".to_string(),
-        Ty::Float64 | Ty::FloatLiteral => "Float64".to_string(),
-        Ty::Bool => "Bool".to_string(),
-        Ty::String => "String".to_string(),
-        Ty::None => "None".to_string(),
-        Ty::List(elem) => format!("List${}", type_mangle(elem)),
-        Ty::Tuple(elems) => format!(
-            "Tuple${}",
-            elems.iter().map(type_mangle).collect::<Vec<_>>().join("$")
-        ),
-        Ty::Struct(name, args) => {
-            let mut s = format!("Struct${name}");
-            for arg in args {
-                s.push('$');
-                match arg {
-                    TyArg::Ty(t) => s.push_str(&type_mangle(t)),
-                    TyArg::Val(v) => s.push_str(&format!("V{v}")),
-                }
-            }
-            s
-        }
-        Ty::Param { name, .. } => format!("Param${name}"),
-        Ty::SelfType => "Self".to_string(),
-        other => other.to_string(),
+    let params = match ty {
+        Ty::Func { params, .. } | Ty::GenericFunc { params, .. } => params,
+        _ => return None,
     };
-    raw.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '$' })
-        .collect()
+    Some(crate::symbol::function_symbol(
+        name,
+        &crate::symbol::SignatureKey::from_tys(params),
+    ))
+}
+
+/// The lowered symbol of an overloaded method/constructor resolution, likewise
+/// canonical (`sig.params` are the declared parameter types, unsubstituted —
+/// matching the MIR definition side, which mangles the declared annotations).
+fn method_lowered_name(type_name: &str, method: &str, sig: &MethodSig) -> String {
+    crate::symbol::method_symbol(
+        type_name,
+        method,
+        &crate::symbol::SignatureKey::from_tys(&sig.params),
+    )
 }
 
 enum OverloadSelect {
     NoMatch,
     Ambiguous,
+}
+
+/// A concrete method candidate after receiver-type substitution and argument
+/// scoring. Named fields keep overload resolution readable as it evolves.
+struct MethodCallResolution {
+    conversion_score: usize,
+    parameter_types: Vec<Ty>,
+    return_type: Ty,
+    mutates_receiver: bool,
+    lowered_name: Option<String>,
 }
 
 fn select_callable_overload(
@@ -191,12 +174,15 @@ fn select_callable_overload(
 
 fn select_method_overload(
     _method: &str,
-    matches: Vec<(usize, Vec<Ty>, Ty, bool, Option<String>)>,
-) -> Option<(usize, Vec<Ty>, Ty, bool, Option<String>)> {
-    let best = matches.iter().map(|(score, ..)| *score).min()?;
+    matches: Vec<MethodCallResolution>,
+) -> Option<MethodCallResolution> {
+    let best = matches
+        .iter()
+        .map(|candidate| candidate.conversion_score)
+        .min()?;
     let mut best_matches = matches
         .into_iter()
-        .filter(|(score, ..)| *score == best)
+        .filter(|candidate| candidate.conversion_score == best)
         .collect::<Vec<_>>();
     if best_matches.len() == 1 {
         Some(best_matches.remove(0))
@@ -206,9 +192,7 @@ fn select_method_overload(
 }
 
 fn overload_candidates(existing: &Ty, new_ty: &Ty) -> Option<Vec<Ty>> {
-    if fixed_callable_arity(new_ty).is_none() {
-        return None;
-    }
+    fixed_callable_arity(new_ty)?;
     match existing {
         Ty::Func { .. } | Ty::GenericFunc { .. } if fixed_callable_arity(existing).is_some() => {
             Some(vec![existing.clone()])
@@ -1143,12 +1127,10 @@ impl Checker {
                 let variadic_idx = params
                     .iter()
                     .position(|p| p.kind == crate::ast::ParamKind::Variadic);
-                if variadic_idx.is_some() {
-                    if !type_params.is_empty() {
-                        return Err(TypeError::Unsupported(
-                            "variadic parameters on generic functions".to_string(),
-                        ));
-                    }
+                if variadic_idx.is_some() && !type_params.is_empty() {
+                    return Err(TypeError::Unsupported(
+                        "variadic parameters on generic functions".to_string(),
+                    ));
                 }
                 // Regular (non-variadic) parameters, over which arity is computed.
                 let regular: Vec<&crate::ast::FnParam> = params
@@ -1207,9 +1189,8 @@ impl Checker {
                     let regular_tys: Vec<Ty> = params
                         .iter()
                         .zip(&param_tys)
-                        .filter_map(|(p, ty)| {
-                            (p.kind == crate::ast::ParamKind::Regular).then(|| ty.clone())
-                        })
+                        .filter(|(p, _)| p.kind == crate::ast::ParamKind::Regular)
+                        .map(|(_, ty)| ty.clone())
                         .collect();
                     Ty::Func {
                         params: regular_tys,
@@ -1290,15 +1271,15 @@ impl Checker {
                 methods,
                 fieldwise_init,
                 decorators: _,
-            } => self.check_struct(
+            } => self.check_struct(&StructDeclaration {
                 name,
                 type_params,
                 conforms,
                 fields,
                 associated,
                 methods,
-                *fieldwise_init,
-            ),
+                fieldwise_init: *fieldwise_init,
+            }),
 
             StmtKind::Trait {
                 name,
@@ -1641,17 +1622,10 @@ impl Checker {
     /// parameters are validated and kept in scope (as `Self.T`) for its fields
     /// and methods; field/method types referring to them become `Ty::Param`.
     /// Declared trait conformances are verified once the members are known.
-    #[allow(clippy::too_many_arguments)]
-    fn check_struct(
-        &mut self,
-        name: &str,
-        type_params: &[crate::ast::TypeParam],
-        conforms: &[String],
-        fields: &[crate::ast::Param],
-        associated: &[StructComptime],
-        methods: &[Method],
-        fieldwise_init: bool,
-    ) -> Result<(), TypeError> {
+    fn check_struct(&mut self, declaration: &StructDeclaration<'_>) -> Result<(), TypeError> {
+        let name = declaration.name;
+        let type_params = declaration.type_params;
+        let conforms = declaration.conforms;
         if self.structs.contains_key(name) || self.traits.contains_key(name) {
             return Err(TypeError::Redeclaration(name.to_string()));
         }
@@ -1666,33 +1640,24 @@ impl Checker {
         let self_ty = Ty::Struct(name.to_string(), decls.iter().map(param_as_arg).collect());
         let saved_self_decls = std::mem::replace(&mut self.self_decls, decls.clone());
         let saved_self_ty = self.self_ty.replace(self_ty.clone());
-        let result = self.check_struct_members(
-            name,
-            decls,
-            conforms,
-            fields,
-            associated,
-            methods,
-            fieldwise_init,
-            &self_ty,
-        );
+        let result = self.check_struct_members(declaration, decls, &self_ty);
         self.self_decls = saved_self_decls;
         self.self_ty = saved_self_ty;
         result
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn check_struct_members(
         &mut self,
-        name: &str,
+        declaration: &StructDeclaration<'_>,
         decls: Vec<ParamDecl>,
-        conforms: &[String],
-        fields: &[crate::ast::Param],
-        associated: &[StructComptime],
-        methods: &[Method],
-        fieldwise_init: bool,
         self_ty: &Ty,
     ) -> Result<(), TypeError> {
+        let name = declaration.name;
+        let conforms = declaration.conforms;
+        let fields = declaration.fields;
+        let associated = declaration.associated;
+        let methods = declaration.methods;
+        let fieldwise_init = declaration.fieldwise_init;
         // Field types are resolved against structs defined *so far* (so a struct
         // can't contain itself); duplicate field names are a redeclaration.
         let mut field_tys: Vec<(String, Ty)> = Vec::new();
@@ -1797,7 +1762,7 @@ impl Checker {
                     ret: self.resolve_assoc_ty(&substitute_self(&req_sig.ret, self_ty)),
                     self_convention: req_sig.self_convention,
                 };
-                if !got_sigs.iter().any(|got| *got == want) {
+                if !got_sigs.contains(&want) {
                     return Err(TypeError::TraitMethodMismatch {
                         struct_name: name.to_string(),
                         trait_name: tr.to_string(),
@@ -2912,7 +2877,7 @@ impl Checker {
         // Resolve the method to a concrete signature (params + return + whether
         // it mutates `self`) for this receiver, substituting the receiver's type
         // arguments (struct) or `Self` (a bounded type parameter's trait method).
-        let resolved: Option<(Vec<Ty>, Ty, bool, Option<String>)> = match &obj_ty {
+        let resolved: Option<MethodCallResolution> = match &obj_ty {
             Ty::Struct(sname, targs) => {
                 let info = self
                     .structs
@@ -2926,62 +2891,74 @@ impl Checker {
                         let params: Vec<Ty> =
                             sig.params.iter().map(|t| substitute(t, &subst)).collect();
                         if let Ok(score) = self.score_args(&params, args) {
-                            matches.push((
-                                score,
-                                params,
-                                substitute(&sig.ret, &subst),
-                                matches!(sig.self_convention, Some(crate::ast::ArgConvention::Mut)),
-                                overloaded.then(|| method_lowered_name(sname, method, sig)),
-                            ));
+                            matches.push(MethodCallResolution {
+                                conversion_score: score,
+                                parameter_types: params,
+                                return_type: substitute(&sig.ret, &subst),
+                                mutates_receiver: matches!(
+                                    sig.self_convention,
+                                    Some(crate::ast::ArgConvention::Mut)
+                                ),
+                                lowered_name: overloaded
+                                    .then(|| method_lowered_name(sname, method, sig)),
+                            });
                         }
                     }
                     select_method_overload(method, matches)
-                        .map(|(_, params, ret, mut_self, target)| (params, ret, mut_self, target))
                 })
             }
             Ty::Param { bounds, .. } => {
                 self.lookup_trait_method(bounds, method, args.len())
-                    .map(|sig| {
-                        (
-                            sig.params
-                                .iter()
-                                .map(|t| substitute_self(t, &obj_ty))
-                                .collect(),
-                            substitute_self(&sig.ret, &obj_ty),
-                            matches!(sig.self_convention, Some(crate::ast::ArgConvention::Mut)),
-                            None,
-                        )
+                    .map(|sig| MethodCallResolution {
+                        conversion_score: 0,
+                        parameter_types: sig
+                            .params
+                            .iter()
+                            .map(|t| substitute_self(t, &obj_ty))
+                            .collect(),
+                        return_type: substitute_self(&sig.ret, &obj_ty),
+                        mutates_receiver: matches!(
+                            sig.self_convention,
+                            Some(crate::ast::ArgConvention::Mut)
+                        ),
+                        lowered_name: None,
                     })
             }
             // `x.__hash__()` on a concrete built-in hashable type (`Int`, `String`,
             // …) is an intrinsic returning `UInt` — lets a key struct combine
             // `self.field.__hash__()` values (Phase 6).
             _ if method == "__hash__" && args.is_empty() && builtin_hashable_ty(&obj_ty) => {
-                Some((vec![], Ty::UInt, false, None))
+                Some(MethodCallResolution {
+                    conversion_score: 0,
+                    parameter_types: vec![],
+                    return_type: Ty::UInt,
+                    mutates_receiver: false,
+                    lowered_name: None,
+                })
             }
             _ => None,
         };
-        let (params, ret, mut_self, target) = resolved.ok_or_else(|| TypeError::NoSuchMethod {
+        let resolved = resolved.ok_or_else(|| TypeError::NoSuchMethod {
             object_type: obj_ty.to_string(),
             method: method.to_string(),
         })?;
-        if let Some(target) = target {
+        if let Some(target) = resolved.lowered_name {
             self.overload_targets.borrow_mut().insert(span, target);
         }
         // A `mut self` method mutates its receiver, so the receiver must be a
         // writable place (the mutation is written back to it): a variable, a
         // field/index chain, or `self` in a `mut self` method.
-        if mut_self {
+        if resolved.mutates_receiver {
             self.check_place(object)?;
         }
-        if params.len() != args.len() {
+        if resolved.parameter_types.len() != args.len() {
             return Err(TypeError::ArityMismatch {
                 name: method.to_string(),
-                expected: params.len(),
+                expected: resolved.parameter_types.len(),
                 got: args.len(),
             });
         }
-        for (i, (arg, expected)) in args.iter().zip(&params).enumerate() {
+        for (i, (arg, expected)) in args.iter().zip(&resolved.parameter_types).enumerate() {
             let aty = self.infer(arg)?;
             if !coerces(&aty, expected) {
                 return Err(TypeError::TypeMismatch {
@@ -2991,7 +2968,7 @@ impl Checker {
                 });
             }
         }
-        Ok(ret)
+        Ok(resolved.return_type)
     }
 
     fn score_args(&self, params: &[Ty], args: &[Expr]) -> Result<usize, TypeError> {
@@ -3378,7 +3355,11 @@ impl Checker {
         // and `CeilDivable`/`CeilDivableRaising` a unary `__ceildiv__(Self)`.
         let accepts = math_dunder_bound(method, argc);
         if !accepts.is_empty() && bounds.iter().any(|b| accepts.contains(&b.as_str())) {
-            let params = if argc == 1 { vec![Ty::SelfType] } else { vec![] };
+            let params = if argc == 1 {
+                vec![Ty::SelfType]
+            } else {
+                vec![]
+            };
             return Some(MethodSig {
                 params,
                 ret: Ty::SelfType,
@@ -3688,10 +3669,9 @@ impl Checker {
             for candidate in candidates {
                 if let Ok((ret, score)) =
                     self.infer_callable_ty(name, candidate.clone(), param_args, args, kwargs)
+                    && let Some(target) = callable_lowered_name(name, &candidate)
                 {
-                    if let Some(target) = callable_lowered_name(name, &candidate) {
-                        matches.push((ret, score, target));
-                    }
+                    matches.push((ret, score, target));
                 }
             }
             return match select_callable_overload(matches) {
@@ -3723,25 +3703,8 @@ impl Checker {
     ) -> Result<(Ty, usize), TypeError> {
         let (params, names, ret, required, variadic, positional_only, keyword_only, conventions) =
             match ty {
-            // A non-generic function takes no compile-time parameters.
-            Ty::Func {
-                params,
-                names,
-                ret,
-                required,
-                variadic,
-                positional_only,
-                keyword_only,
-                conventions,
-            } => {
-                if !param_args.is_empty() {
-                    return Err(TypeError::WrongTypeArgCount {
-                        name: name.to_string(),
-                        expected: 0,
-                        got: param_args.len(),
-                    });
-                }
-                (
+                // A non-generic function takes no compile-time parameters.
+                Ty::Func {
                     params,
                     names,
                     ret,
@@ -3750,27 +3713,44 @@ impl Checker {
                     positional_only,
                     keyword_only,
                     conventions,
-                )
-            }
-            // A generic function infers or is supplied its parameters. Keyword
-            // arguments to a generic function are deferred.
-            Ty::GenericFunc { decls, params, ret } => {
-                if !kwargs.is_empty() {
-                    return Err(TypeError::Unsupported(
-                        "keyword arguments to a generic function".to_string(),
-                    ));
+                } => {
+                    if !param_args.is_empty() {
+                        return Err(TypeError::WrongTypeArgCount {
+                            name: name.to_string(),
+                            expected: 0,
+                            got: param_args.len(),
+                        });
+                    }
+                    (
+                        params,
+                        names,
+                        ret,
+                        required,
+                        variadic,
+                        positional_only,
+                        keyword_only,
+                        conventions,
+                    )
                 }
-                return self
-                    .infer_generic_call(name, &decls, &params, &ret, param_args, args)
-                    .map(|ret| (ret, 0));
-            }
-            other => {
-                return Err(TypeError::NotCallable {
-                    name: name.to_string(),
-                    ty: other.to_string(),
-                });
-            }
-        };
+                // A generic function infers or is supplied its parameters. Keyword
+                // arguments to a generic function are deferred.
+                Ty::GenericFunc { decls, params, ret } => {
+                    if !kwargs.is_empty() {
+                        return Err(TypeError::Unsupported(
+                            "keyword arguments to a generic function".to_string(),
+                        ));
+                    }
+                    return self
+                        .infer_generic_call(name, &decls, &params, &ret, param_args, args)
+                        .map(|ret| (ret, 0));
+                }
+                other => {
+                    return Err(TypeError::NotCallable {
+                        name: name.to_string(),
+                        ty: other.to_string(),
+                    });
+                }
+            };
 
         // Match positional then keyword arguments to the regular parameter slots
         // (extra positional args overflow into a `*args` parameter), then check
@@ -4717,10 +4697,13 @@ pub(crate) fn effective_keyword_only_index(
     keyword_only: Option<usize>,
     variadic_idx: Option<usize>,
 ) -> Option<usize> {
-    [regular_marker_index(params, keyword_only), regular_marker_index(params, variadic_idx)]
-        .into_iter()
-        .flatten()
-        .min()
+    [
+        regular_marker_index(params, keyword_only),
+        regular_marker_index(params, variadic_idx),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
 }
 
 /// The per-slot **required** mask for regular parameters. Defaults must be

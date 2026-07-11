@@ -104,10 +104,7 @@ fn bundled_stdlib_root_supports_mojo_shaped_imports() {
 #[test]
 fn custom_search_root_is_used_after_importer_directory() {
     let d = TempDir::new();
-    d.write(
-        "lib/pkg/tool.mojo",
-        "def answer() -> Int:\n    return 42\n",
-    );
+    d.write("lib/pkg/tool.mojo", "def answer() -> Int:\n    return 42\n");
     let main = d.write(
         "src/main.mojo",
         "from pkg.tool import answer\n\ndef main():\n    print(answer())\n",

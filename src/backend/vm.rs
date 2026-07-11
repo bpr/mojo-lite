@@ -27,10 +27,7 @@
 //! with keyword/default/variadic args, and nested `def`/`struct`.
 
 use super::Backend;
-use crate::ast::{
-    ArgConvention, Expr, ExprKind, FnParam, Method, ParamArg, ParamKind, PrefixOp, Stmt, StmtKind,
-    Type,
-};
+use crate::ast::{ArgConvention, Expr, ExprKind, ParamKind, PrefixOp, Stmt, StmtKind, Type};
 use crate::checker::{
     ArgSlot, effective_keyword_only_index, match_call_slots, regular_marker_index,
 };
@@ -106,6 +103,36 @@ struct Prog {
     sigs: HashMap<String, FnSig>,
 }
 
+struct CallerFrame<'a> {
+    registers: &'a mut [Value],
+    variables: &'a mut [Value],
+}
+
+struct WritebackCall<'a> {
+    function_name: &'a str,
+    function_index: usize,
+    positional_args: Vec<Value>,
+    keyword_args: Vec<(String, Value)>,
+    argument_places: &'a [Option<MirPlace>],
+}
+
+struct TryRegions<'a> {
+    body: &'a [MirBlock],
+    handler: &'a Option<(Option<VarId>, Vec<MirBlock>)>,
+    orelse: &'a Option<Vec<MirBlock>>,
+    finalbody: &'a Option<Vec<MirBlock>>,
+    cleanup: &'a [VarId],
+}
+
+struct MethodInvocation<'a> {
+    receiver: Value,
+    method: &'a str,
+    resolved_name: Option<&'a str>,
+    arguments: Vec<Value>,
+    receiver_place: &'a Option<MirPlace>,
+    argument_places: &'a [Option<MirPlace>],
+}
+
 impl Prog {
     fn index_of(&self, name: &str) -> Option<usize> {
         self.mir.functions.iter().position(|(n, _)| n == name)
@@ -117,17 +144,26 @@ impl Prog {
         self.mir.functions.iter().any(|(n, _)| n.ends_with(suffix))
     }
 
+    /// Arity-based overload fallback: resolve a *source* name to the lowered
+    /// function it must mean, for the calls the checker records no per-span
+    /// target for. Its callers are the VM-synthesized dispatches — operator/
+    /// `__str__`/`__hash__` dunders (`call_dunder`), `__setitem__`,
+    /// the `for`-loop `__next__` protocol, `__init__` construction reached
+    /// without a recorded target, and `method_call` when `resolved` is absent
+    /// (i.e. the method isn't overloaded). Checker-resolved calls carry their
+    /// exact lowered callee and never come through here.
     fn overload_name(&self, name: &str, argc: usize) -> String {
         if self.index_of(name).is_some() {
             return name.to_string();
         }
         let expected_params = if name.contains('.') { argc + 1 } else { argc };
-        let prefix = format!("{name}$ov$");
         let mut matches = self
             .mir
             .functions
             .iter()
-            .filter(|(fname, f)| fname.starts_with(&prefix) && f.n_params == expected_params)
+            .filter(|(fname, f)| {
+                crate::symbol::is_overload_of(fname, name) && f.n_params == expected_params
+            })
             .map(|(fname, _)| fname.clone())
             .collect::<Vec<_>>();
         if matches.len() == 1 {
@@ -614,18 +650,23 @@ impl VmBackend {
     /// final value back to the caller's argument place (`arg_places`). This is the
     /// runtime half of reference parameters — the tree-walker's `eval_call`
     /// write-back, done over the caller's frame (`regs`/`vars`).
-    #[allow(clippy::too_many_arguments)]
     fn call_with_writeback(
         &mut self,
         prog: &Prog,
-        name: &str,
-        idx: usize,
-        argv: Vec<Value>,
-        kwargs: Vec<(String, Value)>,
-        arg_places: &[Option<MirPlace>],
-        regs: &[Value],
-        vars: &mut [Value],
+        call: WritebackCall<'_>,
+        frame: CallerFrame<'_>,
     ) -> Result<Value, RuntimeError> {
+        let WritebackCall {
+            function_name: name,
+            function_index: idx,
+            positional_args: argv,
+            keyword_args: kwargs,
+            argument_places: arg_places,
+        } = call;
+        let CallerFrame {
+            registers: regs,
+            variables: vars,
+        } = frame;
         // Order the arguments into parameter slots (filling defaults/keywords),
         // keeping the slot map so each parameter's source argument is known.
         let (bound, slots) = match prog.sigs.get(name) {
@@ -745,7 +786,18 @@ impl VmBackend {
                     .filter(|&idx| prog.mir.functions[idx].1.ref_params.iter().any(|&r| r));
                 let result = match writeback {
                     Some(idx) => self.call_with_writeback(
-                        prog, &func.0, idx, argv, kw, arg_places, regs, vars,
+                        prog,
+                        WritebackCall {
+                            function_name: &func.0,
+                            function_index: idx,
+                            positional_args: argv,
+                            keyword_args: kw,
+                            argument_places: arg_places,
+                        },
+                        CallerFrame {
+                            registers: regs,
+                            variables: vars,
+                        },
                     )?,
                     None => self.call_named(prog, &func.0, argv, kw, &pvals)?,
                 };
@@ -764,14 +816,18 @@ impl VmBackend {
                 let argv: Vec<Value> = args.iter().map(|r| regs[r.0 as usize].clone()).collect();
                 regs[dest.0 as usize] = self.method_call(
                     prog,
-                    recv_val,
-                    method,
-                    resolved.as_deref(),
-                    argv,
-                    recv_place,
-                    arg_places,
-                    regs,
-                    vars,
+                    MethodInvocation {
+                        receiver: recv_val,
+                        method,
+                        resolved_name: resolved.as_deref(),
+                        arguments: argv,
+                        receiver_place: recv_place,
+                        argument_places: arg_places,
+                    },
+                    CallerFrame {
+                        registers: regs,
+                        variables: vars,
+                    },
                 )?;
             }
             MirInstr::GetField { dest, base, field } => {
@@ -1021,7 +1077,20 @@ impl VmBackend {
             } => {
                 // A `try` may complete with a `return` that crossed its boundary;
                 // propagate that outcome to the block driver.
-                return self.exec_try(prog, body, handler, orelse, finalbody, cleanup, regs, vars);
+                return self.exec_try(
+                    prog,
+                    TryRegions {
+                        body,
+                        handler,
+                        orelse,
+                        finalbody,
+                        cleanup,
+                    },
+                    CallerFrame {
+                        registers: regs,
+                        variables: vars,
+                    },
+                );
             }
             MirInstr::Drop { .. } => {
                 return Err(RuntimeError::Unsupported(format!(
@@ -1036,18 +1105,23 @@ impl VmBackend {
     /// `exec_try`). Each sub-part runs as a mini-CFG in the current frame; a raise in
     /// the body unwinds to `handler` (after running the `cleanup` drops), `else` runs
     /// on normal completion, and `finally` always runs (its raise wins).
-    #[allow(clippy::too_many_arguments)]
     fn exec_try(
         &mut self,
         prog: &Prog,
-        body: &[MirBlock],
-        handler: &Option<(Option<VarId>, Vec<MirBlock>)>,
-        orelse: &Option<Vec<MirBlock>>,
-        finalbody: &Option<Vec<MirBlock>>,
-        cleanup: &[VarId],
-        regs: &mut [Value],
-        vars: &mut [Value],
+        regions: TryRegions<'_>,
+        frame: CallerFrame<'_>,
     ) -> Result<Flow, RuntimeError> {
+        let TryRegions {
+            body,
+            handler,
+            orelse,
+            finalbody,
+            cleanup,
+        } = regions;
+        let CallerFrame {
+            registers: regs,
+            variables: vars,
+        } = frame;
         let outcome = match self.run_region(prog, body, regs, vars) {
             // The body raised: run the exceptional-edge cleanup (destroy the body's
             // locals as they go out of scope), then dispatch to the handler or
@@ -1167,20 +1241,24 @@ impl VmBackend {
     /// Dispatch a method call. `List` methods run in place (mutators via the
     /// receiver place, queries on the value); struct methods resolve to the
     /// mangled `Type.method` function, with a `mut self` receiver written back.
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn method_call(
         &mut self,
         prog: &Prog,
-        recv: Value,
-        method: &str,
-        resolved: Option<&str>,
-        args: Vec<Value>,
-        recv_place: &Option<MirPlace>,
-        arg_places: &[Option<MirPlace>],
-        regs: &[Value],
-        vars: &mut [Value],
+        invocation: MethodInvocation<'_>,
+        frame: CallerFrame<'_>,
     ) -> Result<Value, RuntimeError> {
+        let MethodInvocation {
+            receiver: recv,
+            method,
+            resolved_name: resolved,
+            arguments: args,
+            receiver_place: recv_place,
+            argument_places: arg_places,
+        } = invocation;
+        let CallerFrame {
+            registers: regs,
+            variables: vars,
+        } = frame;
         // Intrinsic dunders on a built-in numeric/hashable value; a struct with
         // its own implementation still dispatches to its method below.
         if !matches!(recv, Value::Struct { .. }) {
@@ -1324,7 +1402,7 @@ impl VmBackend {
                 "vm: keyword arguments to '{name}' are not supported"
             )));
         }
-        if let Some((struct_name, _)) = name.split_once(".__init__$ov$")
+        if let Some(struct_name) = crate::symbol::init_overload_struct(name)
             && prog.structs.contains_key(struct_name)
         {
             if !kwargs.is_empty() {
@@ -1514,7 +1592,7 @@ fn build_prog(program: &[Stmt]) -> Prog {
 /// Build the struct registry from the program's top-level `struct` declarations.
 fn build_structs(program: &[Stmt]) -> HashMap<String, StructDef> {
     let mut map = HashMap::new();
-    let method_overloads = method_overloads(program);
+    let overloads = crate::symbol::OverloadSets::scan(program);
     for s in program {
         if let StmtKind::Struct {
             name,
@@ -1529,12 +1607,16 @@ fn build_structs(program: &[Stmt]) -> HashMap<String, StructDef> {
                 .iter()
                 .filter(|m| matches!(m.self_convention, Some(ArgConvention::Mut)))
                 .map(|m| {
-                    let method_name = lifecycle_method_name(m);
+                    let method_name = crate::symbol::lifecycle_method_name(m);
                     let source = format!("{name}.{method_name}");
-                    if method_overloads.contains_key(&source) {
-                        overloaded_method_name(&source, &m.params, &method_overloads)
-                    } else {
+                    let lowered =
+                        crate::symbol::lowered_method_name(&source, &m.params, &overloads);
+                    // A non-overloaded method is keyed by its bare method name
+                    // (`method_call` checks that when no lowering happened).
+                    if lowered == source {
                         method_name.to_string()
+                    } else {
+                        lowered
                     }
                 })
                 .collect();
@@ -1558,7 +1640,7 @@ fn build_structs(program: &[Stmt]) -> HashMap<String, StructDef> {
 /// Build the calling-signature registry from the program's top-level `def`s.
 fn build_sigs(program: &[Stmt]) -> HashMap<String, FnSig> {
     let mut map = HashMap::new();
-    let overloads = top_level_overloads(program);
+    let overloads = crate::symbol::OverloadSets::scan(program);
     for s in program {
         if let StmtKind::Def {
             name,
@@ -1577,7 +1659,7 @@ fn build_sigs(program: &[Stmt]) -> HashMap<String, FnSig> {
             let pos_only = regular_marker_index(params, *positional_only);
             let kw_only = effective_keyword_only_index(params, *keyword_only, variadic_idx);
             let required = regular.iter().map(|p| p.default.is_none()).collect();
-            let lowered_name = overloaded_def_name(name, params, &overloads);
+            let lowered_name = crate::symbol::lowered_def_name(name, params, &overloads);
             map.insert(
                 lowered_name,
                 FnSig {
@@ -1598,151 +1680,6 @@ fn build_sigs(program: &[Stmt]) -> HashMap<String, FnSig> {
         }
     }
     map
-}
-
-fn top_level_overloads(program: &[Stmt]) -> HashMap<String, std::collections::HashSet<usize>> {
-    let mut counts: HashMap<String, Vec<usize>> = HashMap::new();
-    for stmt in program {
-        if let StmtKind::Def { name, params, .. } = &stmt.kind {
-            counts.entry(name.clone()).or_default().push(params.len());
-        }
-    }
-    counts
-        .into_iter()
-        .filter_map(|(name, arities)| {
-            if arities.len() > 1 {
-                Some((name, arities.into_iter().collect()))
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-fn method_overloads(program: &[Stmt]) -> HashMap<String, std::collections::HashSet<usize>> {
-    let mut counts: HashMap<String, Vec<usize>> = HashMap::new();
-    for stmt in program {
-        if let StmtKind::Struct { name, methods, .. } = &stmt.kind {
-            for method in methods {
-                let method_name = lifecycle_method_name(method);
-                counts
-                    .entry(format!("{name}.{method_name}"))
-                    .or_default()
-                    .push(method.params.len());
-            }
-        }
-    }
-    counts
-        .into_iter()
-        .filter_map(|(name, arities)| {
-            if arities.len() > 1 {
-                Some((name, arities.into_iter().collect()))
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-fn lifecycle_method_name(m: &Method) -> &str {
-    if is_mojo_copy_constructor(m) {
-        "__copyinit__"
-    } else {
-        &m.name
-    }
-}
-
-fn is_mojo_copy_constructor(m: &Method) -> bool {
-    m.name == "__init__"
-        && m.has_self
-        && matches!(m.self_convention, Some(ArgConvention::Out))
-        && m.positional_only.is_none()
-        && m.keyword_only == Some(0)
-        && m.params.len() == 1
-        && m.params[0].name == "copy"
-        && m.params[0].default.is_none()
-        && m.params[0].kind == ParamKind::Regular
-        && m.params[0].convention.is_none()
-        && matches!(m.params[0].ty, Type::SelfType)
-        && m.ret.is_none()
-}
-
-fn overloaded_def_name(
-    name: &str,
-    params: &[FnParam],
-    overloads: &HashMap<String, std::collections::HashSet<usize>>,
-) -> String {
-    if overloads
-        .get(name)
-        .is_some_and(|arities| arities.contains(&params.len()))
-    {
-        format!("{name}{}", signature_suffix(params.iter().map(|p| &p.ty)))
-    } else {
-        name.to_string()
-    }
-}
-
-fn overloaded_method_name(
-    name: &str,
-    params: &[FnParam],
-    overloads: &HashMap<String, std::collections::HashSet<usize>>,
-) -> String {
-    if overloads
-        .get(name)
-        .is_some_and(|arities| arities.contains(&params.len()))
-    {
-        format!("{name}{}", signature_suffix(params.iter().map(|p| &p.ty)))
-    } else {
-        name.to_string()
-    }
-}
-
-fn signature_suffix<'a>(params: impl IntoIterator<Item = &'a Type>) -> String {
-    let parts = params
-        .into_iter()
-        .map(type_mangle)
-        .collect::<Vec<_>>()
-        .join("$");
-    format!("$ov${parts}")
-}
-
-fn type_mangle(ty: &Type) -> String {
-    let raw = match ty {
-        Type::Int => "Int".to_string(),
-        Type::UInt => "UInt".to_string(),
-        Type::Bool => "Bool".to_string(),
-        Type::String => "String".to_string(),
-        Type::Float64 => "Float64".to_string(),
-        Type::None => "None".to_string(),
-        Type::Named(name, args) => {
-            let mut s = name.clone();
-            for arg in args {
-                s.push('$');
-                match arg {
-                    ParamArg::Type(t) => s.push_str(&type_mangle(t)),
-                    ParamArg::Value(v) => s.push_str(&format!("V{}", value_arg_mangle(v))),
-                }
-            }
-            s
-        }
-        Type::SelfParam(name) => format!("SelfParam${name}"),
-        Type::Assoc { base, name } => format!("Assoc${}${name}", type_mangle(base)),
-        Type::SelfType => "Self".to_string(),
-        other => format!("{other:?}"),
-    };
-    raw.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '$' })
-        .collect()
-}
-
-fn value_arg_mangle(expr: &Expr) -> String {
-    match &expr.kind {
-        ExprKind::Int(i) => i.to_string(),
-        ExprKind::Bool(b) => b.to_string(),
-        ExprKind::Str(s) => s.clone(),
-        ExprKind::Identifier(name) => name.clone(),
-        _ => "expr".to_string(),
-    }
 }
 
 /// Const-fold a default-argument expression to a value. Handles the literal forms

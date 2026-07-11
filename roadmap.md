@@ -19,8 +19,8 @@ or more ordinary runtime support.
 
 Status: recommended.
 
-Pause feature work for a short stabilization pass, then pivot back to
-self-hosting.
+Finish the remaining stabilization design cleanup, then pivot back to
+self-hosting. The mechanical part of the pass is complete.
 
 That is not a retreat from the self-hosting north star. It is the best way to
 protect it. The last few cycles landed a lot of foundational language surface:
@@ -29,20 +29,20 @@ numeric operation traits, self-hosted math helpers, and lifecycle marker traits
 that now affect observable copy/move/drop behavior. The compiler is therefore at
 a natural consolidation point.
 
-The immediate cleanup target is small and concrete: `cargo clippy --all-targets
--- -D warnings` currently reports six denied warnings, mostly in `src/checker.rs`
-plus one oversized MIR helper. Fix those before adding the next language feature.
-After that, clean up the few design debts that are most likely to make the next
-self-hosted work harder:
+The mechanical cleanup target is complete: `cargo clippy --all-targets -- -D
+warnings` is clean, `scripts/check` runs formatting, tests, and strict Clippy,
+and the oversized checker/lowering/VM data shapes identified by that pass now
+have named records. The remaining stabilization work is the design debt most
+likely to make the next self-hosted work harder:
 
-1. Factor complex checker types into named aliases or small structs.
-2. Consolidate overload signature/lowered-name logic so checker, MIR, and VM do
-   not drift.
+1. Continue replacing complex positional data only when its meaning is unclear;
+   the initial checker and call-context pass is complete.
+2. Status: implemented. Overload signature/lowered-name logic is consolidated in
+   the canonical `src/symbol.rs` module, so checker, MIR, and VM cannot drift.
 3. Keep moving VM metadata toward checked declarations instead of AST-shaped
    side tables.
 4. Improve diagnostics for trait and marker-trait conformance failures.
-5. Re-run `cargo fmt`, `cargo test`, and `cargo clippy --all-targets -- -D
-   warnings` as the new local acceptance gate.
+5. Keep `scripts/check` as the local acceptance gate.
 
 Once that pass is complete, return to the self-hosting loop:
 
@@ -552,6 +552,15 @@ trying to reproduce all of Mojo's overload resolution in one pass.
   call sites.
 
 - Status: implemented.
+  Consolidate signature identity and lowered-name construction behind one
+  canonical symbol API. `src/symbol.rs` now owns the `$ov$` spelling and the
+  typed signature key; checker, MIR, and VM route through it, which also fixed
+  a real checker/MIR drift on struct- and generic-typed overload parameters
+  (`pick$ov$Struct$Point` vs `pick$ov$Point`). Details and residual fallbacks
+  are recorded in `docs/todo.md` under **Overloading**; `tests/symbol_test.rs`
+  guards the spellings and scans `src/` for stray hand-built symbols.
+
+- Status: implemented.
   Add method-overload conformance rules: a conforming struct must provide a
   matching implementation for each trait requirement overload, including
   receiver convention.
@@ -1057,23 +1066,24 @@ status should describe the compiler and stdlib reality, not optimism.
 
 Status: recommended.
 
-1. Do the stabilization checkpoint now.
-2. Make clippy clean under `cargo clippy --all-targets -- -D warnings`, or
-   document any intentional lint allows with narrow local justification.
-3. Consolidate the duplicated overload/lowered-name plumbing before extending
-   overload resolution further.
-4. Tighten trait/marker-trait diagnostics so self-hosted code reports the
+1. Status: implemented.
+   Complete the mechanical stabilization checkpoint: strict Clippy, the local
+   gate, and the first named-data refactors.
+2. Status: implemented.
+   Consolidate the duplicated overload/lowered-name plumbing before extending
+   overload resolution further (`src/symbol.rs`).
+3. Tighten trait/marker-trait diagnostics so self-hosted code reports the
    missing capability instead of a generic bound failure.
-5. Status: implemented.
+4. Status: implemented.
    Improve module search roots and move/mirror the stdlib toward
    `stdlib/std/...`, so self-hosted fixtures can import Mojo-shaped modules
    without repository-relative dot paths.
-6. Return to self-hosted libraries after cleanup: hash-backed `Dict`, richer
+5. Return to self-hosted libraries after cleanup: hash-backed `Dict`, richer
    collection views, and formatting/writer experiments are better next
    acceptance tests than speculative CTFE work.
-7. Promote nested generic CTFE helper specialization only when that self-hosted
+6. Promote nested generic CTFE helper specialization only when that self-hosted
    code naturally needs it.
-8. Promote general trait default methods when a real library protocol needs an
+7. Promote general trait default methods when a real library protocol needs an
    inherited default body; `Hashable` currently reached its proof through
    intrinsic plus explicit `__hash__`, not a general default-method system.
 

@@ -1608,8 +1608,8 @@ fn rejects_tuple_element_write() {
 #[test]
 fn flags_advanced_parameter_forms_as_unsupported() {
     for src in [
-        "def f(**opts: Int):\n    pass\n",                   // **kwargs
-        "def f(out x: Int):\n    pass\n",                    // `out` convention (still deferred)
+        "def f(**opts: Int):\n    pass\n", // **kwargs
+        "def f(out x: Int):\n    pass\n",  // `out` convention (still deferred)
     ] {
         assert!(
             matches!(err(src), TypeError::Unsupported(_)),
@@ -1622,19 +1622,27 @@ fn flags_advanced_parameter_forms_as_unsupported() {
 fn accepts_positional_only_and_keyword_only_markers() {
     ok("def first(a: Int, b: Int, /) -> Int:\n    return a\n\nvar x: Int = first(1, 2)\n");
     ok("def scale(a: Int, *, by: Int) -> Int:\n    return a * by\n\nvar x: Int = scale(4, by=5)\n");
-    ok("def total(*values: Int, scale: Int) -> Int:\n    var t: Int = 0\n    for v in values:\n        t = t + v\n    return t * scale\n\nvar x: Int = total(1, 2, 3, scale=10)\n");
-    ok("def needs_kw(a: Int = 1, *, b: Int) -> Int:\n    return a + b\n\nvar x: Int = needs_kw(b=4)\n");
+    ok(
+        "def total(*values: Int, scale: Int) -> Int:\n    var t: Int = 0\n    for v in values:\n        t = t + v\n    return t * scale\n\nvar x: Int = total(1, 2, 3, scale=10)\n",
+    );
+    ok(
+        "def needs_kw(a: Int = 1, *, b: Int) -> Int:\n    return a + b\n\nvar x: Int = needs_kw(b=4)\n",
+    );
 
     assert!(matches!(
         err("def first(a: Int, /) -> Int:\n    return a\n\nvar x: Int = first(a=1)\n"),
         TypeError::BadCall { .. }
     ));
     assert!(matches!(
-        err("def scale(a: Int, *, by: Int) -> Int:\n    return a * by\n\nvar x: Int = scale(4, 5)\n"),
+        err(
+            "def scale(a: Int, *, by: Int) -> Int:\n    return a * by\n\nvar x: Int = scale(4, 5)\n"
+        ),
         TypeError::ArityMismatch { .. }
     ));
     assert!(matches!(
-        err("def needs_kw(a: Int = 1, *, b: Int) -> Int:\n    return a + b\n\nvar x: Int = needs_kw()\n"),
+        err(
+            "def needs_kw(a: Int = 1, *, b: Int) -> Int:\n    return a + b\n\nvar x: Int = needs_kw()\n"
+        ),
         TypeError::BadCall { .. }
     ));
 }

@@ -751,6 +751,14 @@ and the VM a stable identity for each candidate, including same-arity overloads.
 It also keeps arity overloads and type overloads on one mechanism instead of
 special-casing `name#arity`.
 
+Signature identity and this name scheme are owned by one canonical module,
+`src/symbol.rs`: a signature is typed data (`SignatureKey`, built from either
+the declared `ast::Type` or the checker-resolved `Ty` — both spell a type from
+its annotation, e.g. `Point`, `Pair$Int`) and only the module formats the
+final symbol. Checker, MIR, and VM all route through it, so the recorded
+callee always names the emitted function; `tests/symbol_test.rs` pins the
+spellings and scans `src/` for stray hand-built `$ov$` strings.
+
 ### Try In MIR
 
 `MirInstr::Try` contains mini-CFGs:

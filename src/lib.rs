@@ -11,6 +11,7 @@ pub mod mir;
 pub mod module;
 pub mod parser;
 pub mod runtime;
+pub mod symbol;
 pub mod token;
 pub mod types;
 

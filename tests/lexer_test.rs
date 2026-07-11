@@ -341,7 +341,7 @@ fn keyword_table_and_lex_helper() {
 #[test]
 fn lexes_stropped_identifiers_without_keyword_or_punctuation_meaning() {
     assert_eq!(
-        lex_all("`var` `with space` `with#symbol` `café`") ,
+        lex_all("`var` `with space` `with#symbol` `café`"),
         vec![
             Token::Identifier("var".into()),
             Token::Identifier("with space".into()),

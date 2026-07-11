@@ -302,7 +302,11 @@ impl fmt::Display for LexError {
                 write!(f, "Unterminated string literal starting at byte {}", pos)
             }
             LexError::UnterminatedIdentifier(pos) => {
-                write!(f, "Unterminated backtick identifier starting at byte {}", pos)
+                write!(
+                    f,
+                    "Unterminated backtick identifier starting at byte {}",
+                    pos
+                )
             }
             LexError::InvalidEscape(c, pos) => {
                 write!(f, "Invalid string escape '\\{}' at byte {}", c, pos)

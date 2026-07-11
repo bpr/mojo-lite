@@ -14,25 +14,28 @@ proofs, numeric operation traits, self-hosted math helpers, and lifecycle marker
 traits with observable copy/move/drop behavior. More self-hosting will now put
 pressure on exactly the parts of the compiler that have become a little dense.
 
-The first checkpoint should be mechanical and bounded:
+The mechanical portion of the checkpoint is complete; the remaining items are
+bounded design cleanup:
 
-- Status: pending.
-  Make `cargo clippy --all-targets -- -D warnings` clean. Current failures are
-  small enough to handle directly: complex checker types need names, one checker
-  branch wants `?`, one membership check wants `contains`, one nested `if` can be
-  collapsed, and one MIR helper has too many arguments.
+- Status: implemented.
+  `cargo clippy --all-targets -- -D warnings` is clean. The mechanical findings
+  were fixed, oversized checker tuples were replaced with named records, and
+  coherent argument groups replaced every `too_many_arguments` allowance.
 
-- Status: pending.
-  Add clippy to the normal local gate next to `cargo fmt` and `cargo test`.
+- Status: implemented.
+  `scripts/check` is the normal local gate: `cargo fmt --check`, `cargo test`,
+  then strict Clippy.
 
-- Status: pending.
-  Factor complex checker data shapes into named aliases or small structs. This is
-  especially useful around overload resolution and resolved-callee tables.
+- Status: implemented initial pass; continue when a shape becomes unclear.
+  The method-overload candidate tuple is now `MethodCallResolution`, struct
+  checking uses `StructDeclaration`, and lowering/VM call contexts use named
+  records. Do not manufacture wrappers mechanically, but replace any remaining
+  positional data shape when its fields carry distinct meanings.
 
-- Status: pending.
-  Consolidate overload signature and lowered-name construction. Checker, MIR,
-  and VM must agree on names such as `pick$ov$Int`; duplicated string logic is
-  likely to drift as type-directed overloading grows.
+- Status: implemented.
+  Consolidate overload signature and lowered-name construction. `src/symbol.rs`
+  now owns signature identity (`SignatureKey`/`TypeKey`) and every `$ov$`
+  spelling; checker, MIR, and VM all route through it (see **Overloading**).
 
 - Status: pending.
   Keep moving runtime/MIR metadata toward checked declarations rather than
@@ -307,14 +310,43 @@ Do not flesh them out all at once.
 
 ## Overloading
 
-Status: implemented foundation; needs cleanup before expansion.
+Status: implemented foundation; symbol cleanup complete.
 
 Function, method, and constructor calls now resolve fixed-arity overloads and
 conservative same-arity type-directed overloads. The checker records the
 resolved callee, and MIR/VM lowering uses signature-qualified names.
 
-- Status: pending cleanup.
+- Status: implemented.
   Centralize signature keys and lowered-name formatting.
+
+  `src/symbol.rs` is now the canonical owner of overload identity and symbol
+  formatting: an overload signature is typed data (`SignatureKey`, a list of
+  `TypeKey`s) built from either the declared `ast::Type` (MIR/VM definition
+  side) or the checker-resolved `Ty` (call-resolution side), and only the
+  module formats the `$ov$` spelling. It also owns the overload-set scan
+  (`OverloadSets`), lowered def/method names, the lifecycle `__copyinit__`
+  rename, nested lifted names, and the VM's symbol predicates
+  (`is_overload_of`, `init_overload_struct`).
+
+  Consolidating the two manglings fixed a real drift: the checker used to spell
+  a struct parameter `Struct$Point` (and a type parameter `Param$T` /
+  `SelfParam$T`) where MIR named the definition `Point`/`T`, so a recorded
+  callee like `pick$ov$Struct$Point` named no MIR function and struct-typed
+  overloads failed at runtime. Both sides now spell types from the annotation
+  (`pick$ov$Point`); `assets/ok/overloading_struct_params.mojo` covers it
+  end-to-end, and `tests/symbol_test.rs` pins the spellings, asserts every
+  checker-recorded callee names an emitted MIR function, and scans `src/` so a
+  hand-built `$ov$` string outside the module fails the suite.
+
+  The VM's arity-based `overload_name` fallback remains only for
+  VM-synthesized dispatch with no checked call span (operator/`__str__`/
+  `__hash__` dunders, `__setitem__`, the `for`-loop `__next__` protocol,
+  `__init__` reached without a recorded target); its callers are documented on
+  the method. Definition-side value arguments now fold the same supported
+  comptime integer expressions and constants as the checker, so
+  `FixedBuffer[N]`, `FixedBuffer[2 + 6]`, and resolved `FixedBuffer[8]` share a
+  symbol. Source-controlled identifier text is escaped injectively, preventing
+  stropped type names such as `A-B` and `A_B` from collapsing to one overload.
 
 - Status: pending.
   Add more negative tests for duplicate-equivalent overloads and ambiguous
