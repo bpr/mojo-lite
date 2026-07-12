@@ -1820,6 +1820,36 @@ fn parses_function_type_annotations() {
 }
 
 #[test]
+fn parses_parameterized_capturing_function_type_values() {
+    let stmt = parse("comptime Callback = def[width: Int](Int) capturing[_] -> None\n")
+        .into_iter()
+        .next()
+        .unwrap();
+    assert!(matches!(
+        stmt.kind,
+        StmtKind::Comptime {
+            value: Expr {
+                kind: ExprKind::TypeValue(Type::Func { .. }),
+                ..
+            },
+            ..
+        }
+    ));
+}
+
+#[test]
+fn parses_parenthesized_from_imports() {
+    assert_eq!(
+        parse("from .backend import (\n    tile,\n    vectorize as vec,\n)\n"),
+        vec![Stmt::from(StmtKind::FromImport {
+            level: 1,
+            path: vec!["backend".into()],
+            names: ImportNames::Names(vec![iname("tile", None), iname("vectorize", Some("vec")),]),
+        })]
+    );
+}
+
+#[test]
 fn function_type_return_nests() {
     // `def(Int) -> def(Int) -> Int` — the return type is itself a function type.
     assert_eq!(

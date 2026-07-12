@@ -1667,11 +1667,7 @@ fn accepts_variadic_args() {
         err("def tag(label: String, *nums: Int) -> Int:\n    return 0\n\nvar z: Int = tag()\n"),
         TypeError::BadCall { .. }
     ));
-    // `*args` on a generic function is deferred.
-    assert!(matches!(
-        err("def f[T: AnyType](*a: Int) -> Int:\n    return 0\n"),
-        TypeError::Unsupported(_)
-    ));
+    ok("def f[T: AnyType](*a: T) -> Int:\n    return len(a)\n\nvar n: Int = f(1, 2, 3)\n");
 }
 
 #[test]
@@ -1704,10 +1700,17 @@ fn rejects_bad_default_values_and_arity() {
         err("def f(a: Int, b: Int = 2) -> Int:\n    return a\n\nvar z: Int = f(1, 2, 3)\n"),
         TypeError::ArityMismatch { .. }
     ));
-    // Defaults on generic functions are still deferred.
+    ok("def f[T: Copyable & Movable](a: T, b: Int = 2) -> T:\n    return a\n\nvar n: Int = f(1)\n");
+}
+
+#[test]
+fn generic_calls_share_ordinary_argument_binding() {
+    ok(
+        "def choose[T: Copyable & Movable](first: T, /, offset: Int = 0, *, use_offset: Bool = False) -> T:\n    return first\n\nvar a: Int = choose(1, offset=2, use_offset=True)\n",
+    );
     assert!(matches!(
-        err("def f[T: AnyType](a: T, b: Int = 2) -> T:\n    return a\n"),
-        TypeError::Unsupported(_)
+        err("def f[T: Copyable & Movable](x: T, /) -> T:\n    return x\n\nvar n: Int = f(x=1)\n"),
+        TypeError::BadCall { .. }
     ));
 }
 
@@ -1738,23 +1741,28 @@ fn accepts_keyword_arguments_and_reports_mismatches() {
         err("def main():\n    print(len(x=\"hi\"))\n"),
         TypeError::BadCall { .. }
     ));
-    // Keyword args to a method are still deferred.
-    assert!(matches!(
-        err(
-            "@fieldwise_init\nstruct C:\n    var n: Int\n\n    def g(self, k: Int) -> Int:\n        return k\n\nvar z: Int = C(1).g(k=2)\n"
-        ),
-        TypeError::Unsupported(_)
-    ));
+    // Ordinary user methods use the same keyword matcher.
+    ok(
+        "@fieldwise_init\nstruct C:\n    var n: Int\n\n    def g(self, k: Int) -> Int:\n        return k\n\nvar z: Int = C(1).g(k=2)\n",
+    );
+}
+
+#[test]
+fn method_argument_markers_and_keywords_are_checked() {
+    ok(
+        "@fieldwise_init\nstruct C:\n    var n: Int\n    def f(self, x: Int, /, y: Int = 2, *, scale: Int = 1) -> Int:\n        return (x + y) * scale\n\nvar c: C = C(0)\nvar n: Int = c.f(1, scale=3)\n",
+    );
+    let error = err(
+        "@fieldwise_init\nstruct C:\n    var n: Int\n    def f(self, x: Int, /) -> Int:\n        return x\n\nvar c: C = C(0)\nvar n: Int = c.f(x=1)\n",
+    );
+    assert!(matches!(error, TypeError::BadCall { .. }), "got {error:?}");
 }
 
 #[test]
 fn flags_advanced_forms_on_methods_and_traits() {
-    assert!(matches!(
-        err(
-            "@fieldwise_init\nstruct C:\n    var n: Int\n\n    def f(self, k: Int = 1):\n        pass\n"
-        ),
-        TypeError::Unsupported(_)
-    ));
+    ok(
+        "@fieldwise_init\nstruct C:\n    var n: Int\n\n    def f(self, k: Int = 1):\n        pass\n\nvar c: C = C(0)\nc.f()\n",
+    );
     assert!(matches!(
         err("trait T:\n    def m(self, *args: Int) -> Int:\n        ...\n"),
         TypeError::Unsupported(_)

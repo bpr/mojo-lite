@@ -127,6 +127,7 @@ struct MethodInvocation<'a> {
     method: &'a str,
     resolved_name: Option<&'a str>,
     arguments: Vec<Value>,
+    keyword_arguments: Vec<(String, Value)>,
     receiver_place: &'a Option<MirPlace>,
     argument_places: &'a [Option<MirPlace>],
 }
@@ -807,11 +808,16 @@ impl VmBackend {
                 method,
                 resolved,
                 args,
+                kwargs,
                 recv_place,
                 arg_places,
             } => {
                 let recv_val = regs[recv.0 as usize].clone();
                 let argv: Vec<Value> = args.iter().map(|r| regs[r.0 as usize].clone()).collect();
+                let kw: Vec<(String, Value)> = kwargs
+                    .iter()
+                    .map(|(name, reg)| (name.clone(), regs[reg.0 as usize].clone()))
+                    .collect();
                 regs[dest.0 as usize] = self.method_call(
                     prog,
                     MethodInvocation {
@@ -819,6 +825,7 @@ impl VmBackend {
                         method,
                         resolved_name: resolved.as_deref(),
                         arguments: argv,
+                        keyword_arguments: kw,
                         receiver_place: recv_place,
                         argument_places: arg_places,
                     },
@@ -1250,6 +1257,7 @@ impl VmBackend {
             method,
             resolved_name: resolved,
             arguments: args,
+            keyword_arguments: kwargs,
             receiver_place: recv_place,
             argument_places: arg_places,
         } = invocation;
@@ -1304,12 +1312,18 @@ impl VmBackend {
                 let fidx = prog.index_of(&fname).ok_or_else(|| {
                     RuntimeError::Unsupported(format!("vm: unknown method '{fname}'"))
                 })?;
-                // Bind `self` first (parameter slot 0), then the method arguments
-                // (slots 1..). Methods take only positional args (the checker defers
-                // keyword/default args to methods), so the mapping is direct.
-                let mut call_args = Vec::with_capacity(args.len() + 1);
+                // Bind ordinary arguments through the same signature metadata as
+                // free functions, then prepend `self` in frame slot zero.
+                let (bound, slots) = match prog.sigs.get(&fname) {
+                    Some(signature) => bind_args(&fname, signature, args, kwargs)?,
+                    None => {
+                        let slots = (0..args.len()).map(ArgSlot::Positional).collect();
+                        (args, slots)
+                    }
+                };
+                let mut call_args = Vec::with_capacity(bound.len() + 1);
                 call_args.push(recv.clone());
-                call_args.extend(args);
+                call_args.extend(bound);
                 let (ret, frame_vars) = self.call_frame(prog, fidx, call_args, &[])?;
                 // Write back each `mut`/`ref` *ordinary* parameter (slot ≥ 1; slot 0
                 // is `self`, handled below via `recv_place`) to its caller place,
@@ -1319,7 +1333,13 @@ impl VmBackend {
                     if !ref_params[i] {
                         continue;
                     }
-                    match arg_places.get(i - 1).and_then(|o| o.as_ref()) {
+                    let place = match slots.get(i - 1) {
+                        Some(ArgSlot::Positional(position)) => {
+                            arg_places.get(*position).and_then(|place| place.as_ref())
+                        }
+                        _ => None,
+                    };
+                    match place {
                         Some(place) => *nav_mut(vars, regs, place)? = frame_vars[i].clone(),
                         None => {
                             return Err(RuntimeError::Unsupported(format!(

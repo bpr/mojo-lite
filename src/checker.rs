@@ -75,13 +75,39 @@ enum CtMemberReq {
 
 #[derive(Clone, PartialEq)]
 struct MethodSig {
+    /// Regular parameters only; variadic element type is stored separately.
     params: Vec<Ty>,
+    names: Vec<String>,
+    required: Vec<bool>,
+    variadic: Option<Box<Ty>>,
+    variadic_index: Option<usize>,
+    positional_only: Option<usize>,
+    keyword_only: Option<usize>,
+    conventions: Vec<Option<ArgConvention>>,
     ret: Ty,
     /// Receiver convention. `None` means plain read-only `self`; explicit
     /// conventions (`mut`, `owned`, `ref`, ...) are preserved so trait
     /// requirements can compare them exactly. Today only `mut self` changes call
     /// checking behavior.
     self_convention: Option<crate::ast::ArgConvention>,
+}
+
+impl MethodSig {
+    fn intrinsic(params: Vec<Ty>, ret: Ty) -> MethodSig {
+        let len = params.len();
+        MethodSig {
+            params,
+            names: (0..len).map(|i| format!("arg{i}")).collect(),
+            required: vec![true; len],
+            variadic: None,
+            variadic_index: None,
+            positional_only: None,
+            keyword_only: None,
+            conventions: vec![None; len],
+            ret,
+            self_convention: None,
+        }
+    }
 }
 
 fn fixed_callable_arity(ty: &Ty) -> Option<usize> {
@@ -187,7 +213,8 @@ enum OverloadSelect {
 /// scoring. Named fields keep overload resolution readable as it evolves.
 struct MethodCallResolution {
     conversion_score: usize,
-    parameter_types: Vec<Ty>,
+    slots: Vec<ArgSlot>,
+    conventions: Vec<Option<ArgConvention>>,
     return_type: Ty,
     mutates_receiver: bool,
     lowered_name: Option<String>,
@@ -534,10 +561,28 @@ impl Checker {
                 keyword_only: *keyword_only,
                 conventions: conventions.clone(),
             },
-            Ty::GenericFunc { decls, params, ret } => Ty::GenericFunc {
+            Ty::GenericFunc {
+                decls,
+                params,
+                names,
+                ret,
+                required,
+                variadic,
+                positional_only,
+                keyword_only,
+                conventions,
+            } => Ty::GenericFunc {
                 decls: decls.clone(),
                 params: params.iter().map(|p| self.resolve_assoc_ty(p)).collect(),
+                names: names.clone(),
                 ret: Box::new(self.resolve_assoc_ty(ret)),
+                required: required.clone(),
+                variadic: variadic
+                    .as_ref()
+                    .map(|v| Box::new(self.resolve_assoc_ty(v))),
+                positional_only: *positional_only,
+                keyword_only: *keyword_only,
+                conventions: conventions.clone(),
             },
             Ty::Overload(candidates) => Ty::Overload(
                 candidates
@@ -1147,9 +1192,9 @@ impl Checker {
                 if self.structs.contains_key(name) {
                     return Err(TypeError::Redeclaration(name.clone()));
                 }
-                // Conventions / `**kwargs` are parsed but not all implemented;
-                // default values, `/`, bare `*`, and `*args` are supported on
-                // non-generic functions.
+                // `**kwargs` and out-parameter conventions remain outside the
+                // supported subset. Other argument forms share one binder for
+                // generic and non-generic functions.
                 if let Some(feature) = Self::advanced_param_feature(
                     params,
                     *positional_only,
@@ -1159,27 +1204,11 @@ impl Checker {
                 ) {
                     return Err(TypeError::Unsupported(feature.to_string()));
                 }
-                let has_default = params.iter().any(|p| p.default.is_some());
-                if has_default && !type_params.is_empty() {
-                    return Err(TypeError::Unsupported(
-                        "default values on generic functions".to_string(),
-                    ));
-                }
-                if keyword_only.is_some() && !type_params.is_empty() {
-                    return Err(TypeError::Unsupported(
-                        "keyword-only parameters on generic functions".to_string(),
-                    ));
-                }
                 // A `*args` variadic is supported on non-generic functions; any
                 // regular parameters after it are keyword-only.
                 let variadic_idx = params
                     .iter()
                     .position(|p| p.kind == crate::ast::ParamKind::Variadic);
-                if variadic_idx.is_some() && !type_params.is_empty() {
-                    return Err(TypeError::Unsupported(
-                        "variadic parameters on generic functions".to_string(),
-                    ));
-                }
                 // Regular (non-variadic) parameters, over which arity is computed.
                 let regular: Vec<&crate::ast::FnParam> = params
                     .iter()
@@ -1251,10 +1280,22 @@ impl Checker {
                         conventions: regular.iter().map(|p| p.convention).collect(),
                     }
                 } else {
+                    let regular_tys: Vec<Ty> = params
+                        .iter()
+                        .zip(&param_tys)
+                        .filter(|(p, _)| p.kind == crate::ast::ParamKind::Regular)
+                        .map(|(_, ty)| ty.clone())
+                        .collect();
                     Ty::GenericFunc {
                         decls: decls.clone(),
-                        params: param_tys.clone(),
+                        params: regular_tys,
+                        names: regular.iter().map(|p| p.name.clone()).collect(),
                         ret: Box::new(ret_ty.clone()),
+                        required,
+                        variadic: variadic_idx.map(|vi| Box::new(param_tys[vi].clone())),
+                        positional_only: pos_only,
+                        keyword_only: kw_only,
+                        conventions: regular.iter().map(|p| p.convention).collect(),
                     }
                 };
                 if let Err(e) = self.declare(name, fn_ty) {
@@ -1503,6 +1544,43 @@ impl Checker {
         params.iter().map(|p| self.ty_from_anno(&p.ty)).collect()
     }
 
+    fn method_sig(&self, method: &Method) -> Result<MethodSig, TypeError> {
+        let all_types = self.param_tys(&method.params)?;
+        let variadic_idx = method
+            .params
+            .iter()
+            .position(|p| p.kind == crate::ast::ParamKind::Variadic);
+        let regular: Vec<_> = method
+            .params
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.kind == crate::ast::ParamKind::Regular)
+            .collect();
+        let keyword_only =
+            effective_keyword_only_index(&method.params, method.keyword_only, variadic_idx);
+        Ok(MethodSig {
+            params: regular
+                .iter()
+                .map(|(index, _)| all_types[*index].clone())
+                .collect(),
+            names: regular.iter().map(|(_, p)| p.name.clone()).collect(),
+            required: required_mask(
+                &regular.iter().map(|(_, p)| *p).collect::<Vec<_>>(),
+                keyword_only,
+            )?,
+            variadic: variadic_idx.map(|index| Box::new(all_types[index].clone())),
+            variadic_index: regular_marker_index(&method.params, variadic_idx),
+            positional_only: regular_marker_index(&method.params, method.positional_only),
+            keyword_only,
+            conventions: regular.iter().map(|(_, p)| p.convention).collect(),
+            ret: match &method.ret {
+                Some(ret) => self.ty_from_anno(ret)?,
+                None => Ty::None,
+            },
+            self_convention: method.self_convention,
+        })
+    }
+
     /// The name of the first advanced parameter feature used by a signature (a
     /// default value, a `*args`/`**kwargs` variadic, or an argument convention, or
     /// `None` if the signature is supported by this checking path. `/` and bare
@@ -1640,6 +1718,13 @@ impl Checker {
                 }
                 let sig = MethodSig {
                     params: self.param_tys(&m.params)?,
+                    names: m.params.iter().map(|p| p.name.clone()).collect(),
+                    required: vec![true; m.params.len()],
+                    variadic: None,
+                    variadic_index: None,
+                    positional_only: m.positional_only,
+                    keyword_only: m.keyword_only,
+                    conventions: m.params.iter().map(|p| p.convention).collect(),
                     ret: match &m.ret {
                         Some(t) => self.ty_from_anno(t)?,
                         None => Ty::None,
@@ -1737,14 +1822,7 @@ impl Checker {
         // Method signatures.
         for m in methods {
             let method_name = lifecycle_method_name(m);
-            let sig = MethodSig {
-                params: self.param_tys(&m.params)?,
-                ret: match &m.ret {
-                    Some(t) => self.ty_from_anno(t)?,
-                    None => Ty::None,
-                },
-                self_convention: m.self_convention,
-            };
+            let sig = self.method_sig(m)?;
             let info = self.structs.get_mut(name).expect("just registered");
             let overloads = info.methods.entry(method_name.to_string()).or_default();
             if overloads
@@ -1812,6 +1890,16 @@ impl Checker {
                         .iter()
                         .map(|t| self.resolve_assoc_ty(&substitute_self(t, self_ty)))
                         .collect(),
+                    names: req_sig.names.clone(),
+                    required: req_sig.required.clone(),
+                    variadic: req_sig
+                        .variadic
+                        .as_ref()
+                        .map(|ty| Box::new(self.resolve_assoc_ty(&substitute_self(ty, self_ty)))),
+                    variadic_index: req_sig.variadic_index,
+                    positional_only: req_sig.positional_only,
+                    keyword_only: req_sig.keyword_only,
+                    conventions: req_sig.conventions.clone(),
                     ret: self.resolve_assoc_ty(&substitute_self(&req_sig.ret, self_ty)),
                     self_convention: req_sig.self_convention,
                 };
@@ -1919,16 +2007,11 @@ impl Checker {
                 &m.params,
                 m.positional_only,
                 m.keyword_only,
-                true,
-                true,
+                false,
+                false,
             )
         {
             return Err(TypeError::Unsupported(feature.to_string()));
-        }
-        if !is_mojo_copy_constructor(m) && m.keyword_only.is_some() {
-            return Err(TypeError::Unsupported(
-                "keyword-only parameters on methods".to_string(),
-            ));
         }
         // A `@staticmethod` (no `self`) is parsed but its semantics are deferred.
         if !m.has_self {
@@ -1963,6 +2046,19 @@ impl Checker {
             Some(t) => self.ty_from_anno(t)?,
             None => Ty::None,
         };
+        for param in &m.params {
+            if let Some(default) = &param.default {
+                let expected = self.ty_from_anno(&param.ty)?;
+                let found = self.infer(default)?;
+                if !coerces(&found, &expected) {
+                    return Err(TypeError::TypeMismatch {
+                        expected: expected.to_string(),
+                        found: found.to_string(),
+                        context: format!("default value of method parameter '{}'", param.name),
+                    });
+                }
+            }
+        }
         self.push_scope();
         let mut result = self.bind_and_check_method(self_ty, m, &ret_ty);
         // Definite initialization (conservative, flow-insensitive first pass): an
@@ -2018,7 +2114,10 @@ impl Checker {
         );
         self.declare_with_mutability("self", self_ty.clone(), self_writable)?;
         for p in &m.params {
-            let pty = self.ty_from_anno(&p.ty)?;
+            let mut pty = self.ty_from_anno(&p.ty)?;
+            if p.kind == crate::ast::ParamKind::Variadic {
+                pty = Ty::List(Box::new(pty));
+            }
             self.declare_with_mutability(&p.name, pty, parameter_is_writable(p.convention))?;
         }
         // `self` is writable in a `mut self` method, or an `out self` `__init__`
@@ -2603,6 +2702,9 @@ impl Checker {
             ExprKind::Bool(_) => Ok(Ty::Bool),
             ExprKind::Str(_) => Ok(Ty::String),
             ExprKind::None => Ok(Ty::None),
+            ExprKind::TypeValue(_) => Err(TypeError::Unsupported(
+                "function types as compile-time values".to_string(),
+            )),
             ExprKind::Identifier(name) => self
                 .lookup(name)
                 .cloned()
@@ -2621,10 +2723,7 @@ impl Checker {
                 method,
                 args,
                 kwargs,
-            } => {
-                reject_kwargs(kwargs)?;
-                self.infer_method_call(expr.span, object, method, args)
-            }
+            } => self.infer_method_call(expr.span, object, method, args, kwargs),
             ExprKind::Index { object, index } => self.infer_index(object, index),
             // Transfer is identity for typing (ownership move is not modeled).
             ExprKind::Transfer(inner) => self.infer(inner),
@@ -2959,20 +3058,24 @@ impl Checker {
         object: &Expr,
         method: &str,
         args: &[Expr],
+        kwargs: &[crate::ast::KwArg],
     ) -> Result<Ty, TypeError> {
         // A **static** method on a parameterized built-in type — the receiver is a
         // type, not a value (`UnsafePointer[T].alloc(n)`). Handled before inferring
         // the object (which would reject a bare `TypeApply`).
         if let ExprKind::TypeApply { name, args: targs } = &object.kind {
+            reject_kwargs(kwargs)?;
             return self.infer_static_method(name, targs, method, args);
         }
         let obj_ty = self.infer(object)?;
         // Built-in `List` methods (mutating; require a plain variable receiver).
         if let Ty::List(elem) = &obj_ty {
+            reject_kwargs(kwargs)?;
             return self.infer_list_method(object, method, elem, args);
         }
         // Built-in `UnsafePointer` methods (`free`).
         if let Ty::Pointer(elem) = &obj_ty {
+            reject_kwargs(kwargs)?;
             return self.infer_pointer_method(method, elem, args);
         }
         // Resolve the method to a concrete signature (params + return + whether
@@ -2992,10 +3095,18 @@ impl Checker {
                         for sig in sigs {
                             let params: Vec<Ty> =
                                 sig.params.iter().map(|t| substitute(t, &subst)).collect();
-                            if let Ok(score) = self.score_args(&params, args) {
+                            let variadic = sig.variadic.as_ref().map(|ty| substitute(ty, &subst));
+                            if let Ok((score, slots)) = self.score_method_call(
+                                sig,
+                                &params,
+                                variadic.as_ref(),
+                                args,
+                                kwargs,
+                            ) {
                                 matches.push(MethodCallResolution {
                                     conversion_score: score,
-                                    parameter_types: params,
+                                    slots,
+                                    conventions: sig.conventions.clone(),
                                     return_type: substitute(&sig.ret, &subst),
                                     mutates_receiver: matches!(
                                         sig.self_convention,
@@ -3015,11 +3126,8 @@ impl Checker {
                 .lookup_trait_method(bounds, method, args.len())
                 .map(|sig| MethodCallResolution {
                     conversion_score: 0,
-                    parameter_types: sig
-                        .params
-                        .iter()
-                        .map(|t| substitute_self(t, &obj_ty))
-                        .collect(),
+                    slots: (0..args.len()).map(ArgSlot::Positional).collect(),
+                    conventions: sig.conventions.clone(),
                     return_type: substitute_self(&sig.ret, &obj_ty),
                     mutates_receiver: matches!(
                         sig.self_convention,
@@ -3033,7 +3141,8 @@ impl Checker {
             _ if method == "__hash__" && args.is_empty() && builtin_hashable_ty(&obj_ty) => {
                 Ok(Some(MethodCallResolution {
                     conversion_score: 0,
-                    parameter_types: vec![],
+                    slots: vec![],
+                    conventions: vec![],
                     return_type: Ty::UInt,
                     mutates_receiver: false,
                     lowered_name: None,
@@ -3071,49 +3180,82 @@ impl Checker {
         if resolved.mutates_receiver {
             self.check_place(object)?;
         }
-        if resolved.parameter_types.len() != args.len() {
-            return Err(TypeError::ArityMismatch {
-                name: method.to_string(),
-                expected: resolved.parameter_types.len(),
-                got: args.len(),
-            });
-        }
-        for (i, (arg, expected)) in args.iter().zip(&resolved.parameter_types).enumerate() {
-            let aty = self.infer(arg)?;
-            if !coerces(&aty, expected) {
-                return Err(TypeError::TypeMismatch {
-                    expected: expected.to_string(),
-                    found: aty.to_string(),
-                    context: format!("argument {} to method '{}'", i + 1, method),
-                });
+        for (index, slot) in resolved.slots.iter().enumerate() {
+            let expression = match slot {
+                ArgSlot::Positional(position) => &args[*position],
+                ArgSlot::Keyword(position) => &kwargs[*position].value,
+                ArgSlot::Default => continue,
+            };
+            let ty = self.infer(expression)?;
+            if matches!(
+                resolved.conventions.get(index),
+                Some(Some(ArgConvention::Owned | ArgConvention::Deinit))
+            ) {
+                self.check_consuming(
+                    expression,
+                    &ty,
+                    &format!("argument {} to method '{}'", index + 1, method),
+                )?;
             }
         }
+        check_call_aliasing(&resolved.slots, &resolved.conventions, args, kwargs)?;
         Ok(resolved.return_type)
     }
 
-    fn score_args(&self, params: &[Ty], args: &[Expr]) -> Result<usize, TypeError> {
-        if params.len() != args.len() {
-            return Err(TypeError::ArityMismatch {
-                name: "overload".to_string(),
-                expected: params.len(),
-                got: args.len(),
-            });
-        }
+    fn score_method_call(
+        &self,
+        signature: &MethodSig,
+        params: &[Ty],
+        variadic: Option<&Ty>,
+        args: &[Expr],
+        kwargs: &[crate::ast::KwArg],
+    ) -> Result<(usize, Vec<ArgSlot>), TypeError> {
+        let keyword_names: Vec<_> = kwargs.iter().map(|arg| arg.name.as_str()).collect();
+        let (slots, overflow) = match_call_slots(
+            &signature.names,
+            &signature.required,
+            signature.positional_only,
+            signature.keyword_only,
+            args.len(),
+            &keyword_names,
+            variadic.is_some(),
+        )
+        .map_err(|error| error.into_type_error("method"))?;
         let mut score = 0;
-        for (arg, expected) in args.iter().zip(params) {
-            let aty = self.infer(arg)?;
-            if !coerces(&aty, expected) {
+        for (index, slot) in slots.iter().enumerate() {
+            let expression = match slot {
+                ArgSlot::Positional(position) => &args[*position],
+                ArgSlot::Keyword(position) => &kwargs[*position].value,
+                ArgSlot::Default => continue,
+            };
+            let actual = self.infer(expression)?;
+            if !coerces(&actual, &params[index]) {
                 return Err(TypeError::TypeMismatch {
-                    expected: expected.to_string(),
-                    found: aty.to_string(),
-                    context: "overload candidate".to_string(),
+                    expected: params[index].to_string(),
+                    found: actual.to_string(),
+                    context: "method overload candidate".to_string(),
                 });
             }
-            if aty != *expected {
+            if actual != params[index] {
                 score += 1;
             }
         }
-        Ok(score)
+        if let Some(element) = variadic {
+            for position in overflow {
+                let actual = self.infer(&args[position])?;
+                if !coerces(&actual, element) {
+                    return Err(TypeError::TypeMismatch {
+                        expected: element.to_string(),
+                        found: actual.to_string(),
+                        context: "variadic method argument".to_string(),
+                    });
+                }
+                if actual != *element {
+                    score += 1;
+                }
+            }
+        }
+        Ok((score, slots))
     }
 
     /// Type a static method on a parameterized built-in type. Currently only
@@ -3463,11 +3605,7 @@ impl Checker {
         // (Phase 6). A user trait cannot shadow a built-in name, so this is
         // unambiguous.
         if method == "__hash__" && argc == 0 && bounds.iter().any(|b| b == "Hashable") {
-            return Some(MethodSig {
-                params: vec![],
-                ret: Ty::UInt,
-                self_convention: None,
-            });
+            return Some(MethodSig::intrinsic(vec![], Ty::UInt));
         }
         // The built-in numeric-rounding traits contribute a `-> Self` dunder
         // (Phase 7), used by the self-hosted `math` module: `Floorable`/
@@ -3480,11 +3618,7 @@ impl Checker {
             } else {
                 vec![]
             };
-            return Some(MethodSig {
-                params,
-                ret: Ty::SelfType,
-                self_convention: None,
-            });
+            return Some(MethodSig::intrinsic(params, Ty::SelfType));
         }
         bounds
             .iter()
@@ -3852,16 +3986,11 @@ impl Checker {
                         conventions,
                     )
                 }
-                // A generic function infers or is supplied its parameters. Keyword
-                // arguments to a generic function are deferred.
-                Ty::GenericFunc { decls, params, ret } => {
-                    if !kwargs.is_empty() {
-                        return Err(TypeError::Unsupported(
-                            "keyword arguments to a generic function".to_string(),
-                        ));
-                    }
+                // Bind ordinary arguments first, then infer or apply the generic
+                // function's compile-time parameters from the occupied slots.
+                generic @ Ty::GenericFunc { .. } => {
                     return self
-                        .infer_generic_call(name, &decls, &params, &ret, param_args, args)
+                        .infer_generic_call(name, &generic, param_args, args, kwargs)
                         // Concrete overloads are preferred to generic candidates.
                         // Keep the genericity penalty above any realistic argument
                         // coercion count while preserving ties between generics.
@@ -3953,35 +4082,80 @@ impl Checker {
     fn infer_generic_call(
         &self,
         name: &str,
-        decls: &[ParamDecl],
-        params: &[Ty],
-        ret: &Ty,
+        generic: &Ty,
         param_args: &[crate::ast::ParamArg],
         args: &[Expr],
+        kwargs: &[crate::ast::KwArg],
     ) -> Result<Ty, TypeError> {
-        if params.len() != args.len() {
-            return Err(TypeError::ArityMismatch {
-                name: name.to_string(),
-                expected: params.len(),
-                got: args.len(),
-            });
+        let Ty::GenericFunc {
+            decls,
+            params,
+            names,
+            ret,
+            required,
+            variadic,
+            positional_only,
+            keyword_only,
+            conventions,
+        } = generic
+        else {
+            unreachable!("infer_generic_call requires a generic function")
+        };
+        let kw_names: Vec<&str> = kwargs.iter().map(|k| k.name.as_str()).collect();
+        let (slots, overflow) = match_call_slots(
+            names,
+            required,
+            *positional_only,
+            *keyword_only,
+            args.len(),
+            &kw_names,
+            variadic.is_some(),
+        )
+        .map_err(|e| e.into_type_error(name))?;
+        let mut use_params = Vec::new();
+        let mut arg_tys = Vec::new();
+        for (i, slot) in slots.iter().enumerate() {
+            let arg = match slot {
+                ArgSlot::Positional(p) => &args[*p],
+                ArgSlot::Keyword(k) => &kwargs[*k].value,
+                ArgSlot::Default => continue,
+            };
+            use_params.push(params[i].clone());
+            arg_tys.push(self.infer(arg)?);
         }
-        let arg_tys = args
-            .iter()
-            .map(|a| self.infer(a))
-            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(elem) = variadic.as_deref() {
+            for &p in &overflow {
+                use_params.push(elem.clone());
+                arg_tys.push(self.infer(&args[p])?);
+            }
+        }
         let (subst, _tyargs) =
-            self.resolve_use_params(name, decls, param_args, params, &arg_tys)?;
-        for (i, (aty, pty)) in arg_tys.iter().zip(params).enumerate() {
+            self.resolve_use_params(name, decls, param_args, &use_params, &arg_tys)?;
+        for (aty, pty) in arg_tys.iter().zip(&use_params) {
             let expected = self.resolve_assoc_ty(&substitute(pty, &subst));
             if !coerces(aty, &expected) {
                 return Err(TypeError::TypeMismatch {
                     expected: expected.to_string(),
                     found: aty.to_string(),
-                    context: format!("argument {} to '{}'", i + 1, name),
+                    context: format!("argument to '{}'", name),
                 });
             }
         }
+        for (i, slot) in slots.iter().enumerate() {
+            if matches!(
+                conventions.get(i),
+                Some(Some(ArgConvention::Owned | ArgConvention::Deinit))
+            ) {
+                let arg = match slot {
+                    ArgSlot::Positional(p) => &args[*p],
+                    ArgSlot::Keyword(k) => &kwargs[*k].value,
+                    ArgSlot::Default => continue,
+                };
+                let ty = self.infer(arg)?;
+                self.check_consuming(arg, &ty, &format!("argument '{}' to '{}'", names[i], name))?;
+            }
+        }
+        check_call_aliasing(&slots, conventions, args, kwargs)?;
         Ok(self.resolve_assoc_ty(&substitute(ret, &subst)))
     }
 

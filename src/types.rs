@@ -44,7 +44,13 @@ pub enum Ty {
     GenericFunc {
         decls: Vec<ParamDecl>,
         params: Vec<Ty>,
+        names: Vec<String>,
         ret: Box<Ty>,
+        required: Vec<bool>,
+        variadic: Option<Box<Ty>>,
+        positional_only: Option<usize>,
+        keyword_only: Option<usize>,
+        conventions: Vec<Option<ArgConvention>>,
     },
     /// A source name that denotes multiple callable signatures. The checker
     /// resolves an overload set at each call site. The first implementation

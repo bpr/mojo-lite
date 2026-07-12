@@ -318,6 +318,18 @@ fn method_mut_ref_param_writeback_parity() {
 }
 
 #[test]
+fn method_argument_binding_matches_free_functions() {
+    let src = "@fieldwise_init\nstruct Acc:\n    var total: Int\n    def add(mut self, x: Int, /, y: Int = 2, *rest: Int, scale: Int = 1) -> Int:\n        var amount: Int = x + y\n        for value in rest:\n            amount = amount + value\n        self.total = self.total + amount * scale\n        return self.total\n    def bump_arg(self, mut value: Int, delta: Int = 1):\n        value = value + delta\n\ndef main():\n    var acc: Acc = Acc(0)\n    print(acc.add(3, y=4, scale=2))\n    print(acc.add(1, 5, 6, 7, scale=3))\n    var n: Int = 10\n    acc.bump_arg(n, delta=4)\n    print(n)\n";
+    assert_eq!(parity(src), "14\n71\n14\n");
+}
+
+#[test]
+fn generic_argument_binding_matches_free_functions() {
+    let src = "def collect[T: AnyType](head: T, /, extra: Int = 2, *rest: Int, scale: Int = 1) -> Int:\n    return (extra + len(rest)) * scale\n\ndef replace[T: Copyable & Movable](mut value: T, replacement: T):\n    value = replacement\n\ndef main():\n    print(collect(\"x\", extra=3, scale=4))\n    print(collect(1, 2, 8, 9, scale=3))\n    var n: Int = 5\n    replace(n, replacement=9)\n    print(n)\n";
+    assert_eq!(parity(src), "12\n12\n9\n");
+}
+
+#[test]
 fn try_except_else_finally() {
     // Full structured exceptions run on the VM identically to the tree-walker: a
     // caught raise, the `else` on normal completion, and `finally` on every path.

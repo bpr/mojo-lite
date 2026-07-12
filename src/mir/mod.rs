@@ -210,6 +210,7 @@ pub enum MirInstr {
         method: String,
         resolved: Option<String>,
         args: Vec<Reg>,
+        kwargs: Vec<(String, Reg)>,
         recv_place: Option<MirPlace>,
         /// Like `Call::arg_places`: `arg_places[i]` is `Some` when ordinary
         /// argument `i` is a simple place, so a method's `mut`/`ref` ordinary
@@ -833,6 +834,10 @@ impl Flatten<'_> {
                     None => (self.expr(object), None),
                 };
                 let regs = self.args(args);
+                let kw: Vec<(String, Reg)> = kwargs
+                    .iter()
+                    .map(|arg| (arg.name.clone(), self.expr(&arg.value)))
+                    .collect();
                 // Capture each ordinary argument's place (if simple) for `mut`/`ref`
                 // ordinary-parameter write-back, mirroring a free-function `Call`.
                 let arg_places: Vec<Option<MirPlace>> =
@@ -844,6 +849,7 @@ impl Flatten<'_> {
                     method: method.clone(),
                     resolved: self.overload_targets.get(&span(e)).cloned(),
                     args: regs,
+                    kwargs: kw,
                     recv_place,
                     arg_places,
                 });
@@ -946,7 +952,7 @@ impl Flatten<'_> {
             // program never reaches MIR lowering with them. A bare `TypeApply` is a
             // type used as a value (only valid as a static-method receiver, handled
             // in the `MethodCall` arm above).
-            ExprKind::TypeApply { .. } | ExprKind::TString { .. } => {
+            ExprKind::TypeValue(_) | ExprKind::TypeApply { .. } | ExprKind::TString { .. } => {
                 unreachable!("parse-only expression rejected by the checker before MIR: {e:?}")
             }
         }
@@ -2133,6 +2139,34 @@ pub fn lower_program(program: &[Stmt]) -> MirProgram {
                         &m.params,
                         &overloads,
                     );
+                    let variadic_idx = m
+                        .params
+                        .iter()
+                        .position(|param| param.kind == ParamKind::Variadic);
+                    let regular: Vec<_> = m
+                        .params
+                        .iter()
+                        .filter(|param| param.kind == ParamKind::Regular)
+                        .collect();
+                    declarations.functions.push(MirFunctionDeclaration {
+                        lowered_name: mangled.clone(),
+                        param_names: regular.iter().map(|param| param.name.clone()).collect(),
+                        param_types: regular.iter().map(|param| param.ty.clone()).collect(),
+                        defaults: regular.iter().map(|param| param.default.clone()).collect(),
+                        required: regular
+                            .iter()
+                            .map(|param| param.default.is_none())
+                            .collect(),
+                        variadic: variadic_idx.map(|index| m.params[index].ty.clone()),
+                        variadic_index: regular_marker_index(&m.params, variadic_idx),
+                        positional_only: regular_marker_index(&m.params, m.positional_only),
+                        keyword_only: effective_keyword_only_index(
+                            &m.params,
+                            m.keyword_only,
+                            variadic_idx,
+                        ),
+                        param_decls: Vec::new(),
+                    });
                     // A method's receiver `self` is the implicit first parameter,
                     // followed by the declared params.
                     let mut names: Vec<String> = Vec::new();

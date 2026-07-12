@@ -590,6 +590,10 @@ pub enum ExprKind {
     Str(String),
     None,
     Identifier(String),
+    /// A type used as a compile-time value, such as a function/closure signature.
+    /// Parsed for source compatibility; semantic treatment as a first-class
+    /// compile-time value is deferred.
+    TypeValue(Type),
     /// A unary operator applied to an operand, e.g. `-x` or `not ok`.
     Prefix(PrefixOp, Box<Expr>),
     /// A binary operator applied to two operands, e.g. `a + b`.

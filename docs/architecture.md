@@ -1018,6 +1018,8 @@ fallback for compiler-generated calls, not the general overload-ranking engine.
 Method calls are normal function calls with a receiver convention:
 
 - `self` is parameter slot 0
+- ordinary arguments use the same positional/keyword/default/variadic slot
+  matcher as free functions before `self` is prepended
 - `mut self` writes the final receiver back to the caller place
 - ordinary `mut`/`ref` method parameters also write back
 - list mutators operate through the receiver place

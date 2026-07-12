@@ -516,12 +516,16 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         }
         self.expect(Token::Import, "Expected 'import' after the module name")?;
 
+        let parenthesized = matches!(self.peek_token()?, Some(Token::LParen));
+        if parenthesized {
+            self.next_token()?;
+        }
         let names = if matches!(self.peek_token()?, Some(Token::Star)) {
             self.next_token()?; // consume '*'
             crate::ast::ImportNames::Wildcard
         } else {
             let mut targets = Vec::new();
-            loop {
+            while !parenthesized || !matches!(self.peek_token()?, Some(Token::RParen)) {
                 let name = self.expect_identifier("Expected an imported name")?;
                 let alias = self.parse_import_alias()?;
                 targets.push(crate::ast::ImportName { name, alias });
@@ -533,6 +537,9 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
             }
             crate::ast::ImportNames::Names(targets)
         };
+        if parenthesized {
+            self.expect(Token::RParen, "Expected ')' after imported names")?;
+        }
         self.expect_stmt_end()?;
         Ok(StmtKind::FromImport { level, path, names })
     }
@@ -1311,6 +1318,12 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
     /// `'(' [type (',' type)*] ')' effects '->' type`. Effects between `)` and
     /// `->` are `thin`, `raises`, and `abi(...)` (the last parsed and discarded).
     fn parse_function_type_tail(&mut self) -> Result<Type, ParseError> {
+        // Function signatures may themselves be parameterized, e.g.
+        // `def[width: Int](Int) capturing[_] -> None`. Their compile-time
+        // parameter declarations do not yet affect the syntax-only `Type` AST.
+        if matches!(self.peek_token()?, Some(Token::LBracket)) {
+            self.parse_type_params()?;
+        }
         self.expect(Token::LParen, "Expected '(' in a function type")?;
         let mut params = Vec::new();
         if !matches!(self.peek_token()?, Some(Token::RParen)) {
@@ -1346,6 +1359,14 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
                         self.next_token()?;
                     }
                     self.expect(Token::RParen, "Expected ')' to close 'abi(...)'")?;
+                }
+                Some(Token::Identifier(id)) if id == "capturing" => {
+                    self.next_token()?;
+                    self.expect(Token::LBracket, "Expected '[' after 'capturing'")?;
+                    while !matches!(self.peek_token()?, Some(Token::RBracket) | None) {
+                        self.next_token()?;
+                    }
+                    self.expect(Token::RBracket, "Expected ']' after capturing origins")?;
                 }
                 _ => break,
             }
@@ -1534,6 +1555,10 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
             Token::TString { chunks, raw } => self.build_tstring(chunks, raw, start),
             Token::None => Ok(self.node(ExprKind::None, start)),
             Token::Identifier(id) => Ok(self.node(ExprKind::Identifier(id), start)),
+            Token::Def => {
+                let ty = self.parse_function_type_tail()?;
+                Ok(self.node(ExprKind::TypeValue(ty), start))
+            }
             Token::Minus => {
                 let operand = self.parse_expression(Precedence::Unary)?;
                 Ok(self.node(ExprKind::Prefix(PrefixOp::Neg, Box::new(operand)), start))

@@ -53,11 +53,12 @@ or user program needs them.
   findings are retained in `overload_errors.md`.
 - [ ] **CLI module search paths** — expose the existing `LinkOptions` search-root
   support through a `--module-path` or `--stdlib` command-line option.
-- [ ] **Method argument binding parity** — give ordinary method calls the same
+- [x] **Method argument binding parity** — ordinary method calls use the same
   keyword, default, positional-only, keyword-only, and variadic binding rules as
-  free functions.
-- [ ] **Generic call binding parity** — route generic function calls through the
-  same marker-aware argument matcher as non-generic calls.
+  free functions while preserving receiver and ordinary-parameter write-back.
+- [x] **Generic call binding parity** — generic free functions use the same
+  default, keyword, positional-only, keyword-only, variadic, convention, and
+  alias-aware argument binding as non-generic functions.
 
 ### 2. Strengthen Self-Hosted Collections
 

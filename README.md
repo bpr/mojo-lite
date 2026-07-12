@@ -1,19 +1,20 @@
 # mojito
 
-mojito is a small Rust implementation of a strict, experimental subset of
-[Mojo](https://www.modular.com/mojo). It is not Mojo, and it is not trying to
+mojito is a small Rust implementation of a subset of [Mojo](https://www.modular.com/mojo). It is not Mojo, and it is not trying to
 compete with Mojo's production compiler. It is a compact compiler playground for
-studying the shape of a modern systems programming language: Python-like syntax,
-value semantics, ownership transfer, borrowing, ASAP destruction, generics, and a
-register-VM execution model.
+studying the shape of a modern systems programming language compiler. Mojo was chosen because it is a rich language, with value semantics, ownership/borrowing, ASAP destruction, generics, overloading, and compile time execution. It has interesting features associated with C++, Rust, and Zig. It has a Pythonic syntax which is still undergoing development, so I can test the idea that "parser generators are invaluable when a language's syntax is rapidly evolving", which I think is wrong, even more so in the era of AI code generators.
 
-Formerly named `mojo-lite`; the rename is only a project-name change, not a
-change in language goals.
+## Why not mojito?
+- mojito does not generate optimized code yet
+- mojito is not currently targeting GPUs or MLIR
+- This list could grow very long, but really, 
+  this is the kind of thing you like, then you'll like this kind of thing.
 
-Think of it as a tiny cousin of Rust, C++, and of course, Mojo, striving for at
-least syntactic compatibility with Mojo. High performance is not a current goal.
-The current goal is making ownership, moves, destructors, borrowing, and
-control-flow lowering visible in a codebase small enough to hold in your head.
+## Project goals
+- Parse all of current Mojo and report syntax
+  errors
+- Support a subset of Mojo semantics. All mojito 
+  programs should be runnable by Mojo, though many Mojo programs will exceed what mojito can do
 
 ## Status
 

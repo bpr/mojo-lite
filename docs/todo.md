@@ -14,19 +14,6 @@ Expose `LinkOptions.search_roots` through the CLI. Decide between repeatable
 `--module-path PATH`, a dedicated `--stdlib PATH`, or both. Cover precedence
 between the importing directory, user roots, and the bundled stdlib.
 
-### Method argument binding parity
-
-Route ordinary method calls through the same slot matcher used by free
-functions. Support defaults, keyword arguments, positional-only and keyword-only
-markers, required keyword-only parameters, and homogeneous `*args`. Preserve
-`mut self` and `mut`/`ref` argument write-back behavior.
-
-### Generic call binding parity
-
-Use the ordinary marker-aware matcher for generic free-function calls after
-compile-time type/value arguments are resolved. Add parity tests for defaults,
-keywords, and variadic arguments.
-
 ## Self-Hosted Collections
 
 ### Nested self-hosted lists

@@ -501,10 +501,10 @@ arg: NAME '=' expression | expression   # `name=value` is a keyword argument
 ```
 
 Keyword arguments (`f(x=1, y=2)`; a positional argument may not follow a keyword one)
-are **implemented** for free-function calls — matched to parameters by name, mixed
-with positional args and defaults. Keyword args to a method, built-in, struct
-construction, or generic function are still deferred. List literals use only
-positional elements.
+are **implemented** for free-function and ordinary user-method calls — matched to
+parameters by name, mixed with positional args, defaults, and homogeneous
+`*args`. Keyword args to builtins, general struct construction, and generic
+functions are still deferred. List literals use only positional elements.
 
 Notes:
 
