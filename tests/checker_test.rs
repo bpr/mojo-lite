@@ -1942,6 +1942,38 @@ fn structs_are_non_copyable_by_default() {
 }
 
 #[test]
+fn trait_bound_diagnostics_name_the_blocking_field_or_operation() {
+    let marker = err(
+        "@fieldwise_init\nstruct Item:\n    var value: Int\n\n@fieldwise_init\nstruct Box(ImplicitlyCopyable):\n    var item: Item\n",
+    );
+    assert!(
+        marker.to_string().contains("field 'item'")
+            && marker.to_string().contains("not ImplicitlyCopyable"),
+        "got {marker}"
+    );
+
+    let hashable = err(
+        "@fieldwise_init\nstruct Item:\n    var value: Int\n\ndef use[K: Hashable](key: K):\n    pass\n\ndef main():\n    var item: Item = Item(1)\n    use(item)\n",
+    );
+    assert!(
+        hashable
+            .to_string()
+            .contains("missing required operation '__hash__() -> UInt'"),
+        "got {hashable}"
+    );
+
+    let numeric = err(
+        "def magnitude[T: Absable](value: T) -> T:\n    return abs(value)\n\ndef main():\n    print(magnitude(\"nope\"))\n",
+    );
+    assert!(
+        numeric
+            .to_string()
+            .contains("missing required operation '__abs__() -> Self'"),
+        "got {numeric}"
+    );
+}
+
+#[test]
 fn owned_arg_consumes_but_read_and_mut_borrow() {
     let common = "@fieldwise_init\nstruct T:\n    var x: Int\n\n";
     // `owned` consumes → copying a non-Copyable value into it is rejected.

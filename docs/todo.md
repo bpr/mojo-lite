@@ -1,371 +1,293 @@
 # Todo
 
-This is a living list of work that is too concrete to bury in the architecture
-document, but still broader than a single test failure.
+This file contains only unfinished, concrete work. Phase order and completed
+milestones belong in `roadmap.md`; architectural invariants belong in
+`docs/architecture.md`.
 
-## Stabilization Checkpoint
+Tasks are grouped in the same approximate dependency order as the roadmap.
 
-Status: highest priority.
+## Correctness and Interface Gaps
 
-Yes: this is a good time to stop and pay down tech debt before the next language
-feature wave. The compiler has just absorbed several foundational changes:
-signature-aware function/method overloading, hashable/hash-backed collection
-proofs, numeric operation traits, self-hosted math helpers, and lifecycle marker
-traits with observable copy/move/drop behavior. More self-hosting will now put
-pressure on exactly the parts of the compiler that have become a little dense.
+### CLI module search paths
 
-The mechanical portion of the checkpoint is complete; the remaining items are
-bounded design cleanup:
+Expose `LinkOptions.search_roots` through the CLI. Decide between repeatable
+`--module-path PATH`, a dedicated `--stdlib PATH`, or both. Cover precedence
+between the importing directory, user roots, and the bundled stdlib.
 
-- Status: implemented.
-  `cargo clippy --all-targets -- -D warnings` is clean. The mechanical findings
-  were fixed, oversized checker tuples were replaced with named records, and
-  coherent argument groups replaced every `too_many_arguments` allowance.
+### Method argument binding parity
 
-- Status: implemented.
-  `scripts/check` is the normal local gate: `cargo fmt --check`, `cargo test`,
-  then strict Clippy.
+Route ordinary method calls through the same slot matcher used by free
+functions. Support defaults, keyword arguments, positional-only and keyword-only
+markers, required keyword-only parameters, and homogeneous `*args`. Preserve
+`mut self` and `mut`/`ref` argument write-back behavior.
 
-- Status: implemented initial pass; continue when a shape becomes unclear.
-  The method-overload candidate tuple is now `MethodCallResolution`, struct
-  checking uses `StructDeclaration`, and lowering/VM call contexts use named
-  records. Do not manufacture wrappers mechanically, but replace any remaining
-  positional data shape when its fields carry distinct meanings.
+### Generic call binding parity
 
-- Status: implemented.
-  Consolidate overload signature and lowered-name construction. `src/symbol.rs`
-  now owns signature identity (`SignatureKey`/`TypeKey`) and every `$ov$`
-  spelling; checker, MIR, and VM all route through it (see **Overloading**).
-
-- Status: pending.
-  Keep moving runtime/MIR metadata toward checked declarations rather than
-  rebuilding meaning from AST-shaped side tables in the VM.
-
-- Status: pending.
-  Improve trait and marker-trait diagnostics. A failed `Copyable`,
-  `ImplicitlyCopyable`, `Hashable`, or numeric-operation bound should explain the
-  missing operation or field that caused the failure where possible.
-
-- Status: pending.
-  Review untracked planning scratch files before the next commit and either
-  commit them intentionally or remove them intentionally.
-
-## Module System And Stdlib Layout
-
-Status: implemented foundation; compatibility cleanup remains.
-
-The current module linker is useful but too path-shaped. It supports
-`from module import Name` and relative imports, then hoists declarations into one
-flat program. That was enough to get self-hosted `stdlib/` files working, but it
-is not the organization mojito wants long-term.
-
-The next direction should follow Mojo's file organization more closely:
-
-```text
-stdlib/
-  std/
-    collections/
-      list.mojo
-      set.mojo
-      dict.mojo
-    optional.mojo
-```
-
-Then user code and fixtures should be able to write imports like:
-
-```mojo
-from std.collections.dict import Dict
-from std.collections.list import List
-from std.optional import Optional
-```
-
-They should not need repository-relative imports such as:
-
-```mojo
-from ...stdlib.dict import Dict
-```
-
-That syntax is a symptom that the linker has no standard-library search root.
-
-### Tasks
-
-- Status: implemented.
-  Add a module search path concept to `src/module.rs`.
-
-- Status: implemented.
-  Make the default search roots include the directory of the importing file and
-  the repository/compiler stdlib root.
-
-- Status: implemented.
-  Move or mirror the current self-hosted library into a Mojo-like layout under
-  `stdlib/std/`.
-
-- Status: implemented.
-  Update self-hosted fixtures to import through `std...` paths instead of
-  relative-dot paths.
-
-- Status: decided for now.
-  Decide whether old imports such as `from list import List` remain supported as
-  compatibility shims or disappear once the stdlib layout moves. Keep the flat
-  files for now as compatibility mirrors; prefer `std...` imports in docs and
-  new fixtures.
-
-- Status: implemented foundation.
-  Add module tests for stdlib-root lookup, dotted paths, transitive imports, and
-  missing imported names.
-
-- Status: pending.
-  Add a CLI/module-path option if users need a custom stdlib or project-wide
-  import path outside tests.
-
-### Likely Implementation Shape
-
-`src/module.rs` currently resolves a module by starting from the importing file's
-directory:
-
-```rust
-fn module_file(from_dir: &Path, level: usize, path: &[String])
-```
-
-That function probably needs to become a resolver that can try multiple roots:
-
-```text
-relative import with dots:
-  resolve from the importing file's directory
-
-absolute import:
-  try importing file's directory
-  then try configured stdlib roots
-```
-
-The public API now stays small:
-
-```rust
-pub fn link(entry_path: &Path) -> Result<Vec<Stmt>, ModuleError>
-pub fn link_with_options(entry_path: &Path, options: LinkOptions) -> Result<Vec<Stmt>, ModuleError>
-pub fn link_source_with_options(...)
-
-pub struct LinkOptions {
-    pub search_roots: Vec<PathBuf>,
-}
-```
-
-`link(entry_path)` can construct default options:
-
-- the entry file's directory, so local examples keep working
-- `CARGO_MANIFEST_DIR/stdlib`, so `from std.collections.dict import Dict` works
-  in tests and the CLI when run from this repo
-
-Longer term, the CLI may also want a `--stdlib` or `--module-path` option.
-
-### Acceptance Sketch
-
-Create a fixture like:
-
-```mojo
-from std.collections.dict import Dict
-
-def main():
-    var d: Dict[String, Int] = Dict[String, Int]()
-    d["a"] = 1
-    print(d["a"])
-```
-
-The asset harness should run this through the linker and pass without any
-leading dots.
-
-## Asset Harness Uses Linking
-
-Status: implemented.
-
-The file-based asset harness should run fixtures through `mojito::link(path)`
-instead of parse-only `parse(source)`. Otherwise imports parse successfully but
-remain no-ops, and imported names fail later as undefined variables.
-
-Keep this behavior. It lets `assets/ok/*.mojo` files exercise modules the same
-way CLI file execution does.
-
-## Function Argument Semantics
-
-Status: partially implemented.
-
-Ordinary free functions now support Mojo-style `/`, bare `*`, homogeneous
-`*args`, keyword calls, default values, required keyword-only arguments, and
-regular parameters after `*args`.
-
-- Status: implemented.
-  Enforce positional-only arguments before `/`.
-
-- Status: implemented.
-  Enforce keyword-only arguments after bare `*`.
-
-- Status: implemented.
-  Treat regular parameters after `*args` as keyword-only and bind the collected
-  variadic list into the correct VM frame slot.
-
-- Status: deferred.
-  Implement `**kwargs`. This likely needs a real keyword-dictionary value shape
-  rather than another ad hoc call-binding branch.
-
-- Status: deferred.
-  Extend keyword/default argument binding to ordinary method calls. Today methods
-  still mostly use positional binding, apart from special constructor/copy paths.
-
-- Status: deferred.
-  Extend generic function calls to use the same keyword/default marker-aware
-  binding as non-generic functions. The current generic call path remains
-  positional-only.
+Use the ordinary marker-aware matcher for generic free-function calls after
+compile-time type/value arguments are resolved. Add parity tests for defaults,
+keywords, and variadic arguments.
 
 ## Self-Hosted Collections
 
-Status: active.
+### Nested self-hosted lists
 
-The current self-hosted proofs are:
+Make `std.collections.list.List[List[T]]` work as the bucket-array representation
+inside `std.collections.hashset`. Remove the remaining reliance on the built-in
+`List` behavior from that path and retain collision tests for `Int` and `String`.
 
-- `Optional`
-- `List`
-- `Set`
-- list-backed `Dict`
-- experimental hash-backed `HashSet`
-- hashing helpers
+### Dictionary views
 
-Next useful work:
+Design key, value, and item views without exposing `_DictEntry` as public API.
+Wait until the `Indexer` and iterator associated-result design can state each
+view's element type cleanly.
 
-- Status: pending.
-  Expand `Dict` tests for string values, overwrites, missing keys, value
-  semantics, and iteration over entries.
+### Hash-backed dictionary
 
-- Status: pending.
-  Decide whether `DictEntry` is public API or hidden behind future key/value/item
-  views.
+Add a separate hash-backed dictionary after nested self-hosted lists are stable.
+Use the list-backed `Dict` as the behavior oracle for insertion, overwrite,
+missing keys, iteration, copying, and value semantics. Keep collision resolution
+and resizing explicit in tests.
 
-- Status: pending.
-  Keep the list-backed `Dict` as a reference implementation even if a
-  hash-backed collection appears later.
+### Keyword-map value
 
-- Status: pending.
-  Add a hash-backed `Dict` only after the stabilization checkpoint. Use the
-  existing list-backed `Dict` as the behavior oracle and keep collision
-  resolution explicit and testable.
+Determine whether the self-hosted dictionary is a suitable runtime value for
+`**kwargs`, including key ownership, argument ordering, duplicate detection, and
+write-back restrictions. Implement `**kwargs` only after this representation is
+settled.
 
-- Status: pending.
-  Make nested self-hosted `List[List[T]]` behave well enough that
-  `std.collections.hashset` can import `std.collections.list` explicitly instead
-  of leaning on the built-in `List` runtime behavior for its bucket array.
+## Checked Semantic Data
 
-## Comptime Stress Tests
+### Checked program representation
 
-Status: active, demand-driven.
+Define a checked program/declaration representation that owns resolved symbols,
+types, conformances, callable signatures, defaults, and source provenance.
+Change the checker to produce it without weakening existing sequential name
+binding or overload resolution.
 
-Direct comptime facts, associated comptime members, and VM-backed CTFE are now
-real enough for self-hosted library code to use. The next comptime work should be
-pulled by self-hosted code, not guessed in isolation.
+### Typed MIR declarations
 
-- Status: implemented.
-  Add a small self-hosted algorithm module that uses direct comptime facts:
-  `is_same_type`, value-parameter constants, associated `comptime` members, and
-  VM-backed CTFE.
+Build `MirDeclarations` from checked declarations. Replace remaining AST `Type`
+and default `Expr` values with checked types and normalized constant/default
+metadata so MIR and backends do not reinterpret source syntax.
 
-- Status: blocked until demanded.
-  Implement deeper nested generic CTFE helper specialization when real stdlib
-  code needs `outer[T]()` calling `inner[T]()` where `inner` reads `T` facts.
+### Module identity preservation
 
-## Traits
+Identify the smallest provenance needed after the linker flattens modules. Add
+module identity to checked declarations only when a concrete consumer—improved
+diagnostics, caching, or interchange—needs it.
 
-Status: active, demand-driven.
+## Origins, References, and Lifetimes
 
-Trait names are recognized more broadly than they are semantically implemented.
-Do not flesh them out all at once.
+Mojo origins are compile-time symbolic descriptions of the storage that governs
+a reference and of the mutability available through it. They are used to extend
+owner lifetimes, enforce exclusivity, and reject references that outlive their
+owners. They have no runtime identity and are erased after lifetime checking.
 
-- Status: implemented foundation.
-  Make `Iterable` / `Iterator` useful with associated `Element` facts in generic
-  self-hosted algorithms.
+Mojito now parses the principal surface forms, but origin clauses are discarded
+and reference bindings/types are deliberately rejected by the checker. Existing
+infrastructure provides only part of the semantic foundation:
 
-- Status: implemented.
-  Make `Comparable` enable ordering on opaque type parameters, with a negative
-  test proving `Equatable` alone is not enough.
+- MIR places already identify rooted field/index projections.
+- Call checking already rejects overlapping mutable/shared argument places and
+  permits statically disjoint fields.
+- MIR use modes distinguish copy, move, shared borrow, and mutable borrow.
+- Ownership analysis already tracks moves through CFG joins and loops.
+- Liveness and drop elaboration already insert ASAP destruction and edge cleanup.
+- `mut` and `ref` parameters currently use value cloning plus post-call
+  write-back, not persistent reference identity.
 
-- Status: implemented.
-  Make `Sized` enable `len(x)` on opaque type parameters.
+The last point is the largest architectural gap. A reference binding or ref
+return can remain live beyond one call and must continue to alias its owner's
+storage. That cannot be modeled faithfully by copying a value into a callee
+frame and writing it back once when the call returns.
 
-- Status: implemented for `Hashable`; `Hasher` deferred.
-  `Hashable` permits `__hash__() -> UInt` on bounded opaque values and built-in
-  scalar values. It intentionally does not imply `Equatable`. `Hasher` remains a
-  future incremental-hashing protocol.
+### Origin representation
 
-- Status: implemented.
-  Numeric operation traits gate generic use of `abs`, `round`, `**`,
-  conversions, `Bool`, `divmod`, and self-hosted math helpers.
+Replace discarded origin syntax with typed source data:
 
-- Status: implemented for lifecycle markers.
-  `Copyable`, `ImplicitlyCopyable`, `ImplicitlyDeletable`, and `Movable` are no
-  longer just accepted names; they line up with the current ownership model.
-  `RegisterPassable` and `TrivialRegisterPassable` remain deferred backend/layout
-  markers.
+- origin expressions for named origins, `origin_of(place)`, arbitrary
+  `origin_of` expressions, `_`, and unions
+- origin parameters with immutable, mutable, or parameterized mutability
+- the `//` infer-only boundary in generic parameter declarations
+- origin-bearing `ref` parameter and return types
+- source spans for origin diagnostics
 
-- Status: deferred until demanded.
-  Implement general trait default methods. `Hashable` currently works through an
-  intrinsic plus explicit `__hash__`; inherited default bodies should wait until
-  a library protocol actually needs them.
+Define a small canonical checked algebra rather than retaining arbitrary AST
+expressions indefinitely. At minimum it needs owner declarations, field
+derivation, union, inferred/unbound origins, static/untracked origins needed by
+supported APIs, and mutability.
 
-## Overloading
+### Reference type and binding semantics
 
-Status: implemented foundation; symbol cleanup complete.
+Add a checked reference type containing the referent type, origin, and
+mutability. Type `ref name = expression` as an alias rather than an owned
+binding. Require a place-producing expression for safe tracked references, while
+keeping any future unsafe/untracked form explicit.
 
-Function, method, and constructor calls now resolve fixed-arity overloads and
-conservative same-arity type-directed overloads. The checker records the
-resolved callee, and MIR/VM lowering uses signature-qualified names.
+Define how reference reads, writes, assignment, copying of reference handles,
+and end-of-reference lifetime interact with existing place and ownership rules.
+Do not represent references as ordinary copied `Value`s.
 
-- Status: implemented.
-  Centralize signature keys and lowered-name formatting.
+### Origin inference and call substitution
 
-  `src/symbol.rs` is now the canonical owner of overload identity and symbol
-  formatting: an overload signature is typed data (`SignatureKey`, a list of
-  `TypeKey`s) built from either the declared `ast::Type` (MIR/VM definition
-  side) or the checker-resolved `Ty` (call-resolution side), and only the
-  module formats the `$ov$` spelling. It also owns the overload-set scan
-  (`OverloadSets`), lowered def/method names, the lifecycle `__copyinit__`
-  rename, nested lifted names, and the VM's symbol predicates
-  (`is_overload_of`, `init_overload_struct`).
+For each call:
 
-  Consolidating the two manglings fixed a real drift: the checker used to spell
-  a struct parameter `Struct$Point` (and a type parameter `Param$T` /
-  `SelfParam$T`) where MIR named the definition `Point`/`T`, so a recorded
-  callee like `pick$ov$Struct$Point` named no MIR function and struct-typed
-  overloads failed at runtime. Both sides now spell types from the annotation
-  (`pick$ov$Point`); `assets/ok/overloading_struct_params.mojo` covers it
-  end-to-end, and `tests/symbol_test.rs` pins the spellings, asserts every
-  checker-recorded callee names an emitted MIR function, and scans `src/` so a
-  hand-built `$ov$` string outside the module fails the suite.
+- derive an actual origin from each argument place
+- infer omitted origin and mutability parameters
+- substitute actual origins into result/reference types
+- derive field origins from projected places
+- normalize unions by flattening and deduplicating members
+- make a union mutable only when every member permits mutation
+- retain the existing read/read versus read/write exclusivity rule using
+  normalized origin overlap rather than only call syntax
 
-  The VM's arity-based `overload_name` fallback remains only for
-  VM-synthesized dispatch with no checked call span (operator/`__str__`/
-  `__hash__` dunders, `__setitem__`, the `for`-loop `__next__` protocol,
-  `__init__` reached without a recorded target); its callers are documented on
-  the method. Definition-side value arguments now fold the same supported
-  comptime integer expressions and constants as the checker, so
-  `FixedBuffer[N]`, `FixedBuffer[2 + 6]`, and resolved `FixedBuffer[8]` share a
-  symbol. Source-controlled identifier text is escaped injectively, preventing
-  stropped type names such as `A-B` and `A_B` from collapsing to one overload.
+The first implementation can omit wildcard and complex unsafe origins. Static
+and untracked origins should be added only when a supported pointer or literal
+API needs them.
 
-- Status: pending.
-  Add more negative tests for duplicate-equivalent overloads and ambiguous
-  coercion paths.
+### Lifetime extension analysis
 
-- Status: deferred until demanded.
-  Extend overload ranking beyond the current conservative exact/coercion model.
+Extend MIR ownership/liveness dataflow with reference dependencies:
 
-## Documentation
+- a live reference keeps every owner in its normalized origin live
+- a union origin keeps all possible owners live
+- field origins overlap their parent but can remain disjoint from sibling fields
+- moving or destroying an owner while a reference is live is rejected
+- returning a reference to a local owner is rejected
+- branch joins merge possible origins conservatively
+- loops reach a fixed point when reference state crosses a back-edge
+- drop elaboration places owner destruction after the last dependent reference
 
-Status: ongoing.
+This analysis should consume checked origin facts carried into MIR. It should
+not reconstruct origins from source expressions or variable names.
 
-- Status: pending.
-  Update `docs/architecture.md` once module search roots and the stdlib layout
-  exist.
+### Reference-capable VM ABI
 
-- Status: implemented.
-  Update `stdlib/README.md` after the stdlib moves to `stdlib/std/...`.
+Design a runtime representation for references to variable slots and projected
+places. It must support:
 
-- Status: pending.
-  Keep `roadmap.md` focused on phase order and this file focused on concrete
-  backlog items.
+- mutation through a local reference binding
+- references to fields and indexed elements where stable identity is valid
+- passing references through multiple calls
+- returning a reference tied to caller-owned storage
+- parametric mutability
+- invalidation consistent with statically checked moves and drops
+
+The current frame-local `Vec<Value>` plus clone/write-back ABI does not provide
+stable cross-frame aliases. Likely options include stable heap-allocated cells,
+frame/slot handles with explicit caller relationships, or lowering verified
+references into an addressable storage layer. Choose this only after the checked
+origin model and lifetime analysis define exactly which aliases may survive.
+
+### Origin conformance suite
+
+Build the feature in vertical slices with positive and negative cases for:
+
+- inferred immutable and mutable `ref` arguments
+- an explicit named origin shared by an argument and return
+- `origin_of(self.field)` and disjoint sibling fields
+- a union return such as `-> ref[a, b] T`
+- `ref name = collection[index]` mutation
+- rejection of a returned reference to a local variable
+- rejection of owner move/drop while a reference remains live
+- owner destruction immediately after the final reference use
+- exclusivity conflicts after origin substitution
+
+### Work estimate and sequencing
+
+Syntax support is small and present. Full semantics are **large**: they touch the
+AST, generic parameter model, checked types, overload/call substitution, MIR,
+CFG dataflow, drop elaboration, runtime storage, and the call ABI. Implement in
+this order:
+
+1. checked origin and reference types
+2. local reference bindings to simple variable/field places
+3. lifetime extension and invalid-escape diagnostics
+4. inferred origins on `ref` arguments
+5. origin-bearing ref returns and call substitution
+6. union and field-sensitive origins
+7. reference-capable VM behavior beyond simple places
+8. unsafe/static/untracked origin forms only when demanded
+
+Do not start by reproducing Mojo's complete internal origin attribute algebra.
+The first useful stop point is a local or returned reference tied to a named
+caller-owned place, with correct mutation, exclusivity, and destruction timing.
+
+## Protocol Semantics
+
+### Opaque indexing protocol
+
+Define the associated index and result facts for `Indexer`. Teach the checker to
+type `value[index]` for an opaque bounded type and route execution through
+`__getitem__` without hardcoded container knowledge.
+
+### Trait default methods
+
+When a stdlib protocol requires one, preserve and type-check trait default
+bodies in a `Self` context. Define override and multiple-default ambiguity rules,
+then lower inherited bodies as ordinary checked methods visible to MIR and VM
+metadata.
+
+### Incremental Hasher protocol
+
+Promote `Hasher` only for a concrete streaming or composite hashing use case.
+Keep it separate from the existing deterministic `Hashable.__hash__() -> UInt`
+contract.
+
+### Writer and representation research
+
+Verify current Mojo behavior for `Representable`, `Writable`, and `Writer` before
+encoding semantics. Use one self-hosted formatter or writer as the acceptance
+case and retain the existing pragmatic `print`/`__str__` path until then.
+
+### Backend layout markers
+
+Define `RegisterPassable` and `TrivialRegisterPassable` only alongside a backend
+or ABI rule that can observe the difference. Add layout and call-boundary tests
+with the implementation.
+
+## Compile-Time Specialization
+
+### Nested generic CTFE specialization
+
+When demanded by stdlib code, specialize transitive CTFE helper calls per
+compile-time argument tuple. The target case is `outer[T]()` calling `inner[T]()`
+where the inner helper reads `T` facts. Preserve the shared fuel budget and add
+recursion/cache tests.
+
+### Richer compile-time values
+
+Extend `CtValue` and VM materialization only for a concrete missing value shape.
+Keep compile-time-only values from leaking into runtime MIR unless they have an
+explicit materialization rule.
+
+## Overload Growth
+
+### Richer overload ranking
+
+After rejection coverage is complete, collect real APIs that the current
+exact/coercion scoring cannot express. Specify the ranking rules before changing
+candidate selection and retain ambiguity as an error when no unique best match
+exists.
+
+### Generic overload ordering
+
+Design ordering between generic and non-generic candidates, constrained type
+parameters, and value-parameter specializations. Keep this independent from
+ordinary numeric coercion scoring.
+
+## Optional Experiments
+
+### NIF exporter spike
+
+Implement only the export-only experiment described in `docs/nif.md`: a small
+NIF tree writer and a provisional `mojito-mir-v0` schema covering declarations,
+functions, blocks, representative instructions, places, and terminators. Test
+overloads, partial moves/drop elaboration, and try/finally escape flow. Do not add
+an importer, BIF, indexes, or cache integration during the spike.
+
+### Alternative backend boundary
+
+Revisit an additional backend only after checked declarations and MIR are free
+of backend-side AST reconstruction. Use the register VM as the executable
+semantic oracle.

@@ -132,7 +132,7 @@ fn module_comptime_constants_materialize_into_functions() {
 
 #[test]
 fn ctfe_computed_value_parameter_argument() {
-    // Phase 1 regression (comptime.md): a CTFE-computed comptime constant flows
+    // Phase 1 regression (docs/notes/comptime.md): a CTFE-computed comptime constant flows
     // into a value-parameter argument through the shared compile-time value model —
     // `pow2(3)` runs at compile time to `8`, materializes into `scale[N]`, and the
     // checker resolves `scale`'s value parameter `n` from it.
@@ -142,7 +142,7 @@ fn ctfe_computed_value_parameter_argument() {
 
 #[test]
 fn generic_value_param_comptime_if_selects_per_instantiation() {
-    // Phase 6 (comptime.md): `comptime if` inside a generic value-parameter `def`
+    // Phase 6 (docs/notes/comptime.md): `comptime if` inside a generic value-parameter `def`
     // is resolved per call — `f[0]` takes the `if` branch, `f[1]` the `else`. This
     // needs monomorphization: the template is specialized after its argument known.
     let src = "def f[n: Int]() -> Int:\n    comptime if n == 0:\n        return 10\n    else:\n        return 20\n\ndef main():\n    print(f[0](), f[1]())\n";
@@ -180,7 +180,7 @@ fn generic_comptime_specialization_recurses_and_unrolls() {
 
 #[test]
 fn type_predicate_selects_comptime_branch() {
-    // Phase 7 (comptime.md): the built-in `is_same_type[T, U]()` type predicate lets
+    // Phase 7 (docs/notes/comptime.md): the built-in `is_same_type[T, U]()` type predicate lets
     // a `comptime if` branch on a type parameter — `name[Int]` takes the `int`
     // branch, `name[String]` the `other` branch (each a distinct specialization).
     let src = "def name[T: AnyType]() -> String:\n    comptime if is_same_type[T, Int]():\n        return \"int\"\n    else:\n        return \"other\"\n\ndef main():\n    print(name[Int]())\n    print(name[String]())\n";

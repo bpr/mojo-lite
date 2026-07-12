@@ -107,10 +107,50 @@ fn same_method_shape(a: &MethodSig, b: &MethodSig) -> bool {
 
 fn same_callable_signature(a: &Ty, b: &Ty) -> bool {
     match (a, b) {
-        (Ty::Func { params: ap, .. }, Ty::Func { params: bp, .. })
-        | (Ty::GenericFunc { params: ap, .. }, Ty::GenericFunc { params: bp, .. }) => ap == bp,
+        (Ty::Func { params: ap, .. }, Ty::Func { params: bp, .. }) => ap == bp,
+        (
+            Ty::GenericFunc {
+                decls: ad,
+                params: ap,
+                ..
+            },
+            Ty::GenericFunc {
+                decls: bd,
+                params: bp,
+                ..
+            },
+        ) => canonical_generic_signature(ad, ap) == canonical_generic_signature(bd, bp),
         _ => false,
     }
+}
+
+fn canonical_generic_signature(decls: &[ParamDecl], params: &[Ty]) -> (Vec<ParamDecl>, Vec<Ty>) {
+    let mut subst = HashMap::new();
+    let canonical_decls = decls
+        .iter()
+        .enumerate()
+        .map(|(index, decl)| match decl {
+            ParamDecl::Type { name, bounds } => {
+                let canonical_name = format!("${index}");
+                subst.insert(
+                    name.clone(),
+                    Ty::Param {
+                        name: canonical_name.clone(),
+                        bounds: bounds.clone(),
+                    },
+                );
+                ParamDecl::Type {
+                    name: canonical_name,
+                    bounds: bounds.clone(),
+                }
+            }
+            ParamDecl::Value { .. } => ParamDecl::Value {
+                name: format!("${index}"),
+            },
+        })
+        .collect();
+    let canonical_params = params.iter().map(|ty| substitute(ty, &subst)).collect();
+    (canonical_decls, canonical_params)
 }
 
 /// The lowered symbol the checker records as the resolved callee of an
@@ -175,19 +215,20 @@ fn select_callable_overload(
 fn select_method_overload(
     _method: &str,
     matches: Vec<MethodCallResolution>,
-) -> Option<MethodCallResolution> {
+) -> Result<MethodCallResolution, OverloadSelect> {
     let best = matches
         .iter()
         .map(|candidate| candidate.conversion_score)
-        .min()?;
+        .min()
+        .ok_or(OverloadSelect::NoMatch)?;
     let mut best_matches = matches
         .into_iter()
         .filter(|candidate| candidate.conversion_score == best)
         .collect::<Vec<_>>();
     if best_matches.len() == 1 {
-        Some(best_matches.remove(0))
+        Ok(best_matches.remove(0))
     } else {
-        None
+        Err(OverloadSelect::Ambiguous)
     }
 }
 
@@ -540,6 +581,7 @@ impl Checker {
                             param: name.clone(),
                             ty: ty.to_string(),
                             trait_name: bound.clone(),
+                            reason: self.trait_failure_reason(&ty, bound),
                         });
                     }
                 }
@@ -897,6 +939,9 @@ impl Checker {
         in_loop: bool,
     ) -> Result<(), TypeError> {
         match &stmt.kind {
+            StmtKind::RefDecl { .. } => Err(TypeError::Unsupported(
+                "reference binding and origin semantics".to_string(),
+            )),
             StmtKind::VarDecl { name, ty, value } => {
                 let found = self.infer(value)?;
                 self.check_consuming(value, &found, &format!("variable '{name}'"))?;
@@ -1099,6 +1144,9 @@ impl Checker {
                 raises: _,
                 decorators: _,
             } => {
+                if self.structs.contains_key(name) {
+                    return Err(TypeError::Redeclaration(name.clone()));
+                }
                 // Conventions / `**kwargs` are parsed but not all implemented;
                 // default values, `/`, bare `*`, and `*args` are supported on
                 // non-generic functions.
@@ -1271,15 +1319,20 @@ impl Checker {
                 methods,
                 fieldwise_init,
                 decorators: _,
-            } => self.check_struct(&StructDeclaration {
-                name,
-                type_params,
-                conforms,
-                fields,
-                associated,
-                methods,
-                fieldwise_init: *fieldwise_init,
-            }),
+            } => {
+                if self.lookup(name).is_some() {
+                    return Err(TypeError::Redeclaration(name.clone()));
+                }
+                self.check_struct(&StructDeclaration {
+                    name,
+                    type_params,
+                    conforms,
+                    fields,
+                    associated,
+                    methods,
+                    fieldwise_init: *fieldwise_init,
+                })
+            }
 
             StmtKind::Trait {
                 name,
@@ -1812,6 +1865,7 @@ impl Checker {
                 param: "Self".to_string(),
                 ty: self_ty.to_string(),
                 trait_name: tr.to_string(),
+                reason: self.trait_failure_reason(self_ty, tr),
             })
         }
     }
@@ -2125,6 +2179,10 @@ impl Checker {
                 }
                 return Ok(Ty::Struct(name.to_string(), tyargs));
             }
+            return Err(TypeError::BadCall {
+                func: name.to_string(),
+                reason: "no constructor overload matches the supplied arguments".to_string(),
+            });
         }
         if info.methods.contains_key("__init__") {
             return Err(TypeError::ArityMismatch {
@@ -2237,6 +2295,7 @@ impl Checker {
                                 param: pname.clone(),
                                 ty: solved.to_string(),
                                 trait_name: bound.clone(),
+                                reason: self.trait_failure_reason(solved, bound),
                             });
                         }
                     }
@@ -2278,6 +2337,44 @@ impl Checker {
                 .is_some_and(|info| info.conforms.iter().any(|t| t == tr)),
             Ty::Param { bounds, .. } => bounds.iter().any(|b| b == tr),
             _ => false,
+        }
+    }
+
+    /// Explain the first actionable reason a built-in bound failed. This is
+    /// intentionally evidence-oriented: marker traits name the field that
+    /// prevents fieldwise synthesis, while operation traits name the operation
+    /// promised by the bound.
+    fn trait_failure_reason(&self, ty: &Ty, tr: &str) -> Option<String> {
+        let Ty::Struct(name, _) = ty else {
+            return builtin_trait_operation(tr)
+                .map(|operation| format!("missing required operation '{operation}'"));
+        };
+        let info = self.structs.get(name)?;
+        let field_failure = |predicate: &dyn Fn(&Ty) -> bool| {
+            info.fields
+                .iter()
+                .find(|(_, field_ty)| !predicate(field_ty))
+                .map(|(field, field_ty)| {
+                    format!("field '{field}' has type '{field_ty}', which is not {tr}")
+                })
+        };
+        match tr {
+            "Copyable" => field_failure(&|field_ty| self.is_copyable(field_ty)),
+            "ImplicitlyCopyable" => {
+                if info.methods.contains_key("__copyinit__") {
+                    Some(
+                        "defines '__copyinit__'; implicit copying requires fieldwise synthesis"
+                            .to_string(),
+                    )
+                } else {
+                    field_failure(&|field_ty| self.is_implicitly_copyable(field_ty))
+                }
+            }
+            "ImplicitlyDeletable" => {
+                field_failure(&|field_ty| self.is_implicitly_deletable(field_ty))
+            }
+            _ => builtin_trait_operation(tr)
+                .map(|operation| format!("missing required operation '{operation}'")),
         }
     }
 
@@ -2415,9 +2512,13 @@ impl Checker {
         ty: Ty,
         mutable: bool,
     ) -> Result<(), TypeError> {
+        let nested_scope = self.scopes.len() > 1;
         let scope = self.scopes.last_mut().expect("scope stack is never empty");
         if let Some(existing) = scope.get_mut(name) {
             if let Some(mut candidates) = overload_candidates(existing, &ty) {
+                if nested_scope {
+                    return Err(TypeError::Unsupported("overloaded nested def".to_string()));
+                }
                 if candidates
                     .iter()
                     .any(|candidate| same_callable_signature(candidate, &ty))
@@ -2877,71 +2978,90 @@ impl Checker {
         // Resolve the method to a concrete signature (params + return + whether
         // it mutates `self`) for this receiver, substituting the receiver's type
         // arguments (struct) or `Self` (a bounded type parameter's trait method).
-        let resolved: Option<MethodCallResolution> = match &obj_ty {
+        let resolved: Result<Option<MethodCallResolution>, OverloadSelect> = match &obj_ty {
             Ty::Struct(sname, targs) => {
                 let info = self
                     .structs
                     .get(sname)
                     .expect("struct types are registered");
-                info.methods.get(method).and_then(|sigs| {
-                    let overloaded = sigs.len() > 1;
-                    let subst = struct_subst(&info.decls, targs);
-                    let mut matches = Vec::new();
-                    for sig in sigs {
-                        let params: Vec<Ty> =
-                            sig.params.iter().map(|t| substitute(t, &subst)).collect();
-                        if let Ok(score) = self.score_args(&params, args) {
-                            matches.push(MethodCallResolution {
-                                conversion_score: score,
-                                parameter_types: params,
-                                return_type: substitute(&sig.ret, &subst),
-                                mutates_receiver: matches!(
-                                    sig.self_convention,
-                                    Some(crate::ast::ArgConvention::Mut)
-                                ),
-                                lowered_name: overloaded
-                                    .then(|| method_lowered_name(sname, method, sig)),
-                            });
+                match info.methods.get(method) {
+                    Some(sigs) => {
+                        let overloaded = sigs.len() > 1;
+                        let subst = struct_subst(&info.decls, targs);
+                        let mut matches = Vec::new();
+                        for sig in sigs {
+                            let params: Vec<Ty> =
+                                sig.params.iter().map(|t| substitute(t, &subst)).collect();
+                            if let Ok(score) = self.score_args(&params, args) {
+                                matches.push(MethodCallResolution {
+                                    conversion_score: score,
+                                    parameter_types: params,
+                                    return_type: substitute(&sig.ret, &subst),
+                                    mutates_receiver: matches!(
+                                        sig.self_convention,
+                                        Some(crate::ast::ArgConvention::Mut)
+                                    ),
+                                    lowered_name: overloaded
+                                        .then(|| method_lowered_name(sname, method, sig)),
+                                });
+                            }
                         }
+                        select_method_overload(method, matches).map(Some)
                     }
-                    select_method_overload(method, matches)
-                })
+                    None => Ok(None),
+                }
             }
-            Ty::Param { bounds, .. } => {
-                self.lookup_trait_method(bounds, method, args.len())
-                    .map(|sig| MethodCallResolution {
-                        conversion_score: 0,
-                        parameter_types: sig
-                            .params
-                            .iter()
-                            .map(|t| substitute_self(t, &obj_ty))
-                            .collect(),
-                        return_type: substitute_self(&sig.ret, &obj_ty),
-                        mutates_receiver: matches!(
-                            sig.self_convention,
-                            Some(crate::ast::ArgConvention::Mut)
-                        ),
-                        lowered_name: None,
-                    })
-            }
+            Ty::Param { bounds, .. } => Ok(self
+                .lookup_trait_method(bounds, method, args.len())
+                .map(|sig| MethodCallResolution {
+                    conversion_score: 0,
+                    parameter_types: sig
+                        .params
+                        .iter()
+                        .map(|t| substitute_self(t, &obj_ty))
+                        .collect(),
+                    return_type: substitute_self(&sig.ret, &obj_ty),
+                    mutates_receiver: matches!(
+                        sig.self_convention,
+                        Some(crate::ast::ArgConvention::Mut)
+                    ),
+                    lowered_name: None,
+                })),
             // `x.__hash__()` on a concrete built-in hashable type (`Int`, `String`,
             // …) is an intrinsic returning `UInt` — lets a key struct combine
             // `self.field.__hash__()` values (Phase 6).
             _ if method == "__hash__" && args.is_empty() && builtin_hashable_ty(&obj_ty) => {
-                Some(MethodCallResolution {
+                Ok(Some(MethodCallResolution {
                     conversion_score: 0,
                     parameter_types: vec![],
                     return_type: Ty::UInt,
                     mutates_receiver: false,
                     lowered_name: None,
-                })
+                }))
             }
-            _ => None,
+            _ => Ok(None),
         };
-        let resolved = resolved.ok_or_else(|| TypeError::NoSuchMethod {
-            object_type: obj_ty.to_string(),
-            method: method.to_string(),
-        })?;
+        let resolved = match resolved {
+            Ok(Some(resolved)) => resolved,
+            Ok(None) => {
+                return Err(TypeError::NoSuchMethod {
+                    object_type: obj_ty.to_string(),
+                    method: method.to_string(),
+                });
+            }
+            Err(OverloadSelect::NoMatch) => {
+                return Err(TypeError::BadCall {
+                    func: method.to_string(),
+                    reason: "no overload matches the supplied arguments".to_string(),
+                });
+            }
+            Err(OverloadSelect::Ambiguous) => {
+                return Err(TypeError::BadCall {
+                    func: method.to_string(),
+                    reason: "ambiguous overloaded method call".to_string(),
+                });
+            }
+        };
         if let Some(target) = resolved.lowered_name {
             self.overload_targets.borrow_mut().insert(span, target);
         }
@@ -3742,7 +3862,10 @@ impl Checker {
                     }
                     return self
                         .infer_generic_call(name, &decls, &params, &ret, param_args, args)
-                        .map(|ret| (ret, 0));
+                        // Concrete overloads are preferred to generic candidates.
+                        // Keep the genericity penalty above any realistic argument
+                        // coercion count while preserving ties between generics.
+                        .map(|ret| (ret, 1 << 20));
                 }
                 other => {
                     return Err(TypeError::NotCallable {
@@ -4850,6 +4973,20 @@ fn has_len_bound(ty: &Ty) -> bool {
 /// runs after type erasure.
 fn param_has_bound(ty: &Ty, bound: &str) -> bool {
     matches!(ty, Ty::Param { bounds, .. } if bounds.iter().any(|b| b == bound))
+}
+
+fn builtin_trait_operation(trait_name: &str) -> Option<&'static str> {
+    match trait_name {
+        "Hashable" => Some("__hash__() -> UInt"),
+        "Absable" => Some("__abs__() -> Self"),
+        "Roundable" => Some("__round__() -> Self"),
+        "Powable" => Some("__pow__(Self) -> Self"),
+        "Intable" => Some("__int__() -> Int"),
+        "Floatable" => Some("__float__() -> Float64"),
+        "Boolable" => Some("__bool__() -> Bool"),
+        "DivModable" => Some("__divmod__(Self) -> Tuple[Self, Self]"),
+        _ => None,
+    }
 }
 
 /// The trait bounds that supply a numeric-rounding dunder (`method`/`argc`),

@@ -161,6 +161,7 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         let kind = (|| -> Result<StmtKind, ParseError> {
             Ok(match self.peek_token()? {
                 Some(Token::Var) => self.parse_var_decl()?,
+                Some(Token::Identifier(word)) if word == "ref" => self.parse_ref_decl()?,
                 Some(Token::Def) => self.parse_def(Vec::new())?,
                 Some(Token::Struct) => self.parse_struct(Vec::new())?,
                 // A decorator list precedes a `def` or `struct`.
@@ -332,6 +333,19 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         let value = self.parse_expression(Precedence::Lowest)?;
         self.expect_stmt_end()?;
         Ok(StmtKind::VarDecl { name, ty, value })
+    }
+
+    /// `ref name = expression` — Mojo's explicit reference binding. The AST
+    /// preserves the distinction from an owned `var` so later phases cannot
+    /// accidentally give it copy semantics while origins remain unsupported.
+    fn parse_ref_decl(&mut self) -> Result<StmtKind, ParseError> {
+        let keyword = self.expect_identifier("Expected 'ref'")?;
+        debug_assert_eq!(keyword, "ref");
+        let name = self.expect_identifier("Expected a name after 'ref'")?;
+        self.expect(Token::Assign, "Expected '=' after the reference name")?;
+        let value = self.parse_expression(Precedence::Lowest)?;
+        self.expect_stmt_end()?;
+        Ok(StmtKind::RefDecl { name, value })
     }
 
     /// `comptime NAME[: Type] = value` — a compile-time constant.
@@ -1416,13 +1430,39 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         self.next_token()?; // consume '['
         let mut params = Vec::new();
         loop {
+            // Mojo's `//` marker makes following parameters infer-only. Keep the
+            // syntax even though inference policy is not represented yet.
+            if matches!(self.peek_token()?, Some(Token::DoubleSlash)) {
+                self.next_token()?;
+                if matches!(self.peek_token()?, Some(Token::Comma)) {
+                    self.next_token()?;
+                }
+                continue;
+            }
             let name = self.expect_identifier("Expected a type-parameter name")?;
             self.expect(
                 Token::Colon,
                 "A type parameter requires a ': bound' (e.g. 'T: Copyable')",
             )?;
-            let mut bounds =
-                vec![self.expect_identifier("Expected a trait name in the type-parameter bound")?];
+            let first_bound =
+                self.expect_identifier("Expected a trait name in the type-parameter bound")?;
+            // Origin parameters use `Origin[mut=<bool expression>]`. Preserve the
+            // Origin classification and parse the mutability expression; semantic
+            // origin parameters are deliberately deferred.
+            if first_bound == "Origin" && matches!(self.peek_token()?, Some(Token::LBracket)) {
+                self.next_token()?;
+                let key = self.expect_identifier("Expected 'mut' in Origin[mut=...]")?;
+                if key != "mut" {
+                    return Err(ParseError::UnexpectedToken(
+                        Token::Identifier(key),
+                        "expected 'mut' in Origin[mut=...]".into(),
+                    ));
+                }
+                self.expect(Token::Assign, "Expected '=' after 'mut' in Origin")?;
+                self.parse_expression(Precedence::Lowest)?;
+                self.expect(Token::RBracket, "Expected ']' after Origin mutability")?;
+            }
+            let mut bounds = vec![first_bound];
             while matches!(self.peek_token()?, Some(Token::Amp)) {
                 self.next_token()?; // consume '&'
                 bounds.push(self.expect_identifier("Expected a trait name after '&'")?);

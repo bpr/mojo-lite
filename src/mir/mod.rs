@@ -18,10 +18,12 @@
 //! `xs[i] += e` lower uniformly (indices evaluated once).
 
 use crate::ast::{
-    ArgConvention, Dtype, Expr, ExprKind, FnParam, InfixOp, ParamArg, PrefixOp, Stmt, StmtKind,
-    TStringPart, Type,
+    ArgConvention, Dtype, Expr, ExprKind, FnParam, InfixOp, ParamArg, ParamKind, PrefixOp, Stmt,
+    StmtKind, TStringPart, Type,
 };
-use crate::checker::resolve_overload_targets;
+use crate::checker::{
+    effective_keyword_only_index, regular_marker_index, resolve_overload_targets,
+};
 use crate::token::DUMMY_SPAN;
 use std::collections::HashSet;
 
@@ -1298,6 +1300,9 @@ impl Flatten<'_> {
     /// threads the enclosing function's block map for a fallback-path `try`.
     fn lower_stmt(&mut self, s: &Stmt, outer_map: &HashMap<hir::BlockId, MirBlockId>) {
         match &s.kind {
+            StmtKind::RefDecl { .. } => self.emit(MirInstr::Unsupported(
+                "reference binding and origin semantics".to_string(),
+            )),
             // --- Writes through a place (any nesting) --------------------------
             StmtKind::SetPlace { place, value } => {
                 let src = self.expr(value);
@@ -1577,6 +1582,38 @@ fn lower_cfg_nested(
 #[derive(Debug)]
 pub struct MirProgram {
     pub functions: Vec<(String, MirFunction)>,
+    /// Declaration facts needed by execution, normalized once while lowering.
+    /// Backends consume this instead of rescanning the source AST.
+    pub declarations: MirDeclarations,
+}
+
+#[derive(Debug, Default)]
+pub struct MirDeclarations {
+    pub structs: Vec<MirStructDeclaration>,
+    pub functions: Vec<MirFunctionDeclaration>,
+}
+
+#[derive(Debug)]
+pub struct MirStructDeclaration {
+    pub name: String,
+    pub fields: Vec<(String, Type)>,
+    pub mut_self_methods: HashSet<String>,
+    pub fieldwise_init: bool,
+    pub param_decls: Vec<(String, bool)>,
+}
+
+#[derive(Debug)]
+pub struct MirFunctionDeclaration {
+    pub lowered_name: String,
+    pub param_names: Vec<String>,
+    pub param_types: Vec<Type>,
+    pub defaults: Vec<Option<Expr>>,
+    pub required: Vec<bool>,
+    pub variadic: Option<Type>,
+    pub variadic_index: Option<usize>,
+    pub positional_only: Option<usize>,
+    pub keyword_only: Option<usize>,
+    pub param_decls: Vec<(String, bool)>,
 }
 
 // --- Nested `def` (closure) lifting -----------------------------------------
@@ -1997,6 +2034,7 @@ fn lower_fn_nested(request: FunctionLowering<'_>, out: &mut Vec<(String, MirFunc
 /// (Nested `def`s inside a body are still deferred — see `lower_stmt`.)
 pub fn lower_program(program: &[Stmt]) -> MirProgram {
     let mut functions = Vec::new();
+    let mut declarations = MirDeclarations::default();
     let mut toplevel: Vec<Stmt> = Vec::new();
     let overloads = crate::symbol::OverloadSets::scan(program);
     let overload_targets = resolve_overload_targets(program).unwrap_or_default();
@@ -2004,13 +2042,37 @@ pub fn lower_program(program: &[Stmt]) -> MirProgram {
     for s in program {
         match &s.kind {
             StmtKind::Def {
-                name, params, body, ..
+                name,
+                type_params,
+                params,
+                positional_only,
+                keyword_only,
+                body,
+                ..
             } => {
                 let names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
                 let ptys = params.iter().map(|p| p.ty.clone()).collect();
                 let owned = params.iter().map(|p| is_owned(&p.convention)).collect();
                 let refp = params.iter().map(|p| is_ref(&p.convention)).collect();
-                let lowered_name = crate::symbol::lowered_def_name(name, params, &overloads);
+                let lowered_name =
+                    crate::symbol::lowered_def_name(name, type_params, params, &overloads);
+                let variadic_idx = params.iter().position(|p| p.kind == ParamKind::Variadic);
+                let regular: Vec<_> = params
+                    .iter()
+                    .filter(|p| p.kind == ParamKind::Regular)
+                    .collect();
+                declarations.functions.push(MirFunctionDeclaration {
+                    lowered_name: lowered_name.clone(),
+                    param_names: regular.iter().map(|p| p.name.clone()).collect(),
+                    param_types: regular.iter().map(|p| p.ty.clone()).collect(),
+                    defaults: regular.iter().map(|p| p.default.clone()).collect(),
+                    required: regular.iter().map(|p| p.default.is_none()).collect(),
+                    variadic: variadic_idx.map(|i| params[i].ty.clone()),
+                    variadic_index: regular_marker_index(params, variadic_idx),
+                    positional_only: regular_marker_index(params, *positional_only),
+                    keyword_only: effective_keyword_only_index(params, *keyword_only, variadic_idx),
+                    param_decls: crate::runtime::classify_param_decls(type_params),
+                });
                 lower_fn_nested(
                     FunctionLowering {
                         name: &lowered_name,
@@ -2025,12 +2087,52 @@ pub fn lower_program(program: &[Stmt]) -> MirProgram {
                     &mut functions,
                 );
             }
-            StmtKind::Struct { name, methods, .. } => {
+            StmtKind::Struct {
+                name,
+                type_params,
+                fields,
+                methods,
+                fieldwise_init,
+                ..
+            } => {
+                let mut_self_methods = methods
+                    .iter()
+                    .filter(|m| matches!(m.self_convention, Some(ArgConvention::Mut)))
+                    .map(|m| {
+                        let method_name = crate::symbol::lifecycle_method_name(m);
+                        let source = format!("{name}.{method_name}");
+                        let lowered = crate::symbol::lowered_method_name(
+                            &source,
+                            type_params,
+                            &m.params,
+                            &overloads,
+                        );
+                        if lowered == source {
+                            method_name.to_string()
+                        } else {
+                            lowered
+                        }
+                    })
+                    .collect();
+                declarations.structs.push(MirStructDeclaration {
+                    name: name.clone(),
+                    fields: fields
+                        .iter()
+                        .map(|field| (field.name.clone(), field.ty.clone()))
+                        .collect(),
+                    mut_self_methods,
+                    fieldwise_init: *fieldwise_init,
+                    param_decls: crate::runtime::classify_param_decls(type_params),
+                });
                 for m in methods {
                     let method_name = crate::symbol::lifecycle_method_name(m);
                     let source_mangled = format!("{name}.{method_name}");
-                    let mangled =
-                        crate::symbol::lowered_method_name(&source_mangled, &m.params, &overloads);
+                    let mangled = crate::symbol::lowered_method_name(
+                        &source_mangled,
+                        type_params,
+                        &m.params,
+                        &overloads,
+                    );
                     // A method's receiver `self` is the implicit first parameter,
                     // followed by the declared params.
                     let mut names: Vec<String> = Vec::new();
@@ -2079,5 +2181,8 @@ pub fn lower_program(program: &[Stmt]) -> MirProgram {
             &overload_targets,
         ),
     ));
-    MirProgram { functions }
+    MirProgram {
+        functions,
+        declarations,
+    }
 }

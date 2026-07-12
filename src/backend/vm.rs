@@ -27,10 +27,8 @@
 //! with keyword/default/variadic args, and nested `def`/`struct`.
 
 use super::Backend;
-use crate::ast::{ArgConvention, Expr, ExprKind, ParamKind, PrefixOp, Stmt, StmtKind, Type};
-use crate::checker::{
-    ArgSlot, effective_keyword_only_index, match_call_slots, regular_marker_index,
-};
+use crate::ast::{Expr, ExprKind, PrefixOp, Stmt, Type};
+use crate::checker::{ArgSlot, match_call_slots};
 use crate::error::RuntimeError;
 use crate::hir::VarId;
 use crate::mir::{Const, MirBlock, MirInstr, MirPlace, MirProgram, MirTerm, Proj, Reg};
@@ -1579,107 +1577,64 @@ impl Backend for VmBackend {
 }
 
 fn build_prog(program: &[Stmt]) -> Prog {
+    let mir = crate::analysis::elaborate_drops_program(crate::mir::lower_program(program));
+    let structs = build_structs(&mir.declarations);
+    let sigs = build_sigs(&mir.declarations);
     Prog {
         // Elaborate ASAP drops: splice a `DropVar` after each variable's last
         // use, so a struct's `__del__` runs there (Phase 4). A no-op for values
         // without a destructor, so parity with the tree-walker is preserved.
-        mir: crate::analysis::elaborate_drops_program(crate::mir::lower_program(program)),
-        structs: build_structs(program),
-        sigs: build_sigs(program),
+        mir,
+        structs,
+        sigs,
     }
 }
 
-/// Build the struct registry from the program's top-level `struct` declarations.
-fn build_structs(program: &[Stmt]) -> HashMap<String, StructDef> {
-    let mut map = HashMap::new();
-    let overloads = crate::symbol::OverloadSets::scan(program);
-    for s in program {
-        if let StmtKind::Struct {
-            name,
-            type_params,
-            fields,
-            methods,
-            fieldwise_init,
-            ..
-        } = &s.kind
-        {
-            let mut_self_methods = methods
-                .iter()
-                .filter(|m| matches!(m.self_convention, Some(ArgConvention::Mut)))
-                .map(|m| {
-                    let method_name = crate::symbol::lifecycle_method_name(m);
-                    let source = format!("{name}.{method_name}");
-                    let lowered =
-                        crate::symbol::lowered_method_name(&source, &m.params, &overloads);
-                    // A non-overloaded method is keyed by its bare method name
-                    // (`method_call` checks that when no lowering happened).
-                    if lowered == source {
-                        method_name.to_string()
-                    } else {
-                        lowered
-                    }
-                })
-                .collect();
-            map.insert(
-                name.clone(),
+/// Build the VM registry from declaration metadata carried by MIR.
+fn build_structs(declarations: &crate::mir::MirDeclarations) -> HashMap<String, StructDef> {
+    declarations
+        .structs
+        .iter()
+        .map(|declaration| {
+            (
+                declaration.name.clone(),
                 StructDef {
-                    fields: fields
-                        .iter()
-                        .map(|f| (f.name.clone(), f.ty.clone()))
-                        .collect(),
-                    mut_self_methods,
-                    fieldwise_init: *fieldwise_init,
-                    param_decls: crate::runtime::classify_param_decls(type_params),
+                    fields: declaration.fields.clone(),
+                    mut_self_methods: declaration.mut_self_methods.clone(),
+                    fieldwise_init: declaration.fieldwise_init,
+                    param_decls: declaration.param_decls.clone(),
                 },
-            );
-        }
-    }
-    map
+            )
+        })
+        .collect()
 }
 
-/// Build the calling-signature registry from the program's top-level `def`s.
-fn build_sigs(program: &[Stmt]) -> HashMap<String, FnSig> {
-    let mut map = HashMap::new();
-    let overloads = crate::symbol::OverloadSets::scan(program);
-    for s in program {
-        if let StmtKind::Def {
-            name,
-            type_params,
-            params,
-            positional_only,
-            keyword_only,
-            ..
-        } = &s.kind
-        {
-            let variadic_idx = params.iter().position(|p| p.kind == ParamKind::Variadic);
-            let regular: Vec<_> = params
-                .iter()
-                .filter(|p| p.kind == ParamKind::Regular)
-                .collect();
-            let pos_only = regular_marker_index(params, *positional_only);
-            let kw_only = effective_keyword_only_index(params, *keyword_only, variadic_idx);
-            let required = regular.iter().map(|p| p.default.is_none()).collect();
-            let lowered_name = crate::symbol::lowered_def_name(name, params, &overloads);
-            map.insert(
-                lowered_name,
+/// Build the VM calling registry from declaration metadata carried by MIR.
+fn build_sigs(declarations: &crate::mir::MirDeclarations) -> HashMap<String, FnSig> {
+    declarations
+        .functions
+        .iter()
+        .map(|declaration| {
+            (
+                declaration.lowered_name.clone(),
                 FnSig {
-                    param_names: regular.iter().map(|p| p.name.clone()).collect(),
-                    param_types: regular.iter().map(|p| p.ty.clone()).collect(),
-                    defaults: regular
+                    param_names: declaration.param_names.clone(),
+                    param_types: declaration.param_types.clone(),
+                    defaults: declaration
+                        .defaults
                         .iter()
-                        .map(|p| p.default.as_ref().and_then(const_default))
+                        .map(|default| default.as_ref().and_then(const_default))
                         .collect(),
-                    required,
-                    variadic: variadic_idx.map(|vi| params[vi].ty.clone()),
-                    variadic_index: regular_marker_index(params, variadic_idx),
-                    positional_only: pos_only,
-                    keyword_only: kw_only,
-                    param_decls: crate::runtime::classify_param_decls(type_params),
+                    required: declaration.required.clone(),
+                    variadic: declaration.variadic.clone(),
+                    variadic_index: declaration.variadic_index,
+                    positional_only: declaration.positional_only,
+                    keyword_only: declaration.keyword_only,
+                    param_decls: declaration.param_decls.clone(),
                 },
-            );
-        }
-    }
-    map
+            )
+        })
+        .collect()
 }
 
 /// Const-fold a default-argument expression to a value. Handles the literal forms

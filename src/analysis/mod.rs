@@ -59,6 +59,7 @@ pub fn elaborate_drops_program(prog: MirProgram) -> MirProgram {
                 (name, elaborated)
             })
             .collect(),
+        declarations: prog.declarations,
     }
 }
 

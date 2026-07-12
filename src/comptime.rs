@@ -1,7 +1,7 @@
 //! Compile-time elaboration (Phase 4 — comptime semantics).
 //!
 //! A pass between parsing and type-checking that **resolves compile-time
-//! constructs before runtime lowering**, per `comptime.md` / `zig-comptime.md`:
+//! constructs before runtime lowering**, per `docs/notes/comptime.md`:
 //! `comptime` is a *phase distinction*, so the elaborator rewrites the AST so the
 //! checker/MIR/VM only ever see ordinary code.
 //!
@@ -818,9 +818,9 @@ impl<'a> Elab<'a> {
     ) -> Result<(), ComptimeError> {
         match &mut stmt.kind {
             StmtKind::Def { body, .. } => self.rewrite_vm_ctfe_block(body, scope),
-            StmtKind::VarDecl { value, .. } | StmtKind::Assign { value, .. } => {
-                self.rewrite_vm_ctfe_expr(value, scope)
-            }
+            StmtKind::VarDecl { value, .. }
+            | StmtKind::RefDecl { value, .. }
+            | StmtKind::Assign { value, .. } => self.rewrite_vm_ctfe_expr(value, scope),
             StmtKind::AugAssign { place, value, .. } | StmtKind::SetPlace { place, value } => {
                 self.rewrite_vm_ctfe_expr(place, scope)?;
                 self.rewrite_vm_ctfe_expr(value, scope)
@@ -1028,9 +1028,9 @@ impl<'a> Elab<'a> {
         needed: &mut HashSet<String>,
     ) -> bool {
         match &stmt.kind {
-            StmtKind::VarDecl { value, .. } | StmtKind::Assign { value, .. } => {
-                self.vm_ctfe_safe_expr(value, visiting, needed)
-            }
+            StmtKind::VarDecl { value, .. }
+            | StmtKind::RefDecl { value, .. }
+            | StmtKind::Assign { value, .. } => self.vm_ctfe_safe_expr(value, visiting, needed),
             StmtKind::AugAssign { place, value, .. } | StmtKind::SetPlace { place, value } => {
                 self.vm_ctfe_safe_expr(place, visiting, needed)
                     && self.vm_ctfe_safe_expr(value, visiting, needed)
@@ -1500,6 +1500,7 @@ impl<'a> Elab<'a> {
     ) -> Result<(), ComptimeError> {
         match &mut s.kind {
             StmtKind::VarDecl { value, .. }
+            | StmtKind::RefDecl { value, .. }
             | StmtKind::Assign { value, .. }
             | StmtKind::Comptime { value, .. }
             | StmtKind::Raise(value)
@@ -1987,6 +1988,7 @@ fn rewrite_block(body: &mut [Stmt], subs: Subs, into_defs: bool) {
 fn rewrite_stmt(s: &mut Stmt, subs: Subs, into_defs: bool) {
     match &mut s.kind {
         StmtKind::VarDecl { value, .. }
+        | StmtKind::RefDecl { value, .. }
         | StmtKind::Assign { value, .. }
         | StmtKind::Comptime { value, .. }
         | StmtKind::Raise(value)

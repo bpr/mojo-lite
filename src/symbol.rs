@@ -24,6 +24,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
     ArgConvention, Expr, ExprKind, FnParam, Method, ParamArg, ParamKind, Stmt, StmtKind, Type,
+    TypeParam,
 };
 use crate::types::{Ty, TyArg};
 
@@ -40,7 +41,7 @@ pub struct TypeKey(String);
 impl TypeKey {
     /// Mangle a declared parameter annotation (the MIR/VM definition side).
     pub fn from_ast(ty: &Type) -> TypeKey {
-        TypeKey(sanitize(&ast_raw(ty, &HashMap::new())))
+        TypeKey(sanitize(&ast_raw(ty, &HashMap::new(), &HashMap::new())))
     }
 
     /// Mangle a checker-resolved type (the call-resolution side). Aligned with
@@ -51,7 +52,11 @@ impl TypeKey {
     }
 }
 
-fn ast_raw(ty: &Type, comptimes: &HashMap<String, i64>) -> String {
+fn ast_raw(
+    ty: &Type,
+    comptimes: &HashMap<String, i64>,
+    type_bounds: &HashMap<String, Vec<String>>,
+) -> String {
     match ty {
         Type::Int => "Int".to_string(),
         Type::UInt => "UInt".to_string(),
@@ -60,11 +65,11 @@ fn ast_raw(ty: &Type, comptimes: &HashMap<String, i64>) -> String {
         Type::Float64 => "Float64".to_string(),
         Type::None => "None".to_string(),
         Type::Named(name, args) => {
-            let mut s = encode_identifier(name);
+            let mut s = parameter_raw(name, type_bounds);
             for arg in args {
                 s.push('$');
                 match arg {
-                    ParamArg::Type(t) => s.push_str(&ast_raw(t, comptimes)),
+                    ParamArg::Type(t) => s.push_str(&ast_raw(t, comptimes, type_bounds)),
                     ParamArg::Value(v) => {
                         s.push('V');
                         s.push_str(&value_expr_raw(v, comptimes));
@@ -76,10 +81,10 @@ fn ast_raw(ty: &Type, comptimes: &HashMap<String, i64>) -> String {
         // `Self.T` names the same parameter a bare `T` does inside the struct,
         // and the checker resolves both to the same `Ty::Param` — spell them
         // identically so the two sides agree.
-        Type::SelfParam(name) => encode_identifier(name),
+        Type::SelfParam(name) => parameter_raw(name, type_bounds),
         Type::Assoc { base, name } => format!(
             "Assoc${}${}",
-            ast_raw(base, comptimes),
+            ast_raw(base, comptimes, type_bounds),
             encode_identifier(name)
         ),
         Type::SelfType => "Self".to_string(),
@@ -114,7 +119,14 @@ fn ty_raw(ty: &Ty) -> String {
             s
         }
         // A type parameter spells as the bare annotation `T` does.
-        Ty::Param { name, .. } => encode_identifier(name),
+        Ty::Param { name, bounds } => {
+            let mut result = encode_identifier(name);
+            for bound in bounds {
+                result.push('$');
+                result.push_str(&encode_identifier(bound));
+            }
+            result
+        }
         Ty::Pointer(elem) => format!("UnsafePointer${}", ty_raw(elem)),
         Ty::Assoc { base, name } => {
             format!("Assoc${}${}", ty_raw(base), encode_identifier(name))
@@ -122,6 +134,17 @@ fn ty_raw(ty: &Ty) -> String {
         Ty::SelfType => "Self".to_string(),
         other => other.to_string(),
     }
+}
+
+fn parameter_raw(name: &str, type_bounds: &HashMap<String, Vec<String>>) -> String {
+    let mut result = encode_identifier(name);
+    if let Some(bounds) = type_bounds.get(name) {
+        for bound in bounds {
+            result.push('$');
+            result.push_str(&encode_identifier(bound));
+        }
+    }
+    result
 }
 
 /// The mangled spelling of a compile-time value argument in an annotation
@@ -307,9 +330,17 @@ fn keep_overloaded(counts: HashMap<String, Vec<usize>>) -> HashMap<String, HashS
 
 /// The name a top-level `def` lowers to: signature-qualified when the name is
 /// overloaded, the plain source name otherwise.
-pub fn lowered_def_name(name: &str, params: &[FnParam], sets: &OverloadSets) -> String {
+pub fn lowered_def_name(
+    name: &str,
+    type_params: &[TypeParam],
+    params: &[FnParam],
+    sets: &OverloadSets,
+) -> String {
     if sets.function_is_overloaded(name, params.len()) {
-        function_symbol(name, &signature_from_ast(params, &sets.comptimes))
+        function_symbol(
+            name,
+            &signature_from_ast(params, type_params, &sets.comptimes),
+        )
     } else {
         name.to_string()
     }
@@ -317,22 +348,35 @@ pub fn lowered_def_name(name: &str, params: &[FnParam], sets: &OverloadSets) -> 
 
 /// The name a struct method lowers to, from its already-joined source name
 /// (`Type.method`): signature-qualified when overloaded, unchanged otherwise.
-pub fn lowered_method_name(source_name: &str, params: &[FnParam], sets: &OverloadSets) -> String {
+pub fn lowered_method_name(
+    source_name: &str,
+    type_params: &[TypeParam],
+    params: &[FnParam],
+    sets: &OverloadSets,
+) -> String {
     if sets.method_is_overloaded(source_name, params.len()) {
         format!(
             "{source_name}{}",
-            signature_from_ast(params, &sets.comptimes).suffix()
+            signature_from_ast(params, type_params, &sets.comptimes).suffix()
         )
     } else {
         source_name.to_string()
     }
 }
 
-fn signature_from_ast(params: &[FnParam], comptimes: &HashMap<String, i64>) -> SignatureKey {
+fn signature_from_ast(
+    params: &[FnParam],
+    type_params: &[TypeParam],
+    comptimes: &HashMap<String, i64>,
+) -> SignatureKey {
+    let type_bounds = type_params
+        .iter()
+        .map(|param| (param.name.clone(), param.bounds.clone()))
+        .collect();
     SignatureKey(
         params
             .iter()
-            .map(|param| TypeKey(sanitize(&ast_raw(&param.ty, comptimes))))
+            .map(|param| TypeKey(sanitize(&ast_raw(&param.ty, comptimes, &type_bounds))))
             .collect(),
     )
 }

@@ -1497,6 +1497,32 @@ fn parses_ref_convention_with_optional_origin() {
 }
 
 #[test]
+fn parses_origin_unions_parameters_and_reference_bindings() {
+    let source = "def pick[is_mutable: Bool, //, origin: Origin[mut=is_mutable]](ref[origin] a: String, ref[a, origin_of(a)] b: String) -> ref[a, b] String:\n    ref selected = a\n    return selected\n";
+    let stmts = parse(source);
+    let StmtKind::Def {
+        type_params,
+        params,
+        ret,
+        body,
+        ..
+    } = &stmts[0].kind
+    else {
+        panic!("expected a def");
+    };
+    assert_eq!(type_params[0].name, "is_mutable");
+    assert_eq!(type_params[1].name, "origin");
+    assert_eq!(type_params[1].bounds, vec!["Origin"]);
+    assert_eq!(params[0].convention, Some(ArgConvention::Ref));
+    assert_eq!(params[1].convention, Some(ArgConvention::Ref));
+    assert_eq!(ret, &Some(Type::Ref(Box::new(Type::String))));
+    assert!(matches!(
+        &body[0].kind,
+        StmtKind::RefDecl { name, .. } if name == "selected"
+    ));
+}
+
+#[test]
 fn parses_ref_self_receiver() {
     // `ref self` (with an optional discarded origin) is recognized as a receiver.
     let stmts = parse(

@@ -327,7 +327,8 @@ At a call site the checker:
 1. collects the candidates for the source name
 2. filters candidates by call shape, explicit type/value arguments, and argument
    type compatibility
-3. scores surviving candidates by how many argument coercions they need
+3. prefers concrete candidates over generic candidates, then scores surviving
+   candidates by how many argument coercions they need
 4. accepts the unique lowest-score candidate
 5. rejects no-match and tied-best cases
 
@@ -336,7 +337,10 @@ pretending to implement the complete Mojo overload lattice. For example, a
 typed `String` value selects `f(x: String)` over `f(x: Int)`, and an exact
 `Int` argument selects `f(x: Int)` over a candidate requiring widening. A bare
 integer literal passed to both `f(Int)` and `f(Float64)` is ambiguous because it
-can materialize as either.
+can materialize as either. Alpha-equivalent generic declarations are rejected,
+while generic overloads with genuinely different bounds receive distinct lowered
+symbols that include those bounds. Nested-def overload sets are rejected until
+the lifting path can preserve their selected identities safely.
 
 The important architecture point is that overload selection is static. The VM
 does not inspect runtime value tags to choose between same-arity candidates.
@@ -978,9 +982,11 @@ The VM builds a `Prog` containing:
 - signature-mangled overload definitions and fallback lookup for unique arity
   protocol calls
 
-Some of this metadata is still recovered from the AST because MIR intentionally
-does not yet carry every declaration fact. Over time, more of this should migrate
-into MIR or a checked declaration table.
+MIR lowering normalizes the declaration facts needed by execution into
+`MirDeclarations`: struct field layouts, mutating method identities, function
+parameter/default/marker information, and generic parameter declarations. The VM
+builds its compact runtime registries from that metadata rather than rescanning the
+source AST or recomputing overload names.
 
 ### Function Calls
 
@@ -1193,7 +1199,8 @@ The main pressure points are:
 - overload resolution now supports arity and conservative type-directed
   selection, but Mojo's full ranking, implicit-conversion, and generic-overload
   ordering rules remain future work
-- more declaration facts should move out of VM-side AST registries
+- checked declaration metadata can eventually replace the remaining AST types in
+  `MirDeclarations`; the VM-side AST registries themselves have been removed
 - the module system is useful but intentionally simple: no qualified
   `import module` lookup, aliases, packages, or imported top-level execution
 - trait support is intentionally incomplete

@@ -179,6 +179,9 @@ pub enum TypeError {
         param: String,
         ty: String,
         trait_name: String,
+        /// The first concrete missing field or operation, when the checker can
+        /// identify one without obscuring the primary bound failure.
+        reason: Option<String>,
     },
     /// A struct declares conformance to a trait but is missing a required method.
     MissingTraitMethod {
@@ -459,11 +462,18 @@ impl fmt::Display for TypeError {
                 param,
                 ty,
                 trait_name,
-            } => write!(
-                f,
-                "type '{}' for parameter '{}' does not conform to trait '{}'",
-                ty, param, trait_name
-            ),
+                reason,
+            } => {
+                write!(
+                    f,
+                    "type '{}' for parameter '{}' does not conform to trait '{}'",
+                    ty, param, trait_name
+                )?;
+                if let Some(reason) = reason {
+                    write!(f, ": {reason}")?;
+                }
+                Ok(())
+            }
             TypeError::MissingTraitMethod {
                 struct_name,
                 trait_name,

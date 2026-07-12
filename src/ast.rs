@@ -386,6 +386,10 @@ pub enum StmtKind {
         ty: Option<Type>,
         value: Expr,
     },
+    /// `ref name = value` — a reference binding. Parsed so current Mojo source
+    /// reaches a deliberate checker error; origin-carrying reference values are
+    /// not modeled yet.
+    RefDecl { name: String, value: Expr },
     /// `name = value` — re-assigns an already-declared variable (every `var` is
     /// mutable). Distinct from `VarDecl`; the value must keep the declared type.
     Assign { name: String, value: Expr },

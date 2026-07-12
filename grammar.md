@@ -208,7 +208,8 @@ param_item:
     | '**' NAME ':' type                   # **kwargs (keyword variadic)
     | [convention] NAME ':' type ['=' expression]   # regular, optional default
 convention: 'read' | 'mut' | 'owned' | 'out' | 'ref' [origin_spec] | 'deinit'
-origin_spec: '[' ','.expression+ ']'   # a ref origin (parsed & discarded); an expression, a named origin, or '_'
+origin_spec: '[' ','.expression+ ']'   # an expression, a named origin, origin_of(...), or '_'
+reference_binding: 'ref' NAME '=' expression
 ```
 
 Every parameter is typed; omitting `-> type` means the function returns `None`. The
@@ -225,8 +226,9 @@ Int)`). Ordering is parsed leniently. The **`ref` convention** (parametric-mutab
 reference) may carry an **origin specifier** — `ref[origin] x` — whose contents (an
 arbitrary expression treated as `origin_of(...)`, a named origin, or `_` for an unbound
 origin) are **parsed and discarded** (origins are not modeled; `origin_of(...)` itself
-is just an ordinary call expression). Origins as *named parameters* in a `[...]` list
-(`def f[o: Origin[…]](…)`) and the `//` infer-only marker are **not** parsed. An optional `params_decl` list (see **Parameterization** below) makes the
+is just an ordinary call expression). Named `Origin[mut=...]` parameters and the
+`//` infer-only marker are parsed but their origin-specific meaning is discarded.
+An optional `params_decl` list (see **Parameterization** below) makes the
 function generic: its type/value parameters are in scope as bare `NAME`s in the
 signature and body (e.g. `def first[T: Copyable & Movable](p: Pair[T]) -> T`, or
 `def repeat[count: Int](msg: String)` with `count` a value parameter).
@@ -585,6 +587,12 @@ A `NAME` is also a **SIMD type** when it is `SIMD[DType.<dt>, <width>]` or one o
 fixed-width **scalar aliases** (`Int8` / `Int16` / `Int32` / `Int64`, `UInt8` / `UInt16`
 / `UInt32` / `UInt64`, `Float32`) — see **SIMD** — or a **`List[T]`** (see
 **Collections**). These are recognized by the checker, not reserved words.
+
+`ref NAME = expression` parses as a distinct reference binding and is rejected by
+the checker until origin-carrying reference values are modeled. Origin unions in
+arguments and returns, `Origin[mut=...]` parameters, and the `//` infer-only
+parameter marker are also accepted by the parser. Origin clauses are currently
+discarded after parsing, so this is syntax support rather than lifetime semantics.
 
 `comptime NAME = expression` declares a **compile-time constant** (`comptime N = 8`).
 The right-hand side must be a comptime `Int` expression (literals, other `comptime`
