@@ -997,6 +997,13 @@ Calling a function:
 3. coerces arguments to parameter types
 4. creates a new frame
 5. writes arguments into parameter variable slots
+
+For a homogeneous free-function `**kwargs: T` collector, the checker leaves
+explicit parameter binding unchanged and type-checks unmatched keyword values as
+`T`. The ABI preserves those unmatched pairs in call-site order. The VM then
+constructs the implicitly linked self-hosted `HashDict[String, T]` directly in the
+collector's callee slot; it is an owned mutable local and never participates in
+caller write-back. Generic and method collectors are not yet modeled.
 6. binds value parameters into frame locals
 7. runs the callee's block loop
 8. returns the result and, where needed, final variable slots for write-back

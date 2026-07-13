@@ -215,12 +215,11 @@ reference_binding: 'ref' NAME '=' expression
 Every parameter is typed; omitting `-> type` means the function returns `None`. The
 full Mojo parameter grammar is **parsed**. **Default values** (`b: Int = 2`) and a
 trailing **`*args` homogeneous variadic** (`*values: Int`, a `List[T]` in the body)
-are *implemented* for non-generic free `def`s (defaults must be trailing; `*args`
-must be the last parameter). The other advanced forms — `**kwargs`, the `/`
-(positional-only) and `*` (keyword-only) markers, and argument conventions — are
-parsed but the checker still flags a signature using them as an *unsupported feature*
-(`TypeError::Unsupported`; a plain / defaults-only / `*args` signature is unaffected). A
-`convention` word is only a convention when a parameter name follows it, so `read`,
+are *implemented* for non-generic free `def`s. Homogeneous `**kwargs: T` is also
+implemented: unmatched ordered keyword pairs are transported by the call ABI and
+materialized as an owned self-hosted `HashDict[String, T]` local. Generic and method
+`**kwargs` remain deferred. The remaining unsupported form is the `out` convention.
+A `convention` word is only a convention when a parameter name follows it, so `read`,
 `mut`, `ref`, etc. remain usable as parameter names (`def f(read: Int)`, `def f(ref:
 Int)`). Ordering is parsed leniently. The **`ref` convention** (parametric-mutability
 reference) may carry an **origin specifier** — `ref[origin] x` — whose contents (an

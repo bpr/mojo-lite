@@ -1607,15 +1607,24 @@ fn rejects_tuple_element_write() {
 
 #[test]
 fn flags_advanced_parameter_forms_as_unsupported() {
-    for src in [
-        "def f(**opts: Int):\n    pass\n", // **kwargs
-        "def f(out x: Int):\n    pass\n",  // `out` convention (still deferred)
-    ] {
-        assert!(
-            matches!(err(src), TypeError::Unsupported(_)),
-            "expected Unsupported for: {src}"
-        );
-    }
+    let src = "def f(out x: Int):\n    pass\n";
+    assert!(
+        matches!(err(src), TypeError::Unsupported(_)),
+        "expected Unsupported for: {src}"
+    );
+}
+
+#[test]
+fn kwargs_collect_unknown_keywords_and_check_values() {
+    ok("def f(x: Int, **opts: Int):\n    pass\n\nf(1, a=2, b=3)\n");
+    assert!(matches!(
+        err("def f(**opts: Int):\n    pass\n\nf(a=\"wrong\")\n"),
+        TypeError::TypeMismatch { .. }
+    ));
+    assert!(matches!(
+        err("def f(x: Int, **opts: Int):\n    pass\n\nf(x=1, x=2)\n"),
+        TypeError::BadCall { .. }
+    ));
 }
 
 #[test]

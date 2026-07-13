@@ -9,10 +9,10 @@ def main():
     print(d["name"], " : ",d["phase"])
 
     var count: Int = 0
-    for entry in d:
+    for key in d:
         count = count + 1
-        print(entry.key)
-        print(entry.value)
+        print(key)
+        print(d[key])
     print(count)
 
     try:

@@ -151,6 +151,12 @@ impl Linker {
     /// Resolve the entry program's imports (loading their modules) and return its
     /// own non-import statements (declarations + top-level code + `main`).
     fn resolve_entry(&mut self, program: Vec<Stmt>, dir: &Path) -> Result<Vec<Stmt>, ModuleError> {
+        if program_uses_kwargs(&program)
+            && let Some(root) = option_env!("CARGO_MANIFEST_DIR")
+        {
+            let runtime = Path::new(root).join("stdlib/std/collections/hashdict.mojo");
+            self.load_module(&runtime, "std.collections.hashdict")?;
+        }
         let mut body = Vec::new();
         for stmt in program {
             match &stmt.kind {
@@ -232,6 +238,34 @@ impl Linker {
     ) -> Result<(PathBuf, String), ModuleError> {
         module_file(from_dir, level, path, &self.options.search_roots)
     }
+}
+
+fn program_uses_kwargs(program: &[Stmt]) -> bool {
+    program.iter().any(|stmt| match &stmt.kind {
+        StmtKind::Def { params, body, .. } => {
+            params
+                .iter()
+                .any(|p| p.kind == crate::ast::ParamKind::KwVariadic)
+                || program_uses_kwargs(body)
+        }
+        StmtKind::Struct { methods, .. } => methods.iter().any(|method| {
+            method
+                .params
+                .iter()
+                .any(|p| p.kind == crate::ast::ParamKind::KwVariadic)
+                || program_uses_kwargs(&method.body)
+        }),
+        StmtKind::If { branches, orelse } => {
+            branches.iter().any(|(_, body)| program_uses_kwargs(body))
+                || orelse
+                    .as_ref()
+                    .is_some_and(|body| program_uses_kwargs(body))
+        }
+        StmtKind::While { body, .. }
+        | StmtKind::For { body, .. }
+        | StmtKind::ComptimeFor { body, .. } => program_uses_kwargs(body),
+        _ => false,
+    })
 }
 
 /// The declared name of a top-level declaration statement (`def`/`struct`/`trait`/

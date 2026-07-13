@@ -66,17 +66,19 @@ or user program needs them.
 
 ### 2. Strengthen Self-Hosted Collections
 
-- [ ] **Nested self-hosted lists** — make `List[List[T]]` robust enough for the
-  hash-set bucket array to import and use `std.collections.list` rather than
-  relying on built-in `List` behavior.
-- [ ] **Dictionary views** — design and implement key, value, and item views once
-  opaque `Indexer` and iterator result typing can express their element types.
-- [ ] **Hash-backed dictionary** — implement a separate hash-backed `Dict` using
-  the list-backed dictionary as the behavior oracle; keep collision handling and
-  resizing explicit and testable.
-- [ ] **Keyword-map value** — decide whether a self-hosted dictionary can serve as
-  the runtime representation for `**kwargs`; implement `**kwargs` only after that
-  value and ownership story is clear.
+- [x] **Nested self-hosted lists** — pointer-backed element reads deep-copy values,
+  indexed mut-self writeback uses `__setitem__`, and `HashSet` now uses the
+  self-hosted `List[List[T]]` bucket shape.
+- [x] **Dictionary views** — `Dict` provides insertion-ordered key iteration,
+  public `DictEntry` items, snapshot `keys`/`values`/`items`, and Mojo-shaped
+  overloaded `get` accessors.
+- [x] **Hash-backed dictionary** — `HashDict` combines dense insertion-ordered
+  entries with nested-list hash indexes, explicit growth/rehashing, snapshots,
+  overloaded accessors, and deep value-semantic copying.
+- [x] **Keyword-map value** — homogeneous free-function `**kwargs: T` uses ordered
+  keyword pairs as its call ABI and materializes an owned self-hosted
+  `HashDict[String, T]` in the callee; representation rationale is retained in
+  `docs/kwargs_dict_memo.md`.
 
 ### 3. Centralize Checked Semantic Data
 

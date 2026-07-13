@@ -1621,6 +1621,8 @@ pub struct MirFunctionDeclaration {
     pub required: Vec<bool>,
     pub variadic: Option<Type>,
     pub variadic_index: Option<usize>,
+    pub kw_variadic: Option<Type>,
+    pub kw_variadic_index: Option<usize>,
     pub positional_only: Option<usize>,
     pub keyword_only: Option<usize>,
     pub param_decls: Vec<(String, bool)>,
@@ -2067,6 +2069,7 @@ pub fn lower_program(program: &[Stmt]) -> MirProgram {
                 let lowered_name =
                     crate::symbol::lowered_def_name(name, type_params, params, &overloads);
                 let variadic_idx = params.iter().position(|p| p.kind == ParamKind::Variadic);
+                let kw_variadic_idx = params.iter().position(|p| p.kind == ParamKind::KwVariadic);
                 let regular: Vec<_> = params
                     .iter()
                     .filter(|p| p.kind == ParamKind::Regular)
@@ -2079,6 +2082,8 @@ pub fn lower_program(program: &[Stmt]) -> MirProgram {
                     required: regular.iter().map(|p| p.default.is_none()).collect(),
                     variadic: variadic_idx.map(|i| params[i].ty.clone()),
                     variadic_index: regular_marker_index(params, variadic_idx),
+                    kw_variadic: kw_variadic_idx.map(|i| params[i].ty.clone()),
+                    kw_variadic_index: kw_variadic_idx,
                     positional_only: regular_marker_index(params, *positional_only),
                     keyword_only: effective_keyword_only_index(params, *keyword_only, variadic_idx),
                     param_decls: crate::runtime::classify_param_decls(type_params),
@@ -2163,6 +2168,8 @@ pub fn lower_program(program: &[Stmt]) -> MirProgram {
                             .collect(),
                         variadic: variadic_idx.map(|index| m.params[index].ty.clone()),
                         variadic_index: regular_marker_index(&m.params, variadic_idx),
+                        kw_variadic: None,
+                        kw_variadic_index: None,
                         positional_only: regular_marker_index(&m.params, m.positional_only),
                         keyword_only: effective_keyword_only_index(
                             &m.params,

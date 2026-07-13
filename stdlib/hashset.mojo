@@ -8,11 +8,12 @@
 #
 # Keys must be `Hashable` (to choose a bucket) and `Equatable` (to resolve
 # collisions within a bucket) — `Hashable` deliberately does not imply
-# `Equatable`, so both bounds are named. The buckets use the built-in `List`.
+# `Equatable`, so both bounds are named. Buckets use the self-hosted `List`.
 
+from list import List
 from hashing import bucket_index
 
-struct HashSet[T: Hashable & Equatable & Copyable & Movable]:
+struct HashSet[T: Hashable & Equatable & Copyable & Movable](Copyable):
     var buckets: List[List[Self.T]]
     var nbuckets: Int
     var count: Int
@@ -25,6 +26,14 @@ struct HashSet[T: Hashable & Equatable & Copyable & Movable]:
         while i < self.nbuckets:
             self.buckets.append(List[Self.T]())
             i = i + 1
+
+    def __init__(out self, *, copy: Self):
+        self.buckets = List[List[Self.T]](copy: copy.buckets)
+        self.nbuckets = copy.nbuckets
+        self.count = copy.count
+
+    def copy(self) -> Self:
+        return HashSet[Self.T](copy: self)
 
     def contains(self, key: Self.T) -> Bool:
         var idx: Int = bucket_index(key, self.nbuckets)

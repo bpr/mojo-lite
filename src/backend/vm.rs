@@ -28,7 +28,7 @@
 
 use super::Backend;
 use crate::ast::{Expr, ExprKind, PrefixOp, Stmt, Type};
-use crate::checker::{ArgSlot, match_call_slots};
+use crate::checker::{ArgSlot, CallVariadics, match_call_slots};
 use crate::error::RuntimeError;
 use crate::hir::VarId;
 use crate::mir::{Const, MirBlock, MirInstr, MirPlace, MirProgram, MirTerm, Proj, Reg};
@@ -84,6 +84,8 @@ struct FnSig {
     /// Where the collected `*args` list belongs among source parameters. For a
     /// signature like `def f(a, *xs, b)`, this is `Some(1)`.
     variadic_index: Option<usize>,
+    kw_variadic: Option<Type>,
+    kw_variadic_index: Option<usize>,
     /// Indexes into the regular-parameter list.
     positional_only: Option<usize>,
     keyword_only: Option<usize>,
@@ -441,6 +443,53 @@ impl VmBackend {
         Ok(())
     }
 
+    /// Store a value through any currently supported place shape. A final index
+    /// into an arena pointer writes the heap; a final index into a user struct
+    /// dispatches `__setitem__`; ordinary slots, fields, built-in lists, tuples,
+    /// and SIMD lanes use `store_place`. Shared by MIR stores and mut-self
+    /// write-back so `self.buckets[i].append(v)` follows the same path as
+    /// `self.buckets[i] = row`.
+    fn store_at_place(
+        &mut self,
+        prog: &Prog,
+        place: &MirPlace,
+        value: Value,
+        regs: &[Value],
+        vars: &mut [Value],
+    ) -> Result<(), RuntimeError> {
+        enum Target {
+            Pointer(usize, Reg),
+            StructIndex(MirPlace, Reg),
+            Ordinary,
+        }
+        let target = if let Some((Proj::Index(index), prefix)) = place.proj.split_last() {
+            let parent = MirPlace {
+                root: place.root,
+                proj: prefix.to_vec(),
+            };
+            match nav_mut(vars, regs, &parent)? {
+                Value::Pointer(base) => Target::Pointer(*base, *index),
+                Value::Struct { .. } => Target::StructIndex(parent, *index),
+                _ => Target::Ordinary,
+            }
+        } else {
+            Target::Ordinary
+        };
+        match target {
+            Target::Pointer(base, index) => {
+                let offset = value_as_index(&regs[index.0 as usize])?;
+                let slot = self.heap_index(base, offset)?;
+                self.heap[slot] = value;
+                Ok(())
+            }
+            Target::StructIndex(parent, index) => {
+                let index = regs[index.0 as usize].clone();
+                self.store_index_dunder(prog, &parent, index, value, regs, vars)
+            }
+            Target::Ordinary => store_place(vars, regs, place, value),
+        }
+    }
+
     /// Construct a struct via a hand-written `def __init__(out self, …)`: build an
     /// uninitialized `self` skeleton (fields = `None` placeholders, value parameters
     /// reified), run `__init__(self, args…)`, and return the initialized `self`
@@ -639,7 +688,12 @@ impl VmBackend {
             Value::Pointer(b) => {
                 let off = value_as_index(&regs[ireg.0 as usize])?;
                 let i = self.heap_index(*b, off)?;
-                Ok(Some(self.heap[i].clone()))
+                let value = self.heap[i].clone();
+                Ok(Some(if self.has_copyinit {
+                    self.clone_value(prog, &value)?
+                } else {
+                    value
+                }))
             }
             _ => Ok(None),
         }
@@ -669,7 +723,7 @@ impl VmBackend {
         // Order the arguments into parameter slots (filling defaults/keywords),
         // keeping the slot map so each parameter's source argument is known.
         let (bound, slots) = match prog.sigs.get(name) {
-            Some(sig) => bind_args(name, sig, argv, kwargs)?,
+            Some(sig) => self.bind_for_call(prog, name, sig, argv, kwargs)?,
             None => {
                 let slots = (0..argv.len()).map(ArgSlot::Positional).collect();
                 (argv, slots)
@@ -698,6 +752,48 @@ impl VmBackend {
             }
         }
         Ok(ret)
+    }
+
+    fn bind_for_call(
+        &mut self,
+        prog: &Prog,
+        name: &str,
+        sig: &FnSig,
+        argv: Vec<Value>,
+        kwargs: Vec<(String, Value)>,
+    ) -> Result<(Vec<Value>, Vec<ArgSlot>), RuntimeError> {
+        let collected: Vec<(String, Value)> = if sig.kw_variadic.is_some() {
+            kwargs
+                .iter()
+                .filter(|(key, _)| !sig.param_names.contains(key))
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let (mut bound, slots) = bind_args(name, sig, argv, kwargs)?;
+        if let Some(index) = sig.kw_variadic_index {
+            bound[index] = self.make_kwargs_dict(prog, collected)?;
+        }
+        Ok((bound, slots))
+    }
+
+    fn make_kwargs_dict(
+        &mut self,
+        prog: &Prog,
+        entries: Vec<(String, Value)>,
+    ) -> Result<Value, RuntimeError> {
+        let mut dict = self.construct_via_init(prog, "HashDict", None, Vec::new(), &[])?;
+        let fname = prog.overload_name("HashDict.__setitem__", 2);
+        let fidx = prog.index_of(&fname).ok_or_else(|| {
+            RuntimeError::Unsupported("vm: kwargs HashDict has no __setitem__".to_string())
+        })?;
+        for (key, value) in entries {
+            let (_, frame) =
+                self.call_frame(prog, fidx, vec![dict, Value::Str(key), value], &[])?;
+            dict = frame.into_iter().next().unwrap_or(Value::None);
+        }
+        Ok(dict)
     }
 
     /// Execute one straight-line MIR instruction against the current frame.
@@ -854,7 +950,12 @@ impl VmBackend {
                         let b = *b;
                         let off = value_as_index(&regs[index.0 as usize])?;
                         let i = self.heap_index(b, off)?;
-                        regs[dest.0 as usize] = self.heap[i].clone();
+                        let value = self.heap[i].clone();
+                        regs[dest.0 as usize] = if self.has_copyinit {
+                            self.clone_value(prog, &value)?
+                        } else {
+                            value
+                        };
                     }
                     _ => {
                         let idx = value_as_index(&regs[index.0 as usize])?;
@@ -900,40 +1001,7 @@ impl VmBackend {
             }
             MirInstr::Store { place, src } => {
                 let v = regs[src.0 as usize].clone();
-                // Classify a projected `container[i] = v` by the container's runtime
-                // type: a heap pointer writes the arena; a user struct dispatches
-                // `__setitem__` (mut-self write-back); anything else (a slot / List /
-                // SIMD lane) goes through `store_place`.
-                enum StoreTarget {
-                    Ptr(usize, Reg),
-                    StructIdx(MirPlace, Reg),
-                }
-                let target = if let Some((Proj::Index(ireg), prefix)) = place.proj.split_last() {
-                    let parent = MirPlace {
-                        root: place.root,
-                        proj: prefix.to_vec(),
-                    };
-                    let ireg = *ireg;
-                    match nav_mut(vars, regs, &parent)? {
-                        Value::Pointer(b) => Some(StoreTarget::Ptr(*b, ireg)),
-                        Value::Struct { .. } => Some(StoreTarget::StructIdx(parent, ireg)),
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-                match target {
-                    Some(StoreTarget::Ptr(base, ireg)) => {
-                        let off = value_as_index(&regs[ireg.0 as usize])?;
-                        let i = self.heap_index(base, off)?;
-                        self.heap[i] = v;
-                    }
-                    Some(StoreTarget::StructIdx(parent, ireg)) => {
-                        let idx = regs[ireg.0 as usize].clone();
-                        self.store_index_dunder(prog, &parent, idx, v, regs, vars)?;
-                    }
-                    None => store_place(vars, regs, place, v)?,
-                }
+                self.store_at_place(prog, place, v, regs, vars)?;
             }
             MirInstr::LoadPlace { dest, place } => {
                 // The read half of `c[i] += e` on a user struct goes through
@@ -1315,7 +1383,7 @@ impl VmBackend {
                 // Bind ordinary arguments through the same signature metadata as
                 // free functions, then prepend `self` in frame slot zero.
                 let (bound, slots) = match prog.sigs.get(&fname) {
-                    Some(signature) => bind_args(&fname, signature, args, kwargs)?,
+                    Some(signature) => self.bind_for_call(prog, &fname, signature, args, kwargs)?,
                     None => {
                         let slots = (0..args.len()).map(ArgSlot::Positional).collect();
                         (args, slots)
@@ -1359,7 +1427,7 @@ impl VmBackend {
                     d.mut_self_methods.contains(key)
                 });
                 if is_mut && let Some(place) = recv_place {
-                    *nav_mut(vars, regs, place)? = frame_vars[0].clone();
+                    self.store_at_place(prog, place, frame_vars[0].clone(), regs, vars)?;
                 }
                 Ok(ret)
             }
@@ -1537,7 +1605,7 @@ impl VmBackend {
                     // defaults, collect `*args`) when a signature is known; else a
                     // plain positional call.
                     let bound = match prog.sigs.get(name) {
-                        Some(sig) => bind_args(name, sig, args, kwargs)?.0,
+                        Some(sig) => self.bind_for_call(prog, name, sig, args, kwargs)?.0,
                         None => args,
                     };
                     // Reify the function's value parameters (`doubled[21]()`): pair
@@ -1648,6 +1716,8 @@ fn build_sigs(declarations: &crate::mir::MirDeclarations) -> HashMap<String, FnS
                     required: declaration.required.clone(),
                     variadic: declaration.variadic.clone(),
                     variadic_index: declaration.variadic_index,
+                    kw_variadic: declaration.kw_variadic.clone(),
+                    kw_variadic_index: declaration.kw_variadic_index,
                     positional_only: declaration.positional_only,
                     keyword_only: declaration.keyword_only,
                     param_decls: declaration.param_decls.clone(),
@@ -1686,16 +1756,20 @@ fn bind_args(
     kwargs: Vec<(String, Value)>,
 ) -> Result<(Vec<Value>, Vec<ArgSlot>), RuntimeError> {
     let kw_names: Vec<&str> = kwargs.iter().map(|(n, _)| n.as_str()).collect();
-    let (slots, overflow) = match_call_slots(
+    let matched = match_call_slots(
         &sig.param_names,
         &sig.required,
         sig.positional_only,
         sig.keyword_only,
         argv.len(),
         &kw_names,
-        sig.variadic.is_some(),
+        CallVariadics {
+            positional: sig.variadic.is_some(),
+            keyword: sig.kw_variadic.is_some(),
+        },
     )
     .map_err(|e| e.into_runtime_error(name))?;
+    let (slots, overflow) = (matched.slots, matched.positional_overflow);
 
     let mut regular_values = Vec::with_capacity(slots.len());
     for (i, slot) in slots.iter().enumerate() {
@@ -1730,6 +1804,11 @@ fn bind_args(
     } else {
         (regular_values, slots)
     };
+    let (mut out, mut frame_slots) = (out, frame_slots);
+    if let Some(index) = sig.kw_variadic_index {
+        out.insert(index, Value::None);
+        frame_slots.insert(index, ArgSlot::Default);
+    }
     Ok((out, frame_slots))
 }
 

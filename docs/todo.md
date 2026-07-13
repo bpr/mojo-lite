@@ -10,31 +10,10 @@ Tasks are grouped in the same approximate dependency order as the roadmap.
 
 ## Self-Hosted Collections
 
-### Nested self-hosted lists
+### HashSet growth and rehashing
 
-Make `std.collections.list.List[List[T]]` work as the bucket-array representation
-inside `std.collections.hashset`. Remove the remaining reliance on the built-in
-`List` behavior from that path and retain collision tests for `Int` and `String`.
-
-### Dictionary views
-
-Design key, value, and item views without exposing `_DictEntry` as public API.
-Wait until the `Indexer` and iterator associated-result design can state each
-view's element type cleanly.
-
-### Hash-backed dictionary
-
-Add a separate hash-backed dictionary after nested self-hosted lists are stable.
-Use the list-backed `Dict` as the behavior oracle for insertion, overwrite,
-missing keys, iteration, copying, and value semantics. Keep collision resolution
-and resizing explicit in tests.
-
-### Keyword-map value
-
-Determine whether the self-hosted dictionary is a suitable runtime value for
-`**kwargs`, including key ownership, argument ordering, duplicate detection, and
-write-back restrictions. Implement `**kwargs` only after this representation is
-settled.
+Port `HashDict`'s explicit bucket growth to the self-hosted `HashSet`; retain
+collision behavior and deep-copy semantics while rebuilding nested-list buckets.
 
 ## Checked Semantic Data
 

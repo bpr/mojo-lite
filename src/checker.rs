@@ -321,6 +321,9 @@ pub struct Checker {
     /// overload set. Interior mutability keeps expression inference usable from
     /// read-only helper methods while still recording resolution facts.
     overload_targets: RefCell<HashMap<Span, String>>,
+    /// Free-function `**kwargs` collectors, keyed by source function name. The
+    /// stored type is the homogeneous value element type.
+    kw_collectors: RefCell<HashMap<String, Ty>>,
 }
 
 impl Checker {
@@ -338,6 +341,7 @@ impl Checker {
             comptimes: HashMap::new(),
             self_mutable: false,
             overload_targets: RefCell::new(HashMap::new()),
+            kw_collectors: RefCell::new(HashMap::new()),
         }
     }
 
@@ -1201,6 +1205,7 @@ impl Checker {
                     *keyword_only,
                     false,
                     false,
+                    false,
                 ) {
                     return Err(TypeError::Unsupported(feature.to_string()));
                 }
@@ -1209,6 +1214,14 @@ impl Checker {
                 let variadic_idx = params
                     .iter()
                     .position(|p| p.kind == crate::ast::ParamKind::Variadic);
+                let kw_variadic_idx = params
+                    .iter()
+                    .position(|p| p.kind == crate::ast::ParamKind::KwVariadic);
+                if kw_variadic_idx.is_some() && !type_params.is_empty() {
+                    return Err(TypeError::Unsupported(
+                        "generic functions with **kwargs".to_string(),
+                    ));
+                }
                 // Regular (non-variadic) parameters, over which arity is computed.
                 let regular: Vec<&crate::ast::FnParam> = params
                     .iter()
@@ -1237,6 +1250,11 @@ impl Checker {
                         return Err(e);
                     }
                 };
+                if let Some(index) = kw_variadic_idx {
+                    self.kw_collectors
+                        .borrow_mut()
+                        .insert(name.clone(), param_tys[index].clone());
+                }
 
                 // A default value must fit its parameter's type.
                 for (p, pty) in params.iter().zip(&param_tys) {
@@ -1319,16 +1337,20 @@ impl Checker {
                     for (param, ty) in params.iter().zip(&param_tys) {
                         // A `*args` parameter is a `List[element]` inside the body;
                         // a regular parameter keeps its declared type.
-                        let bind_ty = if param.kind == crate::ast::ParamKind::Variadic {
-                            Ty::List(Box::new(ty.clone()))
-                        } else {
-                            ty.clone()
+                        let bind_ty = match param.kind {
+                            crate::ast::ParamKind::Variadic => Ty::List(Box::new(ty.clone())),
+                            crate::ast::ParamKind::KwVariadic => Ty::Struct(
+                                "HashDict".to_string(),
+                                vec![TyArg::Ty(Ty::String), TyArg::Ty(ty.clone())],
+                            ),
+                            crate::ast::ParamKind::Regular => ty.clone(),
                         };
                         // Duplicate parameter names are a redeclaration.
                         result = self.declare_with_mutability(
                             &param.name,
                             bind_ty,
-                            parameter_is_writable(param.convention),
+                            param.kind == crate::ast::ParamKind::KwVariadic
+                                || parameter_is_writable(param.convention),
                         );
                         if result.is_err() {
                             break;
@@ -1591,6 +1613,7 @@ impl Checker {
         _keyword_only: Option<usize>,
         flag_defaults: bool,
         flag_variadic: bool,
+        flag_kw_variadic: bool,
     ) -> Option<&'static str> {
         use crate::ast::{ArgConvention, ParamKind};
         if flag_defaults && params.iter().any(|p| p.default.is_some()) {
@@ -1599,7 +1622,7 @@ impl Checker {
         if flag_variadic && params.iter().any(|p| p.kind == ParamKind::Variadic) {
             return Some("variadic '*args' parameters");
         }
-        if params.iter().any(|p| p.kind == ParamKind::KwVariadic) {
+        if flag_kw_variadic && params.iter().any(|p| p.kind == ParamKind::KwVariadic) {
             return Some("variadic '**kwargs' parameters");
         }
         // `owned`/`read` bind by value; `mut`/`ref` are references whose mutations
@@ -1706,6 +1729,7 @@ impl Checker {
                     &m.params,
                     m.positional_only,
                     m.keyword_only,
+                    true,
                     true,
                     true,
                 ) {
@@ -2009,6 +2033,7 @@ impl Checker {
                 m.keyword_only,
                 false,
                 false,
+                true,
             )
         {
             return Err(TypeError::Unsupported(feature.to_string()));
@@ -3217,16 +3242,20 @@ impl Checker {
         kwargs: &[crate::ast::KwArg],
     ) -> Result<(usize, Vec<ArgSlot>), TypeError> {
         let keyword_names: Vec<_> = kwargs.iter().map(|arg| arg.name.as_str()).collect();
-        let (slots, overflow) = match_call_slots(
+        let matched = match_call_slots(
             &signature.names,
             &signature.required,
             signature.positional_only,
             signature.keyword_only,
             args.len(),
             &keyword_names,
-            variadic.is_some(),
+            CallVariadics {
+                positional: variadic.is_some(),
+                keyword: false,
+            },
         )
         .map_err(|error| error.into_type_error("method"))?;
+        let (slots, overflow) = (matched.slots, matched.positional_overflow);
         let mut score = 0;
         for (index, slot) in slots.iter().enumerate() {
             let expression = match slot {
@@ -4015,16 +4044,25 @@ impl Checker {
         // each supplied argument coerces to its parameter's type (an unfilled slot
         // uses the default, already type-checked at the definition site).
         let kw_names: Vec<&str> = kwargs.iter().map(|k| k.name.as_str()).collect();
-        let (slots, overflow) = match_call_slots(
+        let kw_collector = self.kw_collectors.borrow().get(name).cloned();
+        let matched = match_call_slots(
             &names,
             &required,
             positional_only,
             keyword_only,
             args.len(),
             &kw_names,
-            variadic.is_some(),
+            CallVariadics {
+                positional: variadic.is_some(),
+                keyword: kw_collector.is_some(),
+            },
         )
         .map_err(|e| e.into_type_error(name))?;
+        let (slots, overflow, kw_overflow) = (
+            matched.slots,
+            matched.positional_overflow,
+            matched.keyword_overflow,
+        );
         let mut score = 0;
         for (i, slot) in slots.iter().enumerate() {
             let arg = match slot {
@@ -4073,6 +4111,21 @@ impl Checker {
                 }
             }
         }
+        if let Some(elem) = kw_collector {
+            for index in kw_overflow {
+                let found = self.infer(&kwargs[index].value)?;
+                if !coerces(&found, &elem) {
+                    return Err(TypeError::TypeMismatch {
+                        expected: elem.to_string(),
+                        found: found.to_string(),
+                        context: format!(
+                            "keyword '{}' collected by '{}'",
+                            kwargs[index].name, name
+                        ),
+                    });
+                }
+            }
+        }
 
         // Borrow check (mutable-XOR-shared), root-sensitive: within one call a
         // variable borrowed exclusively (`mut`/`ref`) or moved (`^`) may not be
@@ -4108,16 +4161,20 @@ impl Checker {
             unreachable!("infer_generic_call requires a generic function")
         };
         let kw_names: Vec<&str> = kwargs.iter().map(|k| k.name.as_str()).collect();
-        let (slots, overflow) = match_call_slots(
+        let matched = match_call_slots(
             names,
             required,
             *positional_only,
             *keyword_only,
             args.len(),
             &kw_names,
-            variadic.is_some(),
+            CallVariadics {
+                positional: variadic.is_some(),
+                keyword: false,
+            },
         )
         .map_err(|e| e.into_type_error(name))?;
+        let (slots, overflow) = (matched.slots, matched.positional_overflow);
         let mut use_params = Vec::new();
         let mut arg_tys = Vec::new();
         for (i, slot) in slots.iter().enumerate() {
@@ -4929,6 +4986,17 @@ impl MatchError {
 /// only possible when `has_variadic`). Shared by the checker (over argument
 /// *types*) and the evaluator (over argument *values*) so the two agree.
 /// `required[i]` says whether regular parameter `i` must be bound.
+pub(crate) struct CallVariadics {
+    pub positional: bool,
+    pub keyword: bool,
+}
+
+pub(crate) struct CallSlots {
+    pub slots: Vec<ArgSlot>,
+    pub positional_overflow: Vec<usize>,
+    pub keyword_overflow: Vec<usize>,
+}
+
 pub(crate) fn match_call_slots(
     param_names: &[String],
     required: &[bool],
@@ -4936,12 +5004,12 @@ pub(crate) fn match_call_slots(
     keyword_only: Option<usize>,
     npos: usize,
     kw_names: &[&str],
-    has_variadic: bool,
-) -> Result<(Vec<ArgSlot>, Vec<usize>), MatchError> {
+    variadics: CallVariadics,
+) -> Result<CallSlots, MatchError> {
     let nparams = param_names.len();
     debug_assert_eq!(required.len(), nparams);
     let positional_limit = keyword_only.unwrap_or(nparams).min(nparams);
-    if npos > positional_limit && !has_variadic {
+    if npos > positional_limit && !variadics.positional {
         return Err(MatchError::TooManyPositional {
             expected: positional_limit,
             got: npos + kw_names.len(),
@@ -4950,20 +5018,24 @@ pub(crate) fn match_call_slots(
     // Positional arguments beyond the positional regular parameters overflow into
     // `*args`; regular params at/after `keyword_only` must be supplied by name.
     let n_regular_pos = npos.min(positional_limit);
-    let overflow: Vec<usize> = if has_variadic {
+    let overflow: Vec<usize> = if variadics.positional {
         (positional_limit..npos).collect()
     } else {
         Vec::new()
     };
     let mut slots: Vec<Option<ArgSlot>> = vec![None; nparams];
+    let mut kw_overflow = Vec::new();
     for (i, s) in slots.iter_mut().enumerate().take(n_regular_pos) {
         *s = Some(ArgSlot::Positional(i));
     }
     for (j, kwname) in kw_names.iter().enumerate() {
-        let idx = param_names
-            .iter()
-            .position(|n| n == kwname)
-            .ok_or_else(|| MatchError::UnknownKeyword((*kwname).to_string()))?;
+        let Some(idx) = param_names.iter().position(|n| n == kwname) else {
+            if variadics.keyword {
+                kw_overflow.push(j);
+                continue;
+            }
+            return Err(MatchError::UnknownKeyword((*kwname).to_string()));
+        };
         if positional_only.is_some_and(|limit| idx < limit) {
             return Err(MatchError::PositionalOnly((*kwname).to_string()));
         }
@@ -4980,7 +5052,11 @@ pub(crate) fn match_call_slots(
             None => out.push(ArgSlot::Default),
         }
     }
-    Ok((out, overflow))
+    Ok(CallSlots {
+        slots: out,
+        positional_overflow: overflow,
+        keyword_overflow: kw_overflow,
+    })
 }
 
 pub(crate) fn regular_marker_index(
