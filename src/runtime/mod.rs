@@ -56,8 +56,7 @@ pub enum Value {
     /// A **tombstone** left when a value is moved out of a variable slot (`b = a^`)
     /// in the VM backend: the source slot holds `Moved` afterward, so a
     /// use-after-move surfaces as a loud runtime error (a defensive check — the
-    /// ownership analysis already rejects it statically). Never produced by the
-    /// tree-walker (which copies), and a no-op to drop.
+    /// ownership analysis already rejects it statically), and a no-op to drop.
     Moved,
 }
 
@@ -361,8 +360,8 @@ fn as_num(v: &Value) -> Option<Num> {
 }
 
 /// Apply a (strict) binary operator to two already-evaluated values — the shared
-/// Apply a unary operator to an already-evaluated operand. Shared by the tree
-/// evaluator's `eval_prefix` and the VM backend, so the two agree on semantics.
+/// Apply a unary operator to an already-evaluated operand for VM execution and
+/// VM-backed compile-time evaluation.
 pub(crate) fn apply_prefix(op: PrefixOp, value: Value) -> Result<Value, RuntimeError> {
     match (op, value) {
         (PrefixOp::Neg, Value::Int(n)) => Ok(Value::Int(-n)),
@@ -446,7 +445,11 @@ fn int_op(op: InfixOp, x: i64, y: i64) -> Result<Value, RuntimeError> {
         Ge => Value::Bool(x >= y),
         Eq => Value::Bool(x == y),
         Ne => Value::Bool(x != y),
-        Div | And | Or | In | NotIn => unreachable!("handled before numeric dispatch"),
+        Div | And | Or | In | NotIn => {
+            return Err(RuntimeError::TypeError(format!(
+                "operator '{op:?}' is invalid for integer dispatch"
+            )));
+        }
     })
 }
 
@@ -470,7 +473,11 @@ fn uint_op(op: InfixOp, x: u64, y: u64) -> Result<Value, RuntimeError> {
         Ge => Value::Bool(x >= y),
         Eq => Value::Bool(x == y),
         Ne => Value::Bool(x != y),
-        Div | And | Or | In | NotIn => unreachable!("handled before numeric dispatch"),
+        Div | And | Or | In | NotIn => {
+            return Err(RuntimeError::TypeError(format!(
+                "operator '{op:?}' is invalid for unsigned dispatch"
+            )));
+        }
     })
 }
 
@@ -490,7 +497,9 @@ fn float_op(op: InfixOp, x: f64, y: f64) -> Result<Value, RuntimeError> {
         Eq => Value::Bool(x == y),
         Ne => Value::Bool(x != y),
         Div | Shl | Shr | BitAnd | BitOr | And | Or | In | NotIn => {
-            unreachable!("handled before numeric dispatch")
+            return Err(RuntimeError::TypeError(format!(
+                "operator '{op:?}' is invalid for float dispatch"
+            )));
         }
     })
 }
@@ -887,11 +896,9 @@ fn value_to_float(v: &Value) -> Result<f64, RuntimeError> {
 
 // --- Shared numeric/utility built-ins (value level) -------------------------
 //
-// These operate on already-evaluated `Value`s so both the tree-walker
-// (`eval_*`, which evaluate their argument expressions first) and the VM backend
-// (`call_named`, which has the values in registers) apply identical semantics —
-// no second copy of the rules. The checker guarantees arity/typing, so these are
-// the runtime realization only.
+// These operate on already-evaluated `Value`s so ordinary VM execution and
+// VM-backed CTFE apply identical semantics. The checker guarantees arity and
+// typing; these functions are the runtime realization only.
 
 /// `abs(x)`: absolute value of a numeric (`UInt` is already non-negative).
 pub(crate) fn builtin_abs(v: Value) -> Result<Value, RuntimeError> {
@@ -1072,8 +1079,7 @@ fn value_to_bool_lane(v: &Value) -> Result<bool, RuntimeError> {
 /// Read lane `i` of a SIMD as a width-1 SIMD (scalar) of the same dtype — the
 /// shared core of `v[i]` reads and SIMD-lane read-modify-write.
 /// Build a SIMD value of `dtype`/`width` from element `values`: exactly `width`
-/// elements (one per lane) or a single element splatted to every lane. Shared by
-/// the tree evaluator and the VM's `MakeSimd`.
+/// elements (one per lane) or a single element splatted to every lane.
 pub(crate) fn simd_from_values(
     dtype: Dtype,
     width: usize,
@@ -1148,9 +1154,9 @@ fn simd_shape(v: &Value) -> Option<(Dtype, usize)> {
 /// mask. (The checker guarantees dtype/width agreement and operator validity.)
 pub(crate) fn simd_binop(op: InfixOp, l: &Value, r: &Value) -> Result<Value, RuntimeError> {
     use InfixOp::*;
-    let (dtype, width) = simd_shape(l)
-        .or_else(|| simd_shape(r))
-        .expect("a SIMD operand");
+    let (dtype, width) = simd_shape(l).or_else(|| simd_shape(r)).ok_or_else(|| {
+        RuntimeError::TypeError("SIMD dispatch requires at least one SIMD operand".to_string())
+    })?;
     let is_cmp = matches!(op, Eq | Ne | Lt | Gt | Le | Ge);
     match dtype {
         Dtype::Bool => {

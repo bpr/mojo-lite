@@ -19,382 +19,23 @@
 
 use crate::ast::{
     ArgConvention, Dtype, Expr, ExprKind, FnParam, InfixOp, ParamArg, ParamKind, PrefixOp, Stmt,
-    StmtKind, TStringPart, Type,
+    StmtKind, TStringPart, Type as SourceType,
 };
+use crate::call::{effective_keyword_only_index, regular_marker_index};
+use crate::checked::AnnotationSite;
 use crate::checked::{CheckedConst, CheckedProgram};
-use crate::checker::{effective_keyword_only_index, regular_marker_index};
-use crate::token::DUMMY_SPAN;
-use crate::types::Ty;
-use std::collections::HashSet;
-
-/// Whether an argument convention transfers ownership to the callee (`owned`, or
-/// the destructor's `deinit`).
-fn is_owned(c: &Option<ArgConvention>) -> bool {
-    matches!(c, Some(ArgConvention::Owned | ArgConvention::Deinit))
-}
-
-/// Whether a `try` region's statements contain a `break`/`continue` that **leaves**
-/// the region — targeting a loop *outside* it. Such an escape would need to name the
-/// outer loop's target block, which the self-contained mini-CFG region can't express
-/// (unlike a `return`, which surfaces as a `Flow::Return` the block driver handles).
-/// Nested loops absorb their own `break`/`continue` (tracked via `loop_depth`);
-/// nested `def`/`struct` bodies have their own control flow and are not scanned.
-fn region_crosses_control(body: &[Stmt]) -> bool {
-    fn walk(stmts: &[Stmt], loop_depth: usize) -> bool {
-        stmts.iter().any(|s| match &s.kind {
-            StmtKind::Break | StmtKind::Continue => loop_depth == 0,
-            StmtKind::If { branches, orelse } => {
-                branches.iter().any(|(_, b)| walk(b, loop_depth))
-                    || orelse.as_ref().is_some_and(|b| walk(b, loop_depth))
-            }
-            StmtKind::While { body, .. } | StmtKind::For { body, .. } => walk(body, loop_depth + 1),
-            StmtKind::Try {
-                body,
-                except,
-                orelse,
-                finalbody,
-            } => {
-                walk(body, loop_depth)
-                    || except.as_ref().is_some_and(|(_, b)| walk(b, loop_depth))
-                    || orelse.as_ref().is_some_and(|b| walk(b, loop_depth))
-                    || finalbody.as_ref().is_some_and(|b| walk(b, loop_depth))
-            }
-            _ => false,
-        })
-    }
-    walk(body, 0)
-}
-
-/// Whether an argument convention is a written-back reference (`mut`/`ref`).
-fn is_ref(c: &Option<ArgConvention>) -> bool {
-    matches!(c, Some(ArgConvention::Mut | ArgConvention::Ref))
-}
 use crate::hir::{self, Cfg, HirInstr, Terminator, VarId};
-use std::collections::HashMap;
+use crate::token::{DUMMY_SPAN, SourceSpan};
+use crate::types::Ty;
+use std::collections::{HashMap, HashSet};
 
-/// A virtual ("infinite") register — a fresh one per intermediate value (SSA-ish).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Reg(pub u32);
-
-/// Index of a basic block within a [`MirFunction`]'s `blocks`.
-pub type MirBlockId = usize;
-
-/// A source byte range `(start, end)` — re-exported from [`crate::token`], the
-/// canonical span type stamped by the parser onto every AST node.
-pub use crate::token::Span;
-
-/// How a variable is used at a given site (set from `^` and param conventions).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UseMode {
-    Copy,
-    Move,
-    BorrowShared,
-    BorrowMut,
-}
-
-/// A compile-time-known literal.
-#[derive(Debug, Clone)]
-pub enum Const {
-    Int(i64),
-    Float(f64),
-    Bool(bool),
-    Str(String),
-    None,
-}
-
-/// The callee of a `MirInstr::Call` — a function/struct-constructor/builtin name.
-/// (Resolution to a concrete target happens in the backend's assembler.)
-#[derive(Debug, Clone)]
-pub struct FuncRef(pub String);
-impl FuncRef {
-    pub fn named(name: &str) -> FuncRef {
-        FuncRef(name.to_string())
-    }
-}
-
-/// One step of a **place** projection: a field of a struct, or a subscript. A
-/// place is a *writable location* — a root variable followed by projections — as
-/// opposed to an rvalue (a computed register). This mirrors `rustc` MIR's
-/// `Place`/`Projection` split, and is what a write / read-modify-write targets.
-#[derive(Debug, Clone)]
-pub enum Proj {
-    Field(String),
-    Index(Reg), // the subscript index, flattened to a register (evaluated once)
-}
-
-/// A writable location: a root variable plus a chain of projections
-/// (`p.items[i].x` = root `p`, proj `[Field("items"), Index(i), Field("x")]`).
-#[derive(Debug, Clone)]
-pub struct MirPlace {
-    pub root: VarId,
-    pub proj: Vec<Proj>,
-}
-
-/// A single three-address instruction. Each value-producing instruction writes a
-/// fresh `dest` register; control flow lives in the block's [`MirTerm`].
-#[derive(Debug, Clone)]
-pub enum MirInstr {
-    Const {
-        dest: Reg,
-        k: Const,
-    },
-    /// `x`, `x^`, `borrow x`, … — a use of a variable, tagged with how (`mode`).
-    UseVar {
-        dest: Reg,
-        var: VarId,
-        mode: UseMode,
-    },
-    /// A **partial move** `p.a^` — transfer one sub-place (a pure field chain,
-    /// no dynamic index) out of a variable, reading its value into `dest`. The
-    /// ownership analysis tracks this at place granularity (moving `p.a` leaves
-    /// `p.b` usable); at runtime the field slot is left a tombstone so a later
-    /// drop of the whole struct skips it (no double-drop). Whole-variable moves
-    /// stay `UseVar { mode: Move }`; an indexed transfer falls back to a plain
-    /// read (the move is not modeled — conservative for dynamic indices).
-    MovePlace {
-        dest: Reg,
-        place: MirPlace,
-    },
-    /// `var := <register>` — (re)define a variable slot from a register (lowered
-    /// from a HIR `Bind`). The write paired with `UseVar`; Phase 4 reads it as a
-    /// dataflow *def* (transitions the var to `Owned`). `ty` is a declaration's
-    /// annotation (`var x: T = …`) so a backend can materialize a numeric literal
-    /// to `T` (the tree-walker's `coerce`); `None` = inferred `var`/reassignment,
-    /// which keeps the binding's existing type (`coerce_like`).
-    DefVar {
-        var: VarId,
-        src: Reg,
-        ty: Option<Type>,
-    },
-    UnOp {
-        op: PrefixOp,
-        dest: Reg,
-        a: Reg,
-    },
-    BinOp {
-        op: InfixOp,
-        dest: Reg,
-        a: Reg,
-        b: Reg,
-    },
-    /// A free-function / constructor / builtin call. `args` are the flattened
-    /// positional arguments; `kwargs` the keyword arguments (`name = value`). The
-    /// backend matches them to the callee's parameter slots (filling defaults,
-    /// collecting `*args`) via `checker::match_call_slots`.
-    /// A free-function call. `arg_places[i]` is `Some` when positional argument `i`
-    /// is a simple place (a variable or field chain, no dynamic index), so a
-    /// `mut`/`ref` parameter can write its final value back to the caller; `None`
-    /// otherwise (a temporary, or an indexed place).
-    Call {
-        dest: Reg,
-        func: FuncRef,
-        args: Vec<Reg>,
-        kwargs: Vec<(String, Reg)>,
-        arg_places: Vec<Option<MirPlace>>,
-        /// The supplied compile-time parameter arguments (`Name[param_args](args)`),
-        /// one entry per `[...]` slot: `Some(reg)` for a **value** parameter (a
-        /// comptime `Int` expression, flattened to a register) and `None` for a
-        /// **type** parameter (erased). The backend reifies the value arguments onto
-        /// a constructed struct's `value_params` (type parameters stay erased). Empty
-        /// for a plain call.
-        param_arg_regs: Vec<Option<Reg>>,
-    },
-    /// A method call `recv.method(args)`. `recv_place` is `Some` when the receiver
-    /// is a writable place (a variable / field-index chain), so a `mut self` method
-    /// or an in-place `List` mutator can write the updated receiver back; `None`
-    /// for a temporary receiver (a call result), on which only read-only methods
-    /// are valid (the checker guarantees this).
-    MethodCall {
-        dest: Reg,
-        recv: Reg,
-        method: String,
-        resolved: Option<String>,
-        args: Vec<Reg>,
-        kwargs: Vec<(String, Reg)>,
-        recv_place: Option<MirPlace>,
-        /// Like `Call::arg_places`: `arg_places[i]` is `Some` when ordinary
-        /// argument `i` is a simple place, so a method's `mut`/`ref` ordinary
-        /// parameter can write its final value back to the caller.
-        arg_places: Vec<Option<MirPlace>>,
-    },
-    /// Struct/field *read* `base.field` inside an rvalue (name-based; the backend
-    /// resolves layout). Field/index *writes* go through `Store`/a `MirPlace`.
-    GetField {
-        dest: Reg,
-        base: Reg,
-        field: String,
-    },
-    /// Subscript *read* `base[index]` (List/Tuple/SIMD lane) inside an rvalue.
-    Index {
-        dest: Reg,
-        base: Reg,
-        index: Reg,
-    },
-    /// Slice `object[lower:upper:step]` (List/String) → a new value. Each bound is
-    /// optional (absent = a direction-aware default).
-    Slice {
-        dest: Reg,
-        object: Reg,
-        lower: Option<Reg>,
-        upper: Option<Reg>,
-        step: Option<Reg>,
-    },
-    /// `place = src` — a write through a place (`p.x = e`, `xs[i] = e`, nested).
-    Store {
-        place: MirPlace,
-        src: Reg,
-    },
-    /// Read a place into a register — for a read-modify-write (`place OP= e`),
-    /// where the place (and its indices) must be evaluated exactly once.
-    LoadPlace {
-        dest: Reg,
-        place: MirPlace,
-    },
-    /// Aggregate construction from already-flattened element registers.
-    MakeList {
-        dest: Reg,
-        elems: Vec<Reg>,
-    },
-    MakeTuple {
-        dest: Reg,
-        elems: Vec<Reg>,
-    },
-    /// SIMD construction `SIMD[DType.<dt>, width](elems)` (or a scalar-alias like
-    /// `Int32(x)`). The element `dtype`/`width` — compile-time parameters the MIR
-    /// is otherwise untyped about — are resolved here at lowering; `elems` are the
-    /// lane values (exactly `width`, or one to splat).
-    MakeSimd {
-        dest: Reg,
-        dtype: Dtype,
-        width: usize,
-        elems: Vec<Reg>,
-    },
-    /// `raise <src>` — raise an error value. Propagates as an exceptional outcome
-    /// (the VM unwinds to the nearest enclosing [`MirInstr::Try`] handler).
-    Raise {
-        src: Reg,
-    },
-    /// A `try`/`except`/`else`/`finally` region, lowered structurally (mirroring the
-    /// tree-walker's `exec_try`). Each sub-part is a self-contained mini-CFG (a
-    /// `Vec<MirBlock>` with local block ids, entry = block 0) that **shares this
-    /// function's register and variable space** — so it addresses the same slots.
-    /// `handler` is `Some((error_var, body))` when there is an `except` clause (the
-    /// optional slot binds the caught error). `cleanup` lists the body-local
-    /// variables to drop when the body unwinds (the exceptional-edge cleanup).
-    Try {
-        body: Vec<MirBlock>,
-        handler: Option<(Option<VarId>, Vec<MirBlock>)>,
-        orelse: Option<Vec<MirBlock>>,
-        finalbody: Option<Vec<MirBlock>>,
-        cleanup: Vec<VarId>,
-    },
-    /// An ASAP destructor on a register (reserved for the future Op/assembler VM).
-    Drop {
-        reg: Reg,
-    },
-    /// Drop the value in a variable slot — spliced in by the Phase 4 liveness pass
-    /// at a variable's last use (ASAP destruction). Runs the value's `__del__` (and
-    /// its fields', in reverse order) and leaves the slot empty. A no-op for values
-    /// without a destructor, so it never changes observable behaviour except when a
-    /// struct defines `__del__`.
-    DropVar {
-        var: VarId,
-    },
-    /// A construct the MIR/backends don't lower yet (a `try` with its exceptional
-    /// edges, a nested declaration). Kept as an explicit node — rather than a
-    /// lowering-time `panic!` — so a backend can report a clean error instead of
-    /// crashing on an otherwise-valid program.
-    Unsupported(String),
-    /// Iterator protocol: normalize `iter` to an iterator (a user struct's
-    /// `__iter__()`); a no-op for a built-in `range`/`List`.
-    GetIter {
-        iter: VarId,
-    },
-    /// Iterator protocol (`for` loops): read whether the iterator variable `iter`
-    /// yields another element into `dest` (a `Bool`) — a pure read.
-    HasNext {
-        dest: Reg,
-        iter: VarId,
-    },
-    /// Iterator protocol: bind the current element into `dest` and advance the
-    /// iterator variable `iter` in place (a mutating read).
-    Next {
-        dest: Reg,
-        iter: VarId,
-    },
-}
-
-/// How a basic block hands off control. Block targets are indices into
-/// `MirFunction::blocks`; values are registers.
-#[derive(Debug, Clone)]
-pub enum MirTerm {
-    Jump(MirBlockId),
-    Branch {
-        cond: Reg,
-        then_b: MirBlockId,
-        else_b: MirBlockId,
-    },
-    Return(Option<Reg>),
-    /// Normal fall-through end of a `try` sub-region (see [`hir::Terminator::FallOff`]).
-    /// The VM's region runner reads it as "completed normally". Never appears in a
-    /// function body's blocks.
-    FallOff,
-    /// A `break`/`continue` inside a `try` region that targets an enclosing
-    /// **function** loop: `target` is that loop's exit/header block in the
-    /// *enclosing function*'s `blocks` (not the region's). The VM propagates it out
-    /// as a `Flow::Jump(target)` — running each `finally` on the way — until the
-    /// function driver jumps there. `cleanup` lists the region-body-local variables
-    /// to drop when this escape edge is taken (filled by drop elaboration).
-    EscapeJump {
-        target: MirBlockId,
-        cleanup: Vec<VarId>,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub struct MirBlock {
-    pub instrs: Vec<MirInstr>,
-    pub term: MirTerm,
-}
-
-#[derive(Debug)]
-pub struct MirFunction {
-    pub blocks: Vec<MirBlock>,
-    pub n_regs: u32,
-    /// Number of variable slots (the interner size). A frame allocates this many
-    /// var cells; `UseVar`/`DefVar` index into them.
-    pub n_vars: usize,
-    /// The name of each variable slot (`var_names[id]` is `VarId` `id`'s source
-    /// name; synthetic `$…` names for compiler temporaries). For diagnostics — the
-    /// ownership analysis names the offending variable.
-    pub var_names: Vec<String>,
-    /// Number of leading vars that are parameters (`vars[0..n_params]`), bound from
-    /// the call's arguments in declaration order — the VM call ABI.
-    pub n_params: usize,
-    /// The declared type of each parameter (same order/length as the params), so a
-    /// caller can `coerce` a numeric-literal argument to it — matching the
-    /// tree-walker, which coerces at param binding. Empty for `__toplevel__`.
-    pub param_types: Vec<Type>,
-    /// Whether each parameter is `owned` (the callee takes ownership, so it drops
-    /// the value — unlike a borrowed `read`/`mut` parameter). Same order as the
-    /// params; the caller transfers with `^`, so its own drop is skipped.
-    pub owned_params: Vec<bool>,
-    /// Whether each parameter is a `mut`/`ref` **reference** (its final value is
-    /// written back to the caller). `self` (handled via a method's `recv_place`) is
-    /// always `false` here. Same order as the params.
-    pub ref_params: Vec<bool>,
-    pub spans: SpanTable,
-}
-
-/// Maps each generated register to its source span and (if it names one) the
-/// origin variable — so borrow-checker diagnostics can point at real code.
-#[derive(Debug, Default)]
-pub struct SpanTable(pub HashMap<u32 /*reg*/, (Span, Option<VarId>)>);
+mod ir;
+pub use ir::*;
 
 /// An expression's source span, stamped by the parser (`ast::Expr.span`). Fed
 /// into the [`SpanTable`] so each temporary can be traced back to its origin.
-fn span(e: &Expr) -> Span {
-    e.span
+fn span(e: &Expr) -> SourceSpan {
+    e.source_span()
 }
 
 /// Resolve a `SIMD` dtype parameter argument (`DType.<name>`) to a [`Dtype`].
@@ -468,11 +109,11 @@ struct Flatten<'a> {
     /// unannotated lowering; normally overload_targets gives the exact callee.
     overloads: crate::symbol::OverloadSets,
     /// Checker-selected lowered callee names for overloaded call expressions.
-    overload_targets: HashMap<Span, String>,
+    overload_targets: HashMap<SourceSpan, String>,
 }
 
 impl Flatten<'_> {
-    fn fresh(&mut self, span: Span, origin: Option<VarId>) -> Reg {
+    fn fresh(&mut self, span: SourceSpan, origin: Option<VarId>) -> Reg {
         let r = self.next_reg;
         self.next_reg += 1;
         self.f.spans.0.insert(r, (span, origin));
@@ -532,7 +173,7 @@ impl Flatten<'_> {
     /// merge block. (Preserving the short-circuit — vs an eager `BinOp` — matters
     /// both for observable side effects and for Phase 4 ownership, where a moved
     /// operand on the not-taken side must not count as moved.)
-    fn short_circuit(&mut self, op: InfixOp, a: &Expr, b: &Expr, span: Span) -> Reg {
+    fn short_circuit(&mut self, op: InfixOp, a: &Expr, b: &Expr, span: SourceSpan) -> Reg {
         let ra = self.expr(a);
         let result = self.fresh_var();
         // Seed the result with the left operand's value: for `and` a false `ra`
@@ -540,7 +181,7 @@ impl Flatten<'_> {
         self.emit(MirInstr::DefVar {
             var: result,
             src: ra,
-            ty: None,
+            source_annotation: None,
         });
 
         let rhs_blk = self.new_block();
@@ -561,7 +202,7 @@ impl Flatten<'_> {
         self.emit(MirInstr::DefVar {
             var: result,
             src: rb,
-            ty: None,
+            source_annotation: None,
         });
         self.f.blocks[self.cur].term = MirTerm::Jump(merge_blk);
 
@@ -577,7 +218,7 @@ impl Flatten<'_> {
 
     /// Lower a ternary `then_e if cond else else_e` to a value: branch on `cond`,
     /// each arm writing the result variable, then read it at the merge.
-    fn ternary(&mut self, cond: &Expr, then_e: &Expr, else_e: &Expr, sp: Span) -> Reg {
+    fn ternary(&mut self, cond: &Expr, then_e: &Expr, else_e: &Expr, sp: SourceSpan) -> Reg {
         let rc = self.expr(cond);
         let result = self.fresh_var();
         let then_blk = self.new_block();
@@ -593,7 +234,7 @@ impl Flatten<'_> {
         self.emit(MirInstr::DefVar {
             var: result,
             src: rt,
-            ty: None,
+            source_annotation: None,
         });
         self.f.blocks[self.cur].term = MirTerm::Jump(merge_blk);
         self.cur = else_blk;
@@ -601,7 +242,7 @@ impl Flatten<'_> {
         self.emit(MirInstr::DefVar {
             var: result,
             src: re,
-            ty: None,
+            source_annotation: None,
         });
         self.f.blocks[self.cur].term = MirTerm::Jump(merge_blk);
         self.cur = merge_blk;
@@ -618,13 +259,13 @@ impl Flatten<'_> {
     /// evaluated **once**, left to right; a false link short-circuits the rest (the
     /// remaining operands are not evaluated). The result variable holds the last
     /// comparison evaluated (which is `false` on the link that failed).
-    fn compare_chain(&mut self, first: &Expr, rest: &[(InfixOp, Expr)], sp: Span) -> Reg {
+    fn compare_chain(&mut self, first: &Expr, rest: &[(InfixOp, Expr)], sp: SourceSpan) -> Reg {
         let result = self.fresh_var();
         let merge_blk = self.new_block();
         let mut prev = self.expr(first);
         for (i, (op, operand)) in rest.iter().enumerate() {
             let cur = self.expr(operand);
-            let cmp = self.fresh(sp, None);
+            let cmp = self.fresh(sp.clone(), None);
             self.emit(MirInstr::BinOp {
                 op: *op,
                 dest: cmp,
@@ -634,7 +275,7 @@ impl Flatten<'_> {
             self.emit(MirInstr::DefVar {
                 var: result,
                 src: cmp,
-                ty: None,
+                source_annotation: None,
             });
             if i + 1 == rest.len() {
                 self.f.blocks[self.cur].term = MirTerm::Jump(merge_blk);
@@ -736,7 +377,7 @@ impl Flatten<'_> {
             }
 
             // --- Calls / access ------------------------------------------------
-            // NOTE: keyword args + default-slot matching (checker::match_call_slots)
+            // NOTE: keyword args + default-slot matching (`call::match_call_slots`)
             // are a follow-up; the checker has already validated them, so only the
             // positional `args` are flattened here.
             ExprKind::Call {
@@ -758,7 +399,7 @@ impl Flatten<'_> {
                     return self.lower_nested_call(e, &info, args);
                 }
                 // Compile-time parameter arguments (`Name[param_args](...)`),
-                // evaluated before the call arguments (matching the tree-walker): a
+                // evaluated before ordinary call arguments: a
                 // **value** parameter is a comptime `Int` expression flattened to a
                 // register; a **type** parameter is erased (`None`).
                 let param_arg_regs: Vec<Option<Reg>> = param_args
@@ -908,10 +549,8 @@ impl Flatten<'_> {
                 d
             }
 
-            // The walrus `:=` type-checks (the checker passes it through for the
-            // evaluator to flag), so it *can* reach MIR — lower it to a clean
-            // `Unsupported` (never a panic), so the compiler path and the ownership
-            // analysis handle it gracefully while the evaluator reports it.
+            // Walrus `:=` reaches MIR after type checking. Preserve an explicit
+            // unsupported boundary rather than assigning accidental semantics.
             ExprKind::Named { .. } => {
                 let d = self.fresh(span(e), None);
                 self.emit(MirInstr::Unsupported("the walrus operator ':='".into()));
@@ -957,7 +596,16 @@ impl Flatten<'_> {
             | ExprKind::BraceLit(_)
             | ExprKind::TypeApply { .. }
             | ExprKind::TString { .. } => {
-                unreachable!("parse-only expression rejected by the checker before MIR: {e:?}")
+                let dest = self.fresh(span(e), None);
+                self.emit(MirInstr::Unsupported(format!(
+                    "unchecked expression reached MIR lowering: {:?}",
+                    e.kind
+                )));
+                self.emit(MirInstr::Const {
+                    dest,
+                    k: Const::None,
+                });
+                dest
             }
         }
     }
@@ -1043,12 +691,16 @@ impl Flatten<'_> {
     /// escape targets (`break`/`continue` to an outer loop); most arms ignore it.
     fn lower_instr(&mut self, i: &HirInstr, outer_map: &HashMap<hir::BlockId, MirBlockId>) {
         match i {
-            HirInstr::Bind { dest, expr, ty } => {
+            HirInstr::Bind {
+                dest,
+                expr,
+                source_annotation,
+            } => {
                 let src = self.expr(expr);
                 self.emit(MirInstr::DefVar {
                     var: *dest,
                     src,
-                    ty: ty.clone(),
+                    source_annotation: source_annotation.clone(),
                 });
             }
             HirInstr::Eval(e) => {
@@ -1069,11 +721,13 @@ impl Flatten<'_> {
                 {
                     self.emit_try(body, except, orelse, finalbody, loop_targets, outer_map);
                 } else {
-                    unreachable!("HirInstr::Try always wraps a `try` statement");
+                    self.emit(MirInstr::Unsupported(
+                        "malformed HIR try instruction".to_string(),
+                    ));
                 }
             }
-            HirInstr::Drop(_) => {
-                unreachable!("HirInstr::Drop is inserted by Phase 4, not present during lowering")
+            HirInstr::Drop(var) => {
+                self.emit(MirInstr::DropVar { var: *var });
             }
             // Iterator protocol: compute into a register, then store to the target
             // variable (so the header's branch can read `has_next` as a `UseVar`,
@@ -1082,7 +736,7 @@ impl Flatten<'_> {
                 self.emit(MirInstr::GetIter { iter: *iter });
             }
             HirInstr::HasNext { iter, dest } => {
-                let r = self.fresh(DUMMY_SPAN, None);
+                let r = self.fresh(SourceSpan::new(None, DUMMY_SPAN), None);
                 self.emit(MirInstr::HasNext {
                     dest: r,
                     iter: *iter,
@@ -1090,11 +744,11 @@ impl Flatten<'_> {
                 self.emit(MirInstr::DefVar {
                     var: *dest,
                     src: r,
-                    ty: None,
+                    source_annotation: None,
                 });
             }
             HirInstr::Next { iter, dest } => {
-                let r = self.fresh(DUMMY_SPAN, Some(*iter));
+                let r = self.fresh(SourceSpan::new(None, DUMMY_SPAN), Some(*iter));
                 self.emit(MirInstr::Next {
                     dest: r,
                     iter: *iter,
@@ -1102,7 +756,7 @@ impl Flatten<'_> {
                 self.emit(MirInstr::DefVar {
                     var: *dest,
                     src: r,
-                    ty: None,
+                    source_annotation: None,
                 });
             }
         }
@@ -1129,7 +783,15 @@ impl Flatten<'_> {
                 p.proj.push(Proj::Index(idx));
                 p
             }
-            other => unreachable!("assignment place must be rooted at a variable, got {other:?}"),
+            other => {
+                self.emit(MirInstr::Unsupported(format!(
+                    "invalid assignment place reached MIR lowering: {other:?}"
+                )));
+                MirPlace {
+                    root: self.var("$invalid_place"),
+                    proj: Vec::new(),
+                }
+            }
         }
     }
 
@@ -1155,7 +817,7 @@ impl Flatten<'_> {
             n_vars: 0,
             var_names: Vec::new(),
             n_params: 0,
-            param_types: Vec::new(),
+            param_annotations: Vec::new(),
             owned_params: Vec::new(),
             ref_params: Vec::new(),
             spans: std::mem::take(&mut self.f.spans), // accumulate into the shared table
@@ -1183,10 +845,8 @@ impl Flatten<'_> {
                 for instr in &region_cfg.g[hb].instrs {
                     fl.lower_instr(instr, outer_map);
                 }
-                let term = region_cfg.g[hb]
-                    .term
-                    .as_ref()
-                    .expect("Phase 1 seals every block");
+                let fallback = Terminator::FallOff;
+                let term = region_cfg.g[hb].term.as_ref().unwrap_or(&fallback);
                 // Region terminators resolve local jumps via the region's own `map`;
                 // an `EscapeJump` resolves its outer-loop target via `outer_map`.
                 let mterm = fl.lower_term(term, &map, outer_map);
@@ -1343,7 +1003,7 @@ impl Flatten<'_> {
                     self.emit(MirInstr::DefVar {
                         var,
                         src: res,
-                        ty: None,
+                        source_annotation: None,
                     });
                 } else {
                     let p = self.place(place);
@@ -1373,10 +1033,14 @@ impl Flatten<'_> {
             StmtKind::Comptime { name, value } => {
                 let src = self.expr(value);
                 let var = self.var(name);
-                self.emit(MirInstr::DefVar { var, src, ty: None });
+                self.emit(MirInstr::DefVar {
+                    var,
+                    src,
+                    source_annotation: None,
+                });
             }
-            // No runtime effect: `pass`, and imports (mojito has no module system,
-            // so imports are no-ops — matching the checker/evaluator).
+            // `pass` has no runtime effect. Imports were consumed by linking and
+            // are no-ops in a lowered module body.
             StmtKind::Pass | StmtKind::Import { .. } | StmtKind::FromImport { .. } => {}
 
             // `try`/`except`/`else`/`finally` — each part lowers to a mini-CFG that
@@ -1443,7 +1107,7 @@ impl Flatten<'_> {
                             self.emit(MirInstr::DefVar {
                                 var,
                                 src: elem,
-                                ty: None,
+                                source_annotation: None,
                             });
                         }
                         _ => {
@@ -1458,7 +1122,10 @@ impl Flatten<'_> {
             // Parse-only statements are flagged `Unsupported`, so a checked program
             // never reaches MIR with them.
             StmtKind::With { .. } | StmtKind::ComptimeIf { .. } | StmtKind::ComptimeFor { .. } => {
-                unreachable!("parse-only statement rejected by the checker before MIR: {s:?}")
+                self.emit(MirInstr::Unsupported(format!(
+                    "unchecked statement reached MIR lowering: {:?}",
+                    s.kind
+                )));
             }
             // These are lowered by `hir::Lower` directly (to instrs/terminators), so
             // they never arrive here wrapped in a `HirInstr::Stmt`.
@@ -1471,7 +1138,10 @@ impl Flatten<'_> {
             | StmtKind::VarDecl { .. }
             | StmtKind::Assign { .. }
             | StmtKind::Expr(_) => {
-                unreachable!("handled by hir::Lower directly, not via HirInstr::Stmt: {s:?}")
+                self.emit(MirInstr::Unsupported(format!(
+                    "malformed HIR statement instruction: {:?}",
+                    s.kind
+                )));
             }
         }
     }
@@ -1530,7 +1200,7 @@ fn lower_cfg_nested(
     cfg: &Cfg,
     nested: &HashMap<String, NestedInfo>,
     overloads: &crate::symbol::OverloadSets,
-    overload_targets: &HashMap<Span, String>,
+    overload_targets: &HashMap<SourceSpan, String>,
 ) -> MirFunction {
     let mut mir = MirFunction {
         blocks: Vec::new(),
@@ -1538,7 +1208,7 @@ fn lower_cfg_nested(
         n_vars: cfg.vars.len(),
         var_names: cfg.vars.clone(),
         n_params: cfg.n_params,
-        param_types: Vec::new(), // filled by `lower_program` where signatures are known
+        param_annotations: Vec::new(),
         owned_params: Vec::new(),
         ref_params: Vec::new(),
         spans: SpanTable::default(),
@@ -1572,7 +1242,8 @@ fn lower_cfg_nested(
                 // (a `try`'s escape targets are this function's loop blocks).
                 fl.lower_instr(instr, &map);
             }
-            let term = cfg.g[hb].term.as_ref().expect("Phase 1 seals every block");
+            let fallback = Terminator::FallOff;
+            let term = cfg.g[hb].term.as_ref().unwrap_or(&fallback);
             let mterm = fl.lower_term(term, &map, &map);
             fl.f.blocks[fl.cur].term = mterm;
         }
@@ -1587,14 +1258,33 @@ fn lower_cfg_nested(
 }
 
 /// A whole program's worth of lowered functions, keyed by name. The synthetic
-/// `__toplevel__` holds the module's top-level statements (mirroring the
-/// evaluator's top-level + `main()` model).
+/// `__toplevel__` holds executable top-level statements; the VM runs it before
+/// the program's zero-argument `main` entry point.
 #[derive(Debug)]
 pub struct MirProgram {
     pub functions: Vec<(String, MirFunction)>,
     /// Declaration facts needed by execution, normalized once while lowering.
     /// Backends consume this instead of rescanning the source AST.
     pub declarations: MirDeclarations,
+    /// Violations of the checked-program contract discovered while lowering.
+    /// Backends must reject a program with any entry rather than executing a
+    /// guessed fallback representation.
+    pub invariant_errors: Vec<String>,
+}
+
+fn checked_type_or_record(
+    checked: &CheckedProgram,
+    site: AnnotationSite,
+    description: &str,
+    invariant_errors: &mut Vec<String>,
+) -> Ty {
+    match checked.checked_type_at(&site) {
+        Some(ty) => ty.clone(),
+        None => {
+            invariant_errors.push(format!("missing checked type for {description}"));
+            Ty::None
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1628,414 +1318,8 @@ pub struct MirFunctionDeclaration {
     pub param_decls: Vec<(String, bool)>,
 }
 
-// --- Nested `def` (closure) lifting -----------------------------------------
-
-/// Collect the single-level nested `def` statements of a function body (those
-/// directly in the body or in its control-flow blocks), without descending into
-/// their own bodies.
-fn find_nested_defs<'a>(body: &'a [Stmt], out: &mut Vec<&'a Stmt>) {
-    for s in body {
-        match &s.kind {
-            StmtKind::Def { .. } => out.push(s),
-            StmtKind::If { branches, orelse } => {
-                for (_, b) in branches {
-                    find_nested_defs(b, out);
-                }
-                if let Some(e) = orelse {
-                    find_nested_defs(e, out);
-                }
-            }
-            StmtKind::While { body, .. } | StmtKind::For { body, .. } => {
-                find_nested_defs(body, out)
-            }
-            StmtKind::Try {
-                body,
-                except,
-                orelse,
-                finalbody,
-            } => {
-                find_nested_defs(body, out);
-                if let Some((_, b)) = except {
-                    find_nested_defs(b, out);
-                }
-                if let Some(e) = orelse {
-                    find_nested_defs(e, out);
-                }
-                if let Some(f) = finalbody {
-                    find_nested_defs(f, out);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Collect the names a statement list *binds* in the enclosing (flat) frame: `var`
-/// / `comptime` / `for` vars, `except` bindings, unpack targets, and nested `def`
-/// names. Descends into control-flow blocks but not `def`/`struct`/`trait` bodies.
-fn binds(body: &[Stmt], out: &mut HashSet<String>) {
-    for s in body {
-        match &s.kind {
-            StmtKind::VarDecl { name, .. }
-            | StmtKind::Comptime { name, .. }
-            | StmtKind::Def { name, .. } => {
-                out.insert(name.clone());
-            }
-            StmtKind::For { var, body, .. } => {
-                out.insert(var.clone());
-                binds(body, out);
-            }
-            StmtKind::If { branches, orelse } => {
-                for (_, b) in branches {
-                    binds(b, out);
-                }
-                if let Some(e) = orelse {
-                    binds(e, out);
-                }
-            }
-            StmtKind::While { body, .. } => binds(body, out),
-            StmtKind::Try {
-                body,
-                except,
-                orelse,
-                finalbody,
-            } => {
-                binds(body, out);
-                if let Some((n, b)) = except {
-                    if let Some(n) = n {
-                        out.insert(n.clone());
-                    }
-                    binds(b, out);
-                }
-                if let Some(e) = orelse {
-                    binds(e, out);
-                }
-                if let Some(f) = finalbody {
-                    binds(f, out);
-                }
-            }
-            StmtKind::Unpack { targets, .. } => {
-                for t in targets {
-                    if let ExprKind::Identifier(n) = &t.kind {
-                        out.insert(n.clone());
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Collect every identifier *referenced* by an expression (reads, callee names,
-/// receivers, indices, …).
-fn refs_expr(e: &Expr, out: &mut HashSet<String>) {
-    match &e.kind {
-        ExprKind::Identifier(n) => {
-            out.insert(n.clone());
-        }
-        ExprKind::Prefix(_, a) | ExprKind::Transfer(a) => refs_expr(a, out),
-        ExprKind::Infix(_, a, b) => {
-            refs_expr(a, out);
-            refs_expr(b, out);
-        }
-        ExprKind::Call {
-            name,
-            param_args,
-            args,
-            kwargs,
-        } => {
-            out.insert(name.clone());
-            for pa in param_args {
-                if let ParamArg::Value(x) = pa {
-                    refs_expr(x, out);
-                }
-            }
-            for a in args {
-                refs_expr(a, out);
-            }
-            for k in kwargs {
-                refs_expr(&k.value, out);
-            }
-        }
-        ExprKind::Member { object, .. } => refs_expr(object, out),
-        ExprKind::MethodCall {
-            object,
-            args,
-            kwargs,
-            ..
-        } => {
-            refs_expr(object, out);
-            for a in args {
-                refs_expr(a, out);
-            }
-            for k in kwargs {
-                refs_expr(&k.value, out);
-            }
-        }
-        ExprKind::Index { object, index } => {
-            refs_expr(object, out);
-            refs_expr(index, out);
-        }
-        ExprKind::ListLit(es) | ExprKind::TupleLit(es) => {
-            for x in es {
-                refs_expr(x, out);
-            }
-        }
-        ExprKind::Named { value, .. } => refs_expr(value, out),
-        ExprKind::IfExpr {
-            cond,
-            then_branch,
-            else_branch,
-        } => {
-            refs_expr(cond, out);
-            refs_expr(then_branch, out);
-            refs_expr(else_branch, out);
-        }
-        ExprKind::Compare { first, rest } => {
-            refs_expr(first, out);
-            for (_, x) in rest {
-                refs_expr(x, out);
-            }
-        }
-        ExprKind::Slice {
-            object,
-            lower,
-            upper,
-            step,
-        } => {
-            refs_expr(object, out);
-            for x in [lower, upper, step].into_iter().flatten() {
-                refs_expr(x, out);
-            }
-        }
-        ExprKind::TString { parts, .. } => {
-            for p in parts {
-                if let TStringPart::Expr(x) = p {
-                    refs_expr(x, out);
-                }
-            }
-        }
-        _ => {} // literals, None
-    }
-}
-
-/// Collect identifiers referenced by a statement list; returns `false` if the body
-/// contains a nested `def`/`struct`/`trait` (can't lift — deeper nesting is
-/// refused). Does not descend into such nested bodies.
-fn refs_stmts(body: &[Stmt], out: &mut HashSet<String>) -> bool {
-    let mut ok = true;
-    for s in body {
-        match &s.kind {
-            StmtKind::Def { .. } | StmtKind::Struct { .. } | StmtKind::Trait { .. } => ok = false,
-            StmtKind::VarDecl { value, .. } | StmtKind::Comptime { value, .. } => {
-                refs_expr(value, out)
-            }
-            StmtKind::Assign { name, value } => {
-                out.insert(name.clone());
-                refs_expr(value, out);
-            }
-            StmtKind::AugAssign { place, value, .. } => {
-                refs_expr(place, out);
-                refs_expr(value, out);
-            }
-            StmtKind::SetPlace { place, value } => {
-                refs_expr(place, out);
-                refs_expr(value, out);
-            }
-            StmtKind::If { branches, orelse } => {
-                for (c, b) in branches {
-                    refs_expr(c, out);
-                    ok &= refs_stmts(b, out);
-                }
-                if let Some(e) = orelse {
-                    ok &= refs_stmts(e, out);
-                }
-            }
-            StmtKind::While { cond, body } => {
-                refs_expr(cond, out);
-                ok &= refs_stmts(body, out);
-            }
-            StmtKind::For { iter, body, .. } => {
-                refs_expr(iter, out);
-                ok &= refs_stmts(body, out);
-            }
-            StmtKind::Return(Some(e)) | StmtKind::Raise(e) | StmtKind::Expr(e) => refs_expr(e, out),
-            StmtKind::Try {
-                body,
-                except,
-                orelse,
-                finalbody,
-            } => {
-                ok &= refs_stmts(body, out);
-                if let Some((_, b)) = except {
-                    ok &= refs_stmts(b, out);
-                }
-                if let Some(e) = orelse {
-                    ok &= refs_stmts(e, out);
-                }
-                if let Some(f) = finalbody {
-                    ok &= refs_stmts(f, out);
-                }
-            }
-            StmtKind::Unpack { targets, value } => {
-                for t in targets {
-                    refs_expr(t, out);
-                }
-                refs_expr(value, out);
-            }
-            _ => {}
-        }
-    }
-    ok
-}
-
-/// Compute a nested `def`'s captures (the enclosing-frame locals it references),
-/// or `None` if it can't be lifted: it declares its own nested `def`/`struct`/
-/// `trait`, or it calls a *sibling* nested `def` (whose captures we can't forward).
-/// A self-reference is fine (self-recursion via the registry, not a capture).
-fn analyze_captures(
-    dparams: &[FnParam],
-    dbody: &[Stmt],
-    f_bound: &HashSet<String>,
-    nested_names: &HashSet<String>,
-    self_name: &str,
-) -> Option<Vec<String>> {
-    let mut d_bound: HashSet<String> = dparams.iter().map(|p| p.name.clone()).collect();
-    binds(dbody, &mut d_bound);
-    let mut used = HashSet::new();
-    if !refs_stmts(dbody, &mut used) {
-        return None; // contains a deeper nested declaration
-    }
-    let mut captures: Vec<String> = used
-        .into_iter()
-        .filter(|n| !d_bound.contains(n) && f_bound.contains(n))
-        .collect();
-    if captures
-        .iter()
-        .any(|n| nested_names.contains(n) && n != self_name)
-    {
-        return None; // references a sibling nested `def`
-    }
-    captures.retain(|n| !nested_names.contains(n)); // drop a self-reference
-    captures.sort();
-    Some(captures)
-}
-
-/// Lower a function body (`name` its registered/mangled name) plus every nested
-/// `def` it defines, pushing the function and each lifted nested function into
-/// `out`. A liftable nested `def` becomes `name$inner` with its captured enclosing
-/// locals as leading `mut` parameters (pass-through-typed so `coerce` is identity);
-/// a nested `def` we can't lift stays a clean `Unsupported` at execution.
-struct FunctionLowering<'a> {
-    name: &'a str,
-    parameter_names: &'a [String],
-    parameter_types: Vec<Type>,
-    owned_parameters: Vec<bool>,
-    reference_parameters: Vec<bool>,
-    body: &'a [Stmt],
-    overloads: &'a crate::symbol::OverloadSets,
-    overload_targets: &'a HashMap<Span, String>,
-}
-
-fn lower_fn_nested(request: FunctionLowering<'_>, out: &mut Vec<(String, MirFunction)>) {
-    let FunctionLowering {
-        name,
-        parameter_names: param_names,
-        parameter_types: param_types,
-        owned_parameters: owned_params,
-        reference_parameters: ref_params,
-        body,
-        overloads,
-        overload_targets,
-    } = request;
-    let mut f_bound: HashSet<String> = param_names.iter().cloned().collect();
-    binds(body, &mut f_bound);
-
-    let mut nested_defs = Vec::new();
-    find_nested_defs(body, &mut nested_defs);
-    let nested_names: HashSet<String> = nested_defs
-        .iter()
-        .filter_map(|s| match &s.kind {
-            StmtKind::Def { name, .. } => Some(name.clone()),
-            _ => None,
-        })
-        .collect();
-
-    let mut registry: HashMap<String, NestedInfo> = HashMap::new();
-    let mut liftable: Vec<(&Stmt, Vec<String>, String)> = Vec::new();
-    for ds in &nested_defs {
-        if let StmtKind::Def {
-            name: dname,
-            type_params,
-            params: dparams,
-            body: dbody,
-            ..
-        } = &ds.kind
-        {
-            if !type_params.is_empty() {
-                continue; // a generic nested `def` is refused (stays Unsupported)
-            }
-            if let Some(captures) = analyze_captures(dparams, dbody, &f_bound, &nested_names, dname)
-            {
-                let mangled = crate::symbol::nested_lifted_name(name, dname);
-                registry.insert(
-                    dname.clone(),
-                    NestedInfo {
-                        mangled: mangled.clone(),
-                        captures: captures.clone(),
-                    },
-                );
-                liftable.push((ds, captures, mangled));
-            }
-        }
-    }
-
-    let cfg = Cfg::build_fn(param_names, body);
-    let mut f = lower_cfg_nested(&cfg, &registry, overloads, overload_targets);
-    f.param_types = param_types;
-    f.owned_params = owned_params;
-    f.ref_params = ref_params;
-    out.push((name.to_string(), f));
-
-    let cap_ty = Type::Named("$capture".to_string(), Vec::new());
-    for (ds, captures, mangled) in liftable {
-        if let StmtKind::Def {
-            params: dparams,
-            body: dbody,
-            ..
-        } = &ds.kind
-        {
-            let mut names: Vec<String> = captures.clone();
-            names.extend(dparams.iter().map(|p| p.name.clone()));
-            let mut ptys: Vec<Type> = vec![cap_ty.clone(); captures.len()];
-            ptys.extend(dparams.iter().map(|p| p.ty.clone()));
-            let mut owned2 = vec![false; captures.len()];
-            owned2.extend(dparams.iter().map(|p| is_owned(&p.convention)));
-            // Captures are `mut` (their final value is written back to the enclosing
-            // variable — reference-capture semantics).
-            let mut refp2 = vec![true; captures.len()];
-            refp2.extend(dparams.iter().map(|p| is_ref(&p.convention)));
-            let immutable_captures: HashSet<String> = captures
-                .iter()
-                .filter(|capture| {
-                    body.iter().any(|stmt| {
-                        matches!(
-                            &stmt.kind,
-                            StmtKind::Comptime { name, .. } if name == *capture
-                        )
-                    })
-                })
-                .cloned()
-                .collect();
-            let ncfg = Cfg::build_fn_with_captures(&names, immutable_captures, dbody);
-            let mut nf = lower_cfg_nested(&ncfg, &registry, overloads, overload_targets);
-            nf.param_types = ptys;
-            nf.owned_params = owned2;
-            nf.ref_params = refp2;
-            out.push((mangled, nf));
-        }
-    }
-}
+mod nested;
+use nested::*;
 
 /// Lower a whole program (a top-level statement list) into per-function MIR.
 ///
@@ -2044,16 +1328,16 @@ fn lower_fn_nested(request: FunctionLowering<'_>, out: &mut Vec<(String, MirFunc
 /// `Struct.method`; a `trait`'s bodiless requirements produce nothing (default
 /// methods are deferred). Remaining top-level statements form `__toplevel__`.
 /// (Nested `def`s inside a body are still deferred — see `lower_stmt`.)
-pub fn lower_program(program: &[Stmt]) -> MirProgram {
-    let checked = crate::checker::check_program(program)
-        .unwrap_or_else(|_| CheckedProgram::unchecked(program));
-    lower_checked_program(&checked)
+pub fn lower_program(program: &[Stmt]) -> Result<MirProgram, crate::error::TypeError> {
+    let checked = crate::checker::check_program(program)?;
+    Ok(lower_checked_program(&checked))
 }
 
 pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
     let program = checked.statements();
     let mut functions = Vec::new();
     let mut declarations = MirDeclarations::default();
+    let mut invariant_errors = Vec::new();
     let mut toplevel: Vec<Stmt> = Vec::new();
     let overloads = crate::symbol::OverloadSets::scan(program);
     let overload_targets = checked.overload_targets().clone();
@@ -2087,10 +1371,19 @@ pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
                     param_types: regular
                         .iter()
                         .map(|p| {
-                            checked
-                                .resolved_type(&p.ty)
-                                .expect("checked parameter type")
-                                .clone()
+                            checked_type_or_record(
+                                checked,
+                                AnnotationSite::FunctionParam {
+                                    module: s.module.clone(),
+                                    declaration: s.span,
+                                    param: params
+                                        .iter()
+                                        .position(|candidate| std::ptr::eq(candidate, *p))
+                                        .unwrap_or(params.len()),
+                                },
+                                &format!("parameter '{}' of function '{name}'", p.name),
+                                &mut invariant_errors,
+                            )
                         })
                         .collect(),
                     defaults: regular
@@ -2099,17 +1392,29 @@ pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
                         .collect(),
                     required: regular.iter().map(|p| p.default.is_none()).collect(),
                     variadic: variadic_idx.map(|i| {
-                        checked
-                            .resolved_type(&params[i].ty)
-                            .expect("checked variadic type")
-                            .clone()
+                        checked_type_or_record(
+                            checked,
+                            AnnotationSite::FunctionParam {
+                                module: s.module.clone(),
+                                declaration: s.span,
+                                param: i,
+                            },
+                            &format!("variadic parameter of function '{name}'"),
+                            &mut invariant_errors,
+                        )
                     }),
                     variadic_index: regular_marker_index(params, variadic_idx),
                     kw_variadic: kw_variadic_idx.map(|i| {
-                        checked
-                            .resolved_type(&params[i].ty)
-                            .expect("checked kwargs type")
-                            .clone()
+                        checked_type_or_record(
+                            checked,
+                            AnnotationSite::FunctionParam {
+                                module: s.module.clone(),
+                                declaration: s.span,
+                                param: i,
+                            },
+                            &format!("keyword variadic parameter of function '{name}'"),
+                            &mut invariant_errors,
+                        )
                     }),
                     kw_variadic_index: kw_variadic_idx,
                     positional_only: regular_marker_index(params, *positional_only),
@@ -2120,7 +1425,7 @@ pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
                     FunctionLowering {
                         name: &lowered_name,
                         parameter_names: &names,
-                        parameter_types: ptys,
+                        parameter_annotations: ptys,
                         owned_parameters: owned,
                         reference_parameters: refp,
                         body,
@@ -2161,13 +1466,20 @@ pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
                     name: name.clone(),
                     fields: fields
                         .iter()
-                        .map(|field| {
+                        .enumerate()
+                        .map(|(field_index, field)| {
                             (
                                 field.name.clone(),
-                                checked
-                                    .resolved_type(&field.ty)
-                                    .expect("checked field type")
-                                    .clone(),
+                                checked_type_or_record(
+                                    checked,
+                                    AnnotationSite::StructField {
+                                        module: s.module.clone(),
+                                        declaration: s.span,
+                                        field: field_index,
+                                    },
+                                    &format!("field '{}' of struct '{name}'", field.name),
+                                    &mut invariant_errors,
+                                ),
                             )
                         })
                         .collect(),
@@ -2175,7 +1487,7 @@ pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
                     fieldwise_init: *fieldwise_init,
                     param_decls: crate::runtime::classify_param_decls(type_params),
                 });
-                for m in methods {
+                for (method_index, m) in methods.iter().enumerate() {
                     let method_name = crate::symbol::lifecycle_method_name(m);
                     let source_mangled = format!("{name}.{method_name}");
                     let mangled = crate::symbol::lowered_method_name(
@@ -2199,10 +1511,24 @@ pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
                         param_types: regular
                             .iter()
                             .map(|param| {
-                                checked
-                                    .resolved_type(&param.ty)
-                                    .expect("checked method parameter type")
-                                    .clone()
+                                checked_type_or_record(
+                                    checked,
+                                    AnnotationSite::MethodParam {
+                                        module: s.module.clone(),
+                                        declaration: s.span,
+                                        method: method_index,
+                                        param: m
+                                            .params
+                                            .iter()
+                                            .position(|candidate| std::ptr::eq(candidate, *param))
+                                            .unwrap_or(m.params.len()),
+                                    },
+                                    &format!(
+                                        "parameter '{}' of method '{source_mangled}'",
+                                        param.name
+                                    ),
+                                    &mut invariant_errors,
+                                )
                             })
                             .collect(),
                         defaults: regular
@@ -2214,10 +1540,17 @@ pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
                             .map(|param| param.default.is_none())
                             .collect(),
                         variadic: variadic_idx.map(|index| {
-                            checked
-                                .resolved_type(&m.params[index].ty)
-                                .expect("checked method variadic type")
-                                .clone()
+                            checked_type_or_record(
+                                checked,
+                                AnnotationSite::MethodParam {
+                                    module: s.module.clone(),
+                                    declaration: s.span,
+                                    method: method_index,
+                                    param: index,
+                                },
+                                &format!("variadic parameter of method '{source_mangled}'"),
+                                &mut invariant_errors,
+                            )
                         }),
                         variadic_index: regular_marker_index(&m.params, variadic_idx),
                         kw_variadic: None,
@@ -2233,14 +1566,14 @@ pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
                     // A method's receiver `self` is the implicit first parameter,
                     // followed by the declared params.
                     let mut names: Vec<String> = Vec::new();
-                    let mut ptys: Vec<Type> = Vec::new();
+                    let mut ptys: Vec<SourceType> = Vec::new();
                     let mut owned: Vec<bool> = Vec::new();
                     let mut refp: Vec<bool> = Vec::new();
                     if m.has_self {
                         names.push("self".to_string());
                         // `self` is the struct type; `coerce` is identity on it, so
                         // the exact type only needs to be non-numeric.
-                        ptys.push(Type::Named(name.clone(), Vec::new()));
+                        ptys.push(SourceType::Named(name.clone(), Vec::new()));
                         owned.push(is_owned(&m.self_convention));
                         refp.push(false); // `self` is handled via `recv_place`, not `ref_params`
                     }
@@ -2252,7 +1585,7 @@ pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
                         FunctionLowering {
                             name: &mangled,
                             parameter_names: &names,
-                            parameter_types: ptys,
+                            parameter_annotations: ptys,
                             owned_parameters: owned,
                             reference_parameters: refp,
                             body: &m.body,
@@ -2281,5 +1614,6 @@ pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
     MirProgram {
         functions,
         declarations,
+        invariant_errors,
     }
 }

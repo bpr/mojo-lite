@@ -1,7 +1,7 @@
 //! The abstract syntax tree for the implemented subset of Mojo.
 //!
-//! Kept separate from the parser so the tree can be consumed (by the evaluator,
-//! tests, future type checker) without depending on parsing details.
+//! Kept separate from the parser so linking, compile-time elaboration, semantic
+//! checking, lowering, and syntax-oriented tools do not depend on parser internals.
 //!
 //! **Spans.** Every [`Expr`] carries a source [`Span`] (`token::Span`), stamped by
 //! the parser, so later stages (the MIR's `SpanTable`) can point diagnostics back
@@ -12,7 +12,8 @@ use crate::token::Span;
 
 /// A type annotation. Covers the scalar types plus nominal (`struct`) types,
 /// which may carry type arguments (`Pair[Int]`), and references to a type
-/// parameter. Function/closure types (`def(Int) -> Int`) are not yet parsed.
+/// parameter. Function/closure and reference types are represented even though
+/// their runtime semantics are not yet supported.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Type {
     Int,
@@ -59,6 +60,11 @@ pub enum Type {
     /// type. Parsed; the checker flags a `ref` annotation as unsupported.
     Ref(Box<Type>),
 }
+
+/// Explicit name for [`Type`] when code handles parsed source annotations rather
+/// than the checked semantic lattice in [`crate::types::Ty`]. `Type` remains as a
+/// compatibility name for the public AST API.
+pub type SourceType = Type;
 
 /// A compile-time **parameter** declared in a `[...]` list on a `struct` or `def`
 /// header. Syntactically uniform (`NAME: X`): it is a **type parameter** when `X`
@@ -189,9 +195,8 @@ pub struct Param {
 }
 
 /// A function/method parameter, e.g. `a: Int`, `b: Int = 2`, `*rest: Int`,
-/// `**opts: Int`, or `mut x: Int`. The richer forms (default, variadic kind,
-/// convention) are **parsed** but not yet implemented — the checker flags a
-/// signature that uses any of them as an unsupported feature.
+/// `**opts: Int`, or `mut x: Int`. Defaults, variadics, and the supported
+/// conventions participate in checking and VM argument binding.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FnParam {
     pub name: String,
@@ -216,8 +221,9 @@ pub enum ParamKind {
 
 /// An argument-passing convention on an ordinary parameter (Mojo's `read`
 /// (a.k.a. borrowed, the default), `mut`, `owned`, `out`, and `ref` — a
-/// parametric-mutability reference). Parsed, not modeled. A `ref` convention may
-/// carry an origin specifier (`ref[origin] x`), which is parsed and discarded.
+/// parametric-mutability reference). `read`, `mut`, `owned`, and call-scoped
+/// `ref` behavior are modeled; ordinary `out` and origin semantics are not. A
+/// parsed origin specifier is not retained by this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArgConvention {
     Read,
@@ -231,7 +237,8 @@ pub enum ArgConvention {
     Deinit,
 }
 
-/// A keyword argument at a call site: `name=value`. Parsed, not modeled.
+/// A keyword argument at a call site: `name=value`. Structural binding is owned
+/// by `crate::call`; the checker and VM interpret the matched argument slot.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KwArg {
     pub name: String,
@@ -258,12 +265,12 @@ pub struct Decorator {
 pub struct Method {
     pub name: String,
     /// Whether the method has a `self` receiver. `false` for a `@staticmethod`
-    /// (no `self`); parsed but its semantics are deferred (checker flags it).
+    /// (no `self`); static method semantics are currently rejected by the checker.
     pub has_self: bool,
     /// The receiver's argument convention: `None` = plain read-only `self`,
-    /// `Some(Mut)` = `mut self` (writable, mutations persist), and `Some(Out)` /
-    /// `Some(Owned)` / `Some(Read)` are parsed but not modeled (deferred).
-    /// Meaningful only when `has_self`.
+    /// `Some(Mut)` = `mut self` (writable, mutations persist). `out self` is the
+    /// constructor convention, `deinit self` the destructor convention, and
+    /// owned/read receivers participate in lifecycle and call checking.
     pub self_convention: Option<ArgConvention>,
     /// Decorators preceding the method (`@staticmethod`, …). Parsed, not modeled.
     pub decorators: Vec<Decorator>,
@@ -295,8 +302,7 @@ pub struct TraitMethod {
     pub keyword_only: Option<usize>,
     pub ret: Option<Type>,
     /// The method body. `None` for a pure requirement (`...`); `Some(body)` for a
-    /// **default implementation** — parsed, but the checker flags a trait that
-    /// declares one as unsupported ("parse now, run later").
+    /// **default implementation**. The checker currently rejects default bodies.
     pub default_body: Option<Vec<Stmt>>,
 }
 
@@ -366,6 +372,10 @@ impl Stmt {
             module: None,
         }
     }
+
+    pub fn source_span(&self) -> crate::token::SourceSpan {
+        crate::token::SourceSpan::new(self.module.clone(), self.span)
+    }
 }
 
 /// Span-agnostic structural equality: two statements are equal iff their kinds are.
@@ -412,8 +422,8 @@ pub enum StmtKind {
     /// `a, b, … = value` — **tuple-unpacking assignment** (bare form, no `var`;
     /// the `var a, b = …` form is an open Mojo feature request, not valid yet).
     /// `targets` is the comma-separated target list (each a `NAME` or place); the
-    /// value should evaluate to a tuple of matching arity. Parsed and grammar-
-    /// documented, but the checker flags it as unsupported ("parse now, run later").
+    /// value evaluates to a tuple of matching arity and lowers to independent
+    /// place writes.
     Unpack { targets: Vec<Expr>, value: Expr },
     /// `place = value` — assign through a **place expression** rooted at a
     /// mutable variable (or `mut self`): a field write `p.x = e`, a list-element
@@ -480,18 +490,15 @@ pub enum StmtKind {
     /// ordinary `Int` at runtime.
     Comptime { name: String, value: Expr },
     /// `comptime if cond: ... (elif cond: ...)* (else: ...)?` — a **compile-time
-    /// conditional** (Mojo's modern spelling; the older `@parameter if` is
-    /// deprecated). Same shape as `If`, but the branch is meant to be selected at
-    /// compile time. Parsed and grammar-documented, but the checker flags it as
-    /// unsupported (comptime branch selection is deferred — "parse now, run later").
+    /// conditional**. Compile-time elaboration selects one branch before semantic
+    /// checking, so discarded branches do not need to type-check.
     ComptimeIf {
         branches: Vec<(Expr, Vec<Stmt>)>,
         orelse: Option<Vec<Stmt>>,
     },
     /// `comptime for var in iter: <body>` — a **compile-time (unrolled) loop**
     /// (Mojo's modern spelling; the older `@parameter for` is deprecated). Same
-    /// shape as `For`. Parsed and grammar-documented, but the checker flags it as
-    /// unsupported (comptime unrolling is deferred).
+    /// shape as `For`. Compile-time elaboration unrolls it under a fuel quota.
     ComptimeFor {
         var: String,
         iter: Expr,
@@ -517,14 +524,16 @@ pub enum StmtKind {
     Return(Option<Expr>),
     /// `raise expr` — raise an error (an `Error` value, or a `String` shorthand).
     Raise(Expr),
-    /// `import a.b.c [as alias]`. Parsed but not resolved (no module system yet).
+    /// `import a.b.c [as alias]`. The linker currently treats this as a no-op;
+    /// qualified module namespaces and aliases are not implemented.
     Import {
         path: Vec<String>,
         alias: Option<String>,
     },
     /// `from [.]*module import <targets>`. `level` is the number of leading dots
     /// (0 = absolute; relative imports raise it); `path` is the dotted module
-    /// name (possibly empty for `from . import x`). Parsed but not resolved.
+    /// name (possibly empty for `from . import x`). The linker resolves wildcard
+    /// and selective imports; imported aliases are still deferred.
     FromImport {
         level: usize,
         path: Vec<String>,
@@ -532,8 +541,8 @@ pub enum StmtKind {
     },
     /// `with item (',' item)*: <body>` — a context-manager block, where each
     /// `item` is a `WithItem` (a context expression + optional `as NAME`). Parsed
-    /// and grammar-documented, but the checker flags it as unsupported (the
-    /// `__enter__`/`__exit__` protocol is deferred — "parse now, run later").
+    /// and grammar-documented; the checker rejects it until the
+    /// `__enter__`/`__exit__` protocol is implemented.
     With {
         items: Vec<WithItem>,
         body: Vec<Stmt>,
@@ -563,12 +572,21 @@ pub enum StmtKind {
 pub struct Expr {
     pub kind: ExprKind,
     pub span: Span,
+    pub source: Option<String>,
 }
 
 impl Expr {
     /// Construct a spanned expression.
     pub fn new(kind: ExprKind, span: Span) -> Self {
-        Expr { kind, span }
+        Expr {
+            kind,
+            span,
+            source: None,
+        }
+    }
+
+    pub fn source_span(&self) -> crate::token::SourceSpan {
+        crate::token::SourceSpan::new(self.source.clone(), self.span)
     }
 }
 
@@ -606,12 +624,12 @@ pub enum ExprKind {
     /// A binary operator applied to two operands, e.g. `a + b`.
     Infix(InfixOp, Box<Expr>, Box<Expr>),
     /// A call by name: `name[param_args](args)`. The callee is resolved in scope,
-    /// so this covers `def`s, closures passed in as arguments, built-ins, and
-    /// struct construction. `param_args` are the explicit compile-time parameter
+    /// so this covers `def`s, supported nested defs, built-ins, and struct
+    /// construction. `param_args` are the explicit compile-time parameter
     /// arguments (`Pair[Int](...)`, `FixedBuffer[8](...)`); empty when omitted, in
     /// which case the checker infers the type parameters from `args`.
-    /// `kwargs` are keyword arguments (`name=value`) — parsed, not modeled (a call
-    /// using them is flagged unsupported by the checker).
+    /// `kwargs` are keyword arguments (`name=value`) and use the same structural
+    /// matcher as positional/default/variadic arguments.
     Call {
         name: String,
         param_args: Vec<ParamArg>,
@@ -639,7 +657,8 @@ pub enum ExprKind {
         args: Vec<Expr>,
         kwargs: Vec<KwArg>,
     },
-    /// A subscript `object[index]` — a SIMD lane read (the only subscript form).
+    /// A subscript `object[index]` — supported for lists, tuples, SIMD, unsafe
+    /// pointers, and user types implementing `__getitem__`.
     Index {
         object: Box<Expr>,
         index: Box<Expr>,
@@ -651,8 +670,8 @@ pub enum ExprKind {
         name: String,
         args: Vec<ParamArg>,
     },
-    /// The transfer sigil `expr^` (ownership move). Parsed for completeness but
-    /// not modeled — evaluates to its operand (value semantics unchanged).
+    /// The transfer sigil `expr^`: an ownership move checked by MIR dataflow,
+    /// including field-sensitive partial moves.
     Transfer(Box<Expr>),
     /// A non-empty list literal `[a, b, …]` — a `List` whose element type is
     /// inferred from the elements.
@@ -663,15 +682,14 @@ pub enum ExprKind {
     /// A tuple literal `(a, b, …)` — a fixed-size, heterogeneous `Tuple`. `()` is
     /// the empty tuple and `(a,)` a 1-tuple; a plain `(e)` is grouping, not a tuple.
     TupleLit(Vec<Expr>),
-    /// A named expression (walrus) `name := value` — assigns `value` to `name`
-    /// and evaluates to it. Parsed and type-checked (as `value`'s type), but the
-    /// evaluator reports it as unsupported ("parse now, run later").
+    /// A named expression (walrus) `name := value`. It is parsed and typed as the
+    /// value, but MIR deliberately emits an unsupported operation.
     Named {
         name: String,
         value: Box<Expr>,
     },
     /// A conditional expression (ternary) `then_branch if cond else else_branch`.
-    /// Parsed; semantics deferred (the checker flags it unsupported).
+    /// Checked and lowered with ordinary conditional control flow.
     IfExpr {
         cond: Box<Expr>,
         then_branch: Box<Expr>,
@@ -680,13 +698,14 @@ pub enum ExprKind {
     /// A chained comparison `a < b < c …` (Python semantics: `a < b and b < c`,
     /// each operand evaluated once). `rest` is the `(op, operand)` sequence after
     /// `first`. A single comparison stays an `Infix`; this node is only built for a
-    /// chain of length ≥ 2. Parsed; semantics deferred.
+    /// chain of length ≥ 2. Lowering evaluates every operand at most once and
+    /// short-circuits the comparisons.
     Compare {
         first: Box<Expr>,
         rest: Vec<(InfixOp, Expr)>,
     },
     /// A slice subscript `object[lower:upper:step]`, each bound optional
-    /// (`a[1:2]`, `a[:j]`, `a[::2]`). Parsed; semantics deferred.
+    /// (`a[1:2]`, `a[:j]`, `a[::2]`). Supported for lists and strings.
     Slice {
         object: Box<Expr>,
         lower: Option<Box<Expr>>,
@@ -695,7 +714,7 @@ pub enum ExprKind {
     },
     /// A t-string `t"…{expr}…"` (or raw `rt"…"`, `raw = true`): alternating
     /// literal text and interpolated expressions. Each `{…}` is a fully parsed
-    /// sub-expression. Parsed; semantics deferred (checker flags it).
+    /// sub-expression. The checker currently rejects t-string semantics.
     TString {
         parts: Vec<TStringPart>,
         raw: bool,
@@ -771,5 +790,313 @@ impl InfixOp {
             InfixOp::Ge => "__ge__",
             InfixOp::And | InfixOp::Or | InfixOp::In | InfixOp::NotIn => return None,
         })
+    }
+}
+
+/// Attach one linked source path to an entire AST subtree. Spans remain local
+/// byte ranges; `source_span()` combines them with this provenance.
+pub(crate) fn stamp_source(statements: &mut [Stmt], source: &str) {
+    for statement in statements {
+        statement.module = Some(source.to_string());
+        stamp_stmt_kind(&mut statement.kind, source);
+    }
+}
+
+fn stamp_block(block: &mut [Stmt], source: &str) {
+    stamp_source(block, source);
+}
+
+fn stamp_expr(expr: &mut Expr, source: &str) {
+    expr.source = Some(source.to_string());
+    match &mut expr.kind {
+        ExprKind::Prefix(_, value) | ExprKind::Transfer(value) => stamp_expr(value, source),
+        ExprKind::Infix(_, left, right)
+        | ExprKind::Index {
+            object: left,
+            index: right,
+        } => {
+            stamp_expr(left, source);
+            stamp_expr(right, source);
+        }
+        ExprKind::Call {
+            param_args,
+            args,
+            kwargs,
+            ..
+        } => {
+            stamp_param_args(param_args, source);
+            for arg in args {
+                stamp_expr(arg, source);
+            }
+            for arg in kwargs {
+                stamp_expr(&mut arg.value, source);
+            }
+        }
+        ExprKind::Invoke {
+            callee,
+            param_args,
+            args,
+            kwargs,
+        } => {
+            stamp_expr(callee, source);
+            stamp_param_args(param_args, source);
+            for arg in args {
+                stamp_expr(arg, source);
+            }
+            for arg in kwargs {
+                stamp_expr(&mut arg.value, source);
+            }
+        }
+        ExprKind::Member { object, .. } => stamp_expr(object, source),
+        ExprKind::MethodCall {
+            object,
+            args,
+            kwargs,
+            ..
+        } => {
+            stamp_expr(object, source);
+            for arg in args {
+                stamp_expr(arg, source);
+            }
+            for arg in kwargs {
+                stamp_expr(&mut arg.value, source);
+            }
+        }
+        ExprKind::TypeApply { args, .. } => stamp_param_args(args, source),
+        ExprKind::ListLit(values) | ExprKind::TupleLit(values) => {
+            for value in values {
+                stamp_expr(value, source);
+            }
+        }
+        ExprKind::BraceLit(entries) => {
+            for (key, value) in entries {
+                stamp_expr(key, source);
+                if let Some(value) = value {
+                    stamp_expr(value, source);
+                }
+            }
+        }
+        ExprKind::Named { value, .. } => stamp_expr(value, source),
+        ExprKind::IfExpr {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            stamp_expr(cond, source);
+            stamp_expr(then_branch, source);
+            stamp_expr(else_branch, source);
+        }
+        ExprKind::Compare { first, rest } => {
+            stamp_expr(first, source);
+            for (_, value) in rest {
+                stamp_expr(value, source);
+            }
+        }
+        ExprKind::Slice {
+            object,
+            lower,
+            upper,
+            step,
+        } => {
+            stamp_expr(object, source);
+            for value in [lower, upper, step].into_iter().flatten() {
+                stamp_expr(value, source);
+            }
+        }
+        ExprKind::TString { parts, .. } => {
+            for part in parts {
+                if let TStringPart::Expr(value) = part {
+                    stamp_expr(value, source);
+                }
+            }
+        }
+        ExprKind::TypeValue(ty) => stamp_type(ty, source),
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Str(_)
+        | ExprKind::None
+        | ExprKind::Identifier(_) => {}
+    }
+}
+
+fn stamp_param_args(args: &mut [ParamArg], source: &str) {
+    for arg in args {
+        if let ParamArg::Value(value) = arg {
+            stamp_expr(value, source);
+        }
+    }
+}
+
+fn stamp_type(ty: &mut Type, source: &str) {
+    match ty {
+        Type::Named(_, args) => stamp_param_args(args, source),
+        Type::Assoc { base, .. } | Type::Ref(base) => stamp_type(base, source),
+        Type::Func { params, ret, .. } => {
+            for param in params {
+                stamp_type(param, source);
+            }
+            stamp_type(ret, source);
+        }
+        Type::Int
+        | Type::UInt
+        | Type::Bool
+        | Type::String
+        | Type::Float64
+        | Type::None
+        | Type::SelfParam(_)
+        | Type::SelfType => {}
+    }
+}
+
+fn stamp_fn_param(param: &mut FnParam, source: &str) {
+    stamp_type(&mut param.ty, source);
+    if let Some(value) = &mut param.default {
+        stamp_expr(value, source);
+    }
+}
+
+fn stamp_decorators(decorators: &mut [Decorator], source: &str) {
+    for decorator in decorators {
+        for arg in &mut decorator.args {
+            stamp_expr(arg, source);
+        }
+        for arg in &mut decorator.kwargs {
+            stamp_expr(&mut arg.value, source);
+        }
+    }
+}
+
+fn stamp_stmt_kind(kind: &mut StmtKind, source: &str) {
+    match kind {
+        StmtKind::VarDecl { ty, value, .. } => {
+            if let Some(ty) = ty {
+                stamp_type(ty, source);
+            }
+            stamp_expr(value, source);
+        }
+        StmtKind::RefDecl { value, .. }
+        | StmtKind::Assign { value, .. }
+        | StmtKind::Comptime { value, .. }
+        | StmtKind::Raise(value)
+        | StmtKind::Return(Some(value))
+        | StmtKind::Expr(value) => stamp_expr(value, source),
+        StmtKind::SetPlace { place, value } | StmtKind::AugAssign { place, value, .. } => {
+            stamp_expr(place, source);
+            stamp_expr(value, source);
+        }
+        StmtKind::Unpack { targets, value } => {
+            for target in targets {
+                stamp_expr(target, source);
+            }
+            stamp_expr(value, source);
+        }
+        StmtKind::If { branches, orelse } | StmtKind::ComptimeIf { branches, orelse } => {
+            for (condition, block) in branches {
+                stamp_expr(condition, source);
+                stamp_block(block, source);
+            }
+            if let Some(block) = orelse {
+                stamp_block(block, source);
+            }
+        }
+        StmtKind::While { cond, body } => {
+            stamp_expr(cond, source);
+            stamp_block(body, source);
+        }
+        StmtKind::For { iter, body, .. } | StmtKind::ComptimeFor { iter, body, .. } => {
+            stamp_expr(iter, source);
+            stamp_block(body, source);
+        }
+        StmtKind::With { items, body } => {
+            for item in items {
+                stamp_expr(&mut item.context, source);
+            }
+            stamp_block(body, source);
+        }
+        StmtKind::Try {
+            body,
+            except,
+            orelse,
+            finalbody,
+        } => {
+            stamp_block(body, source);
+            if let Some((_, block)) = except {
+                stamp_block(block, source);
+            }
+            if let Some(block) = orelse {
+                stamp_block(block, source);
+            }
+            if let Some(block) = finalbody {
+                stamp_block(block, source);
+            }
+        }
+        StmtKind::Def {
+            params,
+            ret,
+            body,
+            decorators,
+            ..
+        } => {
+            for param in params {
+                stamp_fn_param(param, source);
+            }
+            if let Some(ret) = ret {
+                stamp_type(ret, source);
+            }
+            stamp_decorators(decorators, source);
+            stamp_block(body, source);
+        }
+        StmtKind::Struct {
+            fields,
+            associated,
+            methods,
+            decorators,
+            ..
+        } => {
+            for field in fields {
+                stamp_type(&mut field.ty, source);
+            }
+            for member in associated {
+                stamp_expr(&mut member.value, source);
+            }
+            stamp_decorators(decorators, source);
+            for method in methods {
+                for param in &mut method.params {
+                    stamp_fn_param(param, source);
+                }
+                if let Some(ret) = &mut method.ret {
+                    stamp_type(ret, source);
+                }
+                stamp_decorators(&mut method.decorators, source);
+                stamp_block(&mut method.body, source);
+            }
+        }
+        StmtKind::Trait {
+            methods,
+            comptime_members,
+            ..
+        } => {
+            for method in methods {
+                for param in &mut method.params {
+                    stamp_fn_param(param, source);
+                }
+                if let Some(ret) = &mut method.ret {
+                    stamp_type(ret, source);
+                }
+                if let Some(body) = &mut method.default_body {
+                    stamp_block(body, source);
+                }
+            }
+            for member in comptime_members {
+                stamp_type(&mut member.ty, source);
+            }
+        }
+        StmtKind::Return(None)
+        | StmtKind::Import { .. }
+        | StmtKind::FromImport { .. }
+        | StmtKind::Pass
+        | StmtKind::Break
+        | StmtKind::Continue => {}
     }
 }

@@ -1,27 +1,30 @@
-use mojito::{BackendKind, RuntimeError, Value, parse};
+use mojito::{BackendKind, RuntimeError, TypeError, Value, check_program, parse};
 
 /// Run a program on the VM backend (the sole executor), returning its global
 /// (top-level) bindings for value inspection. No type-checking — these tests
 /// exercise evaluation semantics directly (static errors are `checker_test`'s job).
 fn run(source: &str) -> Vec<(String, Value)> {
     let program = parse(source).expect("parse error");
+    let checked = check_program(&program).expect("type error");
     let mut backend = BackendKind::Vm.make();
-    backend.run(&program).expect("runtime error");
+    backend.run(&checked).expect("runtime error");
     backend.bindings()
 }
 
 /// Run a program that is expected to fail at runtime, returning the error.
 fn run_err(source: &str) -> RuntimeError {
     let program = parse(source).expect("parse error");
+    let checked = check_program(&program).expect("type error");
     let mut backend = BackendKind::Vm.make();
-    backend.run(&program).expect_err("expected a runtime error")
+    backend.run(&checked).expect_err("expected a runtime error")
 }
 
 /// Run a program and return its captured `print` output.
 fn output(source: &str) -> String {
     let program = parse(source).expect("parse error");
+    let checked = check_program(&program).expect("type error");
     let mut backend = BackendKind::Vm.make();
-    backend.run(&program).expect("runtime error");
+    backend.run(&checked).expect("runtime error");
     backend.output()
 }
 
@@ -58,9 +61,8 @@ fn string_concatenation_and_equality() {
 
 #[test]
 fn and_or_short_circuit() {
-    // `missing` is undefined; if the short-circuit didn't fire, evaluating it
-    // would raise UndefinedVariable. Reaching a value proves it was skipped.
-    let e = run("var a: Bool = False and missing\nvar b: Bool = True or missing\n");
+    // Division by zero would fail at runtime if either right-hand side ran.
+    let e = run("var a: Bool = False and (1 // 0 == 0)\nvar b: Bool = True or (1 // 0 == 0)\n");
     assert_eq!(binding(&e, "a"), Value::Bool(false));
     assert_eq!(binding(&e, "b"), Value::Bool(true));
 }
@@ -96,28 +98,21 @@ fn closure_captures_enclosing_local_downward() {
 
 #[test]
 fn arity_mismatch_is_an_error() {
-    // Too many positional arguments is an arity error.
-    let err = run_err("def f(x: Int) -> Int:\n    return x\n\nvar a: Int = f(1, 2)\n");
-    assert_eq!(
-        err,
-        RuntimeError::ArityMismatch {
-            name: "f".into(),
-            expected: 1,
-            got: 2
-        }
-    );
-    // A missing required argument names the parameter.
-    let err = run_err("def f(x: Int) -> Int:\n    return x\n\nvar a: Int = f()\n");
-    assert_eq!(
-        err,
-        RuntimeError::TypeError("'f' missing required argument 'x'".into())
-    );
+    let program =
+        parse("def f(x: Int) -> Int:\n    return x\n\nvar a: Int = f(1, 2)\n").expect("parse");
+    assert!(matches!(
+        check_program(&program),
+        Err(TypeError::ArityMismatch { .. })
+    ));
 }
 
 #[test]
 fn type_mismatch_in_arithmetic_is_an_error() {
-    let err = run_err("var a: Int = 1 + True\n");
-    assert!(matches!(err, RuntimeError::TypeError(_)));
+    let program = parse("var a: Int = 1 + True\n").expect("parse");
+    assert!(matches!(
+        check_program(&program),
+        Err(TypeError::BadOperator { .. })
+    ));
 }
 
 // --- Structs ---
@@ -281,8 +276,7 @@ fn assignment_in_a_branch_updates_the_enclosing_variable() {
 #[test]
 fn var_less_introduction_binds_the_variable() {
     // `x = 1` on an undeclared name (implicit declaration) works on the VM: it
-    // lowers to the same binding as `var x = 1` (the tree-walker deferred this as
-    // "parse now, run later"; the compiler backend simply runs it).
+    // lowers to the same binding as `var x = 1`.
     let e = run("x = 1\nx = x + 4\n");
     assert_eq!(binding(&e, "x"), Value::Int(5));
 }
@@ -891,7 +885,7 @@ fn not_in_drives_a_dedup_loop() {
 
 // --- Member-write: place assignment + mut self ---
 
-const EPT: &str = "@fieldwise_init\nstruct Point:\n    var x: Int\n    var y: Int\n\n";
+const EPT: &str = "@fieldwise_init\nstruct Point:\n    var x: Int\n    var y: Int\n    def __copyinit__(out self, existing: Point):\n        self.x = existing.x\n        self.y = existing.y\n\n";
 
 #[test]
 fn field_write_mutates_in_place() {
@@ -1082,7 +1076,7 @@ fn float64_vector_arithmetic_and_lane_read() {
 #[test]
 fn float64_lane_write_and_aug_and_splat() {
     let e = run(
-        "var a: Float64 = 100.0\nvar v: SIMD[DType.float64, 3] = SIMD[DType.float64, 3](1.0, 2.0, 3.0)\nv[0] = a\nv[1] += 10.0\nvar lane0: Float64 = v[0]\nvar lane1: Float64 = v[1]\n",
+        "var a: Float64 = 100.0\nvar v: SIMD[DType.float64, 4] = SIMD[DType.float64, 4](1.0, 2.0, 3.0, 4.0)\nv[0] = a\nv[1] += 10.0\nvar lane0: Float64 = v[0]\nvar lane1: Float64 = v[1]\n",
     );
     assert_eq!(binding(&e, "lane0"), Value::Float64(100.0));
     assert_eq!(binding(&e, "lane1"), Value::Float64(12.0));

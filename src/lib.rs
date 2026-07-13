@@ -1,8 +1,10 @@
 pub mod analysis;
 pub mod ast;
 pub mod backend;
+mod call;
 pub mod checked;
 pub mod checker;
+pub mod compiler;
 pub mod comptime;
 pub mod ct;
 pub mod error;
@@ -19,11 +21,13 @@ pub mod types;
 // Re-export commonly used types at the crate root for convenience
 pub use analysis::{check_ownership, check_ownership_checked};
 pub use ast::{
-    Dtype, Expr, ImportName, ImportNames, InfixOp, Param, PrefixOp, Stmt, Type, TypeParam,
+    Dtype, Expr, ImportName, ImportNames, InfixOp, Param, PrefixOp, SourceType, Stmt, Type,
+    TypeParam,
 };
 pub use backend::{Backend, BackendKind};
 pub use checked::{CheckedConst, CheckedProgram};
 pub use checker::{Checker, check, check_program};
+pub use compiler::{CompiledProgram, Compiler, CompilerError, Execution};
 pub use comptime::{ComptimeError, elaborate};
 pub use ct::CtValue;
 pub use error::{LexError, OwnershipError, ParseError, RuntimeError, TypeError};
@@ -33,7 +37,7 @@ pub use module::{
 };
 pub use parser::{ParseReport, Parser};
 pub use runtime::Value;
-pub use token::Token;
+pub use token::{SourceSpan, Token};
 pub use types::{ParamDecl, Ty, TyArg};
 
 /// Lex `source` into its full token stream (a convenience for the **lex-only**

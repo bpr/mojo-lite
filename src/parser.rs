@@ -120,6 +120,7 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         Expr {
             kind,
             span: (start, self.last_span.1),
+            source: None,
         }
     }
 
@@ -358,10 +359,7 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         if matches!(self.peek_token()?, Some(Token::Assign)) {
             self.next_token()?; // consume '='
             let value = self.parse_expression(Precedence::Lowest)?;
-            let stmt = if matches!(expr.kind, ExprKind::Identifier(_)) {
-                let ExprKind::Identifier(name) = expr.kind else {
-                    unreachable!()
-                };
+            let stmt = if let ExprKind::Identifier(name) = expr.kind {
                 StmtKind::Assign { name, value }
             } else if matches!(expr.kind, ExprKind::Member { .. } | ExprKind::Index { .. }) {
                 // A field/index chain — the checker verifies its root is a
@@ -2070,7 +2068,7 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         }
 
         // Walrus / named expression: `name := value`. The target must be a bare
-        // name. (Parsed for completeness; the evaluator flags it as unsupported.)
+        // name. MIR preserves this as an explicit unsupported operation.
         if matches!(self.peek_token()?, Some(Token::ColonEq)) {
             self.next_token()?; // consume ':='
             let ExprKind::Identifier(name) = left.kind else {
@@ -2306,15 +2304,15 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         }
         loop {
             let expr = self.parse_expression(Precedence::Lowest)?;
-            if matches!(expr.kind, ExprKind::Identifier(_))
+            if let ExprKind::Identifier(name) = &expr.kind
                 && matches!(self.peek_token()?, Some(Token::Assign) | Some(Token::Colon))
             {
-                let ExprKind::Identifier(name) = expr.kind else {
-                    unreachable!()
-                };
                 self.next_token()?; // consume '=' or ':'
                 let value = self.parse_expression(Precedence::Lowest)?;
-                kwargs.push(KwArg { name, value });
+                kwargs.push(KwArg {
+                    name: name.clone(),
+                    value,
+                });
             } else {
                 if !kwargs.is_empty() {
                     return Err(ParseError::UnexpectedToken(

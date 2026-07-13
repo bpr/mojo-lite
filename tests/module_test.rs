@@ -3,7 +3,7 @@
 //! multi-file layout into a unique temp directory, link the entry file, then check
 //! + run it on the VM.
 
-use mojito::{BackendKind, LinkOptions, check, link, link_with_options};
+use mojito::{BackendKind, LinkOptions, check_program, link, link_with_options};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -37,10 +37,10 @@ impl Drop for TempDir {
 /// Link + check + run the entry file, returning its captured VM output.
 fn run(entry: &Path) -> Result<String, String> {
     let program = link(entry).map_err(|e| e.to_string())?;
-    check(&program).map_err(|e| format!("type error: {e:?}"))?;
+    let checked = check_program(&program).map_err(|e| format!("type error: {e:?}"))?;
     let mut backend = BackendKind::Vm.make();
     backend
-        .run(&program)
+        .run(&checked)
         .map_err(|e| format!("runtime error: {e:?}"))?;
     Ok(backend.output())
 }
@@ -117,9 +117,9 @@ fn custom_search_root_is_used_after_importer_directory() {
     )
     .map_err(|e| e.to_string())
     .unwrap();
-    check(&program).unwrap();
+    let checked = check_program(&program).unwrap();
     let mut backend = BackendKind::Vm.make();
-    backend.run(&program).unwrap();
+    backend.run(&checked).unwrap();
     assert_eq!(backend.output(), "42\n");
 }
 
@@ -145,9 +145,9 @@ fn custom_search_roots_are_tried_in_order() {
         },
     )
     .unwrap();
-    check(&program).unwrap();
+    let checked = check_program(&program).unwrap();
     let mut backend = BackendKind::Vm.make();
-    backend.run(&program).unwrap();
+    backend.run(&checked).unwrap();
     assert_eq!(backend.output(), "1\n");
 }
 
@@ -167,9 +167,9 @@ fn importer_directory_precedes_custom_search_roots() {
         },
     )
     .unwrap();
-    check(&program).unwrap();
+    let checked = check_program(&program).unwrap();
     let mut backend = BackendKind::Vm.make();
-    backend.run(&program).unwrap();
+    backend.run(&checked).unwrap();
     assert_eq!(backend.output(), "9\n");
 }
 
@@ -196,6 +196,42 @@ fn linked_declarations_preserve_module_identity_in_checked_program() {
         .unwrap();
     assert_eq!(answer.module.as_deref(), Some(module.to_str().unwrap()));
     assert_eq!(entry.module.as_deref(), Some(main.to_str().unwrap()));
+}
+
+#[test]
+fn linked_expression_locations_include_their_source_module() {
+    let d = TempDir::new();
+    let library = d.write(
+        "lib.mojo",
+        "def pick(x: Int) -> Int:\n    return x\n\ndef pick(x: String) -> String:\n    return x\n\ndef from_lib() -> Int:\n    return pick(1)\n",
+    );
+    let entry = d.write(
+        "main.mojo",
+        "from lib import pick, from_lib\n\ndef pick(x: Bool) -> Bool:\n    return x\n\ndef main():\n    print(from_lib(), pick(True))\n",
+    );
+    let checked = mojito::check_program(&link(&entry).expect("link")).expect("check");
+
+    let sources: std::collections::HashSet<_> = checked
+        .overload_targets()
+        .keys()
+        .filter_map(|location| location.source.as_deref())
+        .collect();
+    assert!(sources.contains(library.to_str().unwrap()));
+    assert!(sources.contains(entry.to_str().unwrap()));
+
+    let from_lib = checked
+        .statements()
+        .iter()
+        .find(|statement| matches!(&statement.kind, mojito::ast::StmtKind::Def { name, .. } if name == "from_lib"))
+        .expect("imported function");
+    let mojito::ast::StmtKind::Def { body, .. } = &from_lib.kind else {
+        unreachable!()
+    };
+    let mojito::ast::StmtKind::Return(Some(call)) = &body[0].kind else {
+        panic!("expected return call")
+    };
+    assert_eq!(call.source.as_deref(), Some(library.to_str().unwrap()));
+    assert_eq!(body[0].module.as_deref(), Some(library.to_str().unwrap()));
 }
 
 #[test]

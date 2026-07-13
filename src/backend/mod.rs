@@ -1,4 +1,3 @@
-use crate::ast::Stmt;
 use crate::checked::CheckedProgram;
 use crate::error::RuntimeError;
 use crate::runtime::Value;
@@ -10,10 +9,7 @@ pub use vm::VmBackend;
 /// AST, lowered to verified MIR) and it executes, capturing output.
 pub trait Backend {
     /// Run the whole program (top-level statements, then `main()` if present).
-    fn run(&mut self, program: &[Stmt]) -> Result<(), RuntimeError>;
-    fn run_checked(&mut self, program: &CheckedProgram) -> Result<(), RuntimeError> {
-        self.run(program.statements())
-    }
+    fn run(&mut self, program: &CheckedProgram) -> Result<(), RuntimeError>;
     /// Captured standard output.
     fn output(&self) -> String;
     /// Final top-level bindings, for the CLI `run` dump. Empty for backends with no
@@ -26,7 +22,7 @@ pub trait Backend {
 /// Which backend to execute with (`--backend=…`). The register VM is the sole
 /// executor today; the enum is retained as the seam for future backends (e.g.
 /// Cranelift) behind the verified-MIR waist.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
     Vm,
 }

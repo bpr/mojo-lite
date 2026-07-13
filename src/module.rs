@@ -99,9 +99,7 @@ pub fn link_with_options(
     let dir = entry_path.parent().unwrap_or_else(|| Path::new("."));
     let mut body = linker.resolve_entry(program, dir)?;
     let entry_module = display(entry_path);
-    for stmt in &mut body {
-        stmt.module = Some(entry_module.clone());
-    }
+    crate::ast::stamp_source(&mut body, &entry_module);
     let mut result = linker.decls;
     result.extend(body);
     Ok(result)
@@ -127,9 +125,7 @@ pub fn link_source_with_options(
     let dir = entry_path.parent().unwrap_or_else(|| Path::new("."));
     let mut body = linker.resolve_entry(program, dir)?;
     let entry_module = display(entry_path);
-    for stmt in &mut body {
-        stmt.module = Some(entry_module.clone());
-    }
+    crate::ast::stamp_source(&mut body, &entry_module);
     let mut result = linker.decls;
     result.extend(body);
     Ok(result)
@@ -207,7 +203,7 @@ impl Linker {
                     continue; // a module's `main` is not part of its API
                 }
                 names.insert(name.to_string());
-                stmt.module = Some(display(path));
+                crate::ast::stamp_source(std::slice::from_mut(&mut stmt), &display(path));
                 self.decls.push(stmt);
             }
         }

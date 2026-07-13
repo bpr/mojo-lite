@@ -1,35 +1,15 @@
-//! Phase 3 — register-VM backend (parity first).
+//! Register-VM backend and Mojito's sole runtime.
 //!
-//! Executes **verified MIR** directly: a program is lowered by `lower_program`
-//! into one `MirFunction` per `def`/method plus a synthetic `__toplevel__`, and
-//! this interpreter walks each function's basic blocks over a per-call frame of
-//! register + variable slots. No ownership analysis yet (that is Phase 4) — the
-//! goal here is to reproduce the tree-walker's observable behaviour (its captured
-//! `print` output). Value semantics come for free from `Value: Clone`.
-//!
-//! **Reuse for parity:** the VM and the tree-walker share one value-level layer,
-//! [`crate::runtime`] — `Value`, `apply_infix`/`apply_prefix`, `coerce`/
-//! `coerce_like`, the `List` method logic (`apply_list_method`/`list_query`), the
-//! `SIMD`/place operations, and `Value`'s `Display` — so the two backends can't
-//! drift on the covered subset, and the VM does not depend on the evaluator.
-//!
-//! **Covered:** scalars & `String`; all operators (short-circuit `and`/`or`
-//! lowered to CFG); `if`/`while`; `for`/`range` and `for` over a `List`; variable
-//! read/write and literal coercion; user `def` calls (parameter ABI) + recursion;
-//! `return`; **structs** (fieldwise construction, field read, method calls incl.
-//! `mut self` write-back, `mut`/`ref` ordinary-param write-back); **`List`/`Tuple`/
-//! `SIMD`** (construction, indexing, lane reads *and writes* through places); member/
-//! index writes through places; **value-parameterized generics** (structs reify
-//! `value_params`, functions bind them as frame locals); default/keyword/`*args`
-//! argument matching; **exceptions** (`try`/`except`/`else`/`finally`, incl. a
-//! `return` crossing the boundary); and the scalar/utility built-ins. Not yet (clean
-//! `Unsupported`, never a wrong answer): `break`/`continue` crossing a `try`, methods
-//! with keyword/default/variadic args, and nested `def`/`struct`.
+//! The VM executes verified, drop-elaborated [`MirProgram`]s over per-call
+//! register and variable frames. Language-level validation belongs to the
+//! checker and ownership analysis; this module implements the checked call ABI,
+//! places, structured control flow, exceptions, destruction, and runtime
+//! primitives. See `docs/features.md` for the supported language surface.
 
 use super::Backend;
 use crate::ast::Stmt;
+use crate::call::{ArgSlot, CallVariadics, match_call_slots};
 use crate::checked::CheckedConst;
-use crate::checker::{ArgSlot, CallVariadics, match_call_slots};
 use crate::error::RuntimeError;
 use crate::hir::VarId;
 use crate::mir::{Const, MirBlock, MirInstr, MirPlace, MirProgram, MirTerm, Proj, Reg};
@@ -218,7 +198,8 @@ impl VmBackend {
         value_params: &[(String, Value)],
         fuel: usize,
     ) -> Result<(Value, usize), RuntimeError> {
-        let prog = build_prog(program);
+        let checked = crate::checked::CheckedProgram::prevalidated_ctfe(program);
+        let prog = build_prog_checked(&checked)?;
         self.configure_lifecycle(&prog);
         let idx = prog.index_of(name).ok_or_else(|| {
             RuntimeError::Unsupported(format!("vm: unknown compile-time function '{name}'"))
@@ -299,7 +280,7 @@ impl VmBackend {
         let mut regs = vec![Value::None; f.n_regs as usize];
         let mut vars = vec![Value::None; f.n_vars];
         for (i, arg) in args.into_iter().enumerate() {
-            vars[i] = match f.param_types.get(i) {
+            vars[i] = match f.param_annotations.get(i) {
                 Some(t) => coerce(arg, t),
                 None => arg,
             };
@@ -434,7 +415,9 @@ impl VmBackend {
     ) -> Result<(), RuntimeError> {
         let recv = nav_mut(vars, regs, parent)?.clone();
         let Value::Struct { name, .. } = &recv else {
-            unreachable!("store_index_dunder is only called on a struct container");
+            return Err(RuntimeError::TypeError(
+                "__setitem__ dispatch requires a struct container".to_string(),
+            ));
         };
         let fname = prog.overload_name(&format!("{name}.__setitem__"), 2);
         let fidx = prog.index_of(&fname).ok_or_else(|| {
@@ -524,13 +507,14 @@ impl VmBackend {
             fields,
             value_params,
         };
-        let fidx = prog
-            .index_of(
-                &target
-                    .map(str::to_string)
-                    .unwrap_or_else(|| prog.overload_name(&format!("{name}.__init__"), args.len())),
-            )
-            .expect("caller checked __init__ is present");
+        let constructor = target
+            .map(str::to_string)
+            .unwrap_or_else(|| prog.overload_name(&format!("{name}.__init__"), args.len()));
+        let fidx = prog.index_of(&constructor).ok_or_else(|| {
+            RuntimeError::Unsupported(format!(
+                "vm: checked constructor '{constructor}' is missing from MIR"
+            ))
+        })?;
         let mut call_args = Vec::with_capacity(args.len() + 1);
         call_args.push(skeleton);
         call_args.extend(args);
@@ -703,8 +687,8 @@ impl VmBackend {
 
     /// Call a free function that has `mut`/`ref` parameters, writing each one's
     /// final value back to the caller's argument place (`arg_places`). This is the
-    /// runtime half of reference parameters — the tree-walker's `eval_call`
-    /// write-back, done over the caller's frame (`regs`/`vars`).
+    /// runtime half of call-scoped reference parameters, performed over the
+    /// caller's frame (`regs`/`vars`).
     fn call_with_writeback(
         &mut self,
         prog: &Prog,
@@ -840,10 +824,14 @@ impl VmBackend {
                 }
                 regs[dest.0 as usize] = value;
             }
-            MirInstr::DefVar { var, src, ty } => {
+            MirInstr::DefVar {
+                var,
+                src,
+                source_annotation,
+            } => {
                 let v = regs[src.0 as usize].clone();
                 let slot = *var as usize;
-                vars[slot] = match ty {
+                vars[slot] = match source_annotation {
                     Some(t) => coerce(v, t),
                     None => crate::runtime::coerce_like(v, &vars[slot]),
                 };
@@ -1176,8 +1164,8 @@ impl VmBackend {
         Ok(Flow::Normal)
     }
 
-    /// Execute a `try`/`except`/`else`/`finally` region (mirroring the tree-walker's
-    /// `exec_try`). Each sub-part runs as a mini-CFG in the current frame; a raise in
+    /// Execute a `try`/`except`/`else`/`finally` region. Each sub-part runs as a
+    /// mini-CFG in the current frame; a raise in
     /// the body unwinds to `handler` (after running the `cleanup` drops), `else` runs
     /// on normal completion, and `finally` always runs (its raise wins).
     fn exec_try(
@@ -1545,8 +1533,7 @@ impl VmBackend {
                 )),
             },
             "range" => build_range(&args),
-            // Utility numeric built-ins — the same value-level semantics the
-            // tree-walker uses (shared `builtin_*` helpers), so the backends agree.
+            // Utility numeric built-ins use the shared runtime value helpers.
             "abs" => builtin_abs(arg1(name, args)?),
             "min" => {
                 let (a, b) = arg2(name, args)?;
@@ -1635,16 +1622,8 @@ impl VmBackend {
 }
 
 impl Backend for VmBackend {
-    fn run(&mut self, program: &[Stmt]) -> Result<(), RuntimeError> {
-        let prog = build_prog(program);
-        self.run_prog(prog)
-    }
-
-    fn run_checked(
-        &mut self,
-        program: &crate::checked::CheckedProgram,
-    ) -> Result<(), RuntimeError> {
-        self.run_prog(build_prog_checked(program))
+    fn run(&mut self, program: &crate::checked::CheckedProgram) -> Result<(), RuntimeError> {
+        self.run_prog(build_prog_checked(program)?)
     }
 
     fn output(&self) -> String {
@@ -1679,24 +1658,24 @@ impl VmBackend {
     }
 }
 
-fn build_prog(program: &[Stmt]) -> Prog {
-    let checked = crate::checker::check_program(program)
-        .unwrap_or_else(|_| crate::checked::CheckedProgram::unchecked(program));
-    build_prog_checked(&checked)
-}
-
-fn build_prog_checked(checked: &crate::checked::CheckedProgram) -> Prog {
+fn build_prog_checked(checked: &crate::checked::CheckedProgram) -> Result<Prog, RuntimeError> {
     let mir = crate::analysis::elaborate_drops_program(crate::mir::lower_checked_program(checked));
+    if !mir.invariant_errors.is_empty() {
+        return Err(RuntimeError::Unsupported(format!(
+            "invalid checked program: {}",
+            mir.invariant_errors.join("; ")
+        )));
+    }
     let structs = build_structs(&mir.declarations);
     let sigs = build_sigs(&mir.declarations);
-    Prog {
+    Ok(Prog {
         // Elaborate ASAP drops: splice a `DropVar` after each variable's last
         // use, so a struct's `__del__` runs there (Phase 4). A no-op for values
-        // without a destructor, so parity with the tree-walker is preserved.
+        // without a destructor.
         mir,
         structs,
         sigs,
-    }
+    })
 }
 
 /// Build the VM registry from declaration metadata carried by MIR.
@@ -1748,128 +1727,8 @@ fn build_sigs(declarations: &crate::mir::MirDeclarations) -> HashMap<String, FnS
         .collect()
 }
 
-/// Const-fold a default-argument expression to a value. Handles the literal forms
-/// (and a unary minus over one) that defaults use in practice; a non-constant
-/// default folds to `None` and errors only if that slot is actually taken.
-fn checked_const_value(value: &CheckedConst) -> Value {
-    match value {
-        CheckedConst::Int(value) => Value::Int(*value),
-        CheckedConst::Float(value) => Value::Float64(*value),
-        CheckedConst::Bool(value) => Value::Bool(*value),
-        CheckedConst::String(value) => Value::Str(value.clone()),
-        CheckedConst::None => Value::None,
-    }
-}
-
-/// Match positional + keyword arguments to a function's parameter slots, producing
-/// the ordered argument values the frame binds — filling defaults and collecting a
-/// trailing `*args` into a `List`. Mirrors the tree-walker's `eval_call`.
-fn bind_args(
-    name: &str,
-    sig: &FnSig,
-    argv: Vec<Value>,
-    kwargs: Vec<(String, Value)>,
-) -> Result<(Vec<Value>, Vec<ArgSlot>), RuntimeError> {
-    let kw_names: Vec<&str> = kwargs.iter().map(|(n, _)| n.as_str()).collect();
-    let matched = match_call_slots(
-        &sig.param_names,
-        &sig.required,
-        sig.positional_only,
-        sig.keyword_only,
-        argv.len(),
-        &kw_names,
-        CallVariadics {
-            positional: sig.variadic.is_some(),
-            keyword: sig.kw_variadic.is_some(),
-        },
-    )
-    .map_err(|e| e.into_runtime_error(name))?;
-    let (slots, overflow) = (matched.slots, matched.positional_overflow);
-
-    let mut regular_values = Vec::with_capacity(slots.len());
-    for (i, slot) in slots.iter().enumerate() {
-        let value = match slot {
-            ArgSlot::Positional(p) => argv[*p].clone(),
-            ArgSlot::Keyword(k) => kwargs[*k].1.clone(),
-            ArgSlot::Default => sig.defaults[i].clone().ok_or_else(|| {
-                RuntimeError::Unsupported(format!(
-                    "vm: non-constant default for parameter '{}' of '{name}'",
-                    sig.param_names[i]
-                ))
-            })?,
-        };
-        regular_values.push(crate::runtime::coerce_checked(value, &sig.param_types[i]));
-    }
-    // Collect overflow positional args into the `*args` list.
-    let (out, frame_slots) = if let Some(elem_ty) = &sig.variadic {
-        let items = overflow
-            .iter()
-            .map(|&idx| crate::runtime::coerce_checked(argv[idx].clone(), elem_ty))
-            .collect();
-        let idx = sig.variadic_index.unwrap_or(regular_values.len());
-        let mut out = Vec::with_capacity(regular_values.len() + 1);
-        out.extend(regular_values[..idx].iter().cloned());
-        out.push(Value::List(items));
-        out.extend(regular_values[idx..].iter().cloned());
-        let mut frame_slots = Vec::with_capacity(slots.len() + 1);
-        frame_slots.extend(slots[..idx].iter().copied());
-        frame_slots.push(ArgSlot::Default);
-        frame_slots.extend(slots[idx..].iter().copied());
-        (out, frame_slots)
-    } else {
-        (regular_values, slots)
-    };
-    let (mut out, mut frame_slots) = (out, frame_slots);
-    if let Some(index) = sig.kw_variadic_index {
-        out.insert(index, Value::None);
-        frame_slots.insert(index, ArgSlot::Default);
-    }
-    Ok((out, frame_slots))
-}
-
-/// Build a struct instance (fieldwise), coercing each argument to its field type.
-fn construct(
-    def: &StructDef,
-    name: &str,
-    args: Vec<Value>,
-    param_vals: &[Option<Value>],
-) -> Result<Value, RuntimeError> {
-    if !def.fieldwise_init {
-        return Err(RuntimeError::TypeError(format!(
-            "struct '{name}' has no constructor"
-        )));
-    }
-    if def.fields.len() != args.len() {
-        return Err(RuntimeError::ArityMismatch {
-            name: name.to_string(),
-            expected: def.fields.len(),
-            got: args.len(),
-        });
-    }
-    let fields = def
-        .fields
-        .iter()
-        .zip(args)
-        .map(|((fname, fty), arg)| (fname.clone(), crate::runtime::coerce_checked(arg, fty)))
-        .collect();
-    // Reify the value parameters onto the instance (type parameters stay erased):
-    // pair each declared value parameter with its supplied comptime `Int` argument.
-    // Explicit `Name[...](...)` supplies every parameter positionally, so the decls
-    // align with `param_vals`.
-    let value_params = def
-        .param_decls
-        .iter()
-        .zip(param_vals)
-        .filter(|((_, is_value), _)| *is_value)
-        .map(|((pname, _), val)| (pname.clone(), val.clone().unwrap_or(Value::None)))
-        .collect();
-    Ok(Value::Struct {
-        name: name.to_string(),
-        fields,
-        value_params,
-    })
-}
-
+mod calls;
+use calls::*;
 /// Read a struct field (or a reified value parameter, e.g. `Self.n`) by name.
 fn get_field(base: &Value, field: &str) -> Result<Value, RuntimeError> {
     match base {
@@ -1971,123 +1830,8 @@ fn build_range(args: &[Value]) -> Result<Value, RuntimeError> {
     Ok(Value::Range { start, stop, step })
 }
 
-/// Navigate one projection step from a container slot to an inner mutable slot.
-/// A SIMD lane is *not* a `Value` slot, so it is not reachable here — callers that
-/// may target a lane (`store_place`/`load_place`) special-case a final `Index`
-/// into a `Value::Simd` before reaching this.
-fn nav_step<'a>(
-    slot: &'a mut Value,
-    proj: &Proj,
-    regs: &[Value],
-) -> Result<&'a mut Value, RuntimeError> {
-    match proj {
-        Proj::Field(name) => match slot {
-            // Search declared fields first, then value parameters (a `Self.n`
-            // read) — mirroring `get_field`, so a place read through this matches
-            // the register-based `GetField`.
-            Value::Struct {
-                fields,
-                value_params,
-                ..
-            } => {
-                if let Some(pos) = fields.iter().position(|(f, _)| f == name) {
-                    Ok(&mut fields[pos].1)
-                } else if let Some(pos) = value_params.iter().position(|(f, _)| f == name) {
-                    Ok(&mut value_params[pos].1)
-                } else {
-                    Err(RuntimeError::TypeError(format!("no field '{name}'")))
-                }
-            }
-            other => Err(RuntimeError::TypeError(format!(
-                "field access on non-struct {}",
-                crate::runtime::type_name(other)
-            ))),
-        },
-        Proj::Index(reg) => {
-            let idx = value_as_index(&regs[reg.0 as usize])?;
-            match slot {
-                Value::List(items) => {
-                    let i = crate::runtime::bounds_check(idx, items.len(), "list index")?;
-                    Ok(&mut items[i])
-                }
-                Value::Tuple(items) => {
-                    let i = crate::runtime::bounds_check(idx, items.len(), "tuple index")?;
-                    Ok(&mut items[i])
-                }
-                other => Err(RuntimeError::TypeError(format!(
-                    "cannot index {}",
-                    crate::runtime::type_name(other)
-                ))),
-            }
-        }
-    }
-}
-
-/// Navigate a [`MirPlace`] to a mutable slot: the root variable followed by field
-/// and index projections. Used for method write-back and `MovePlace` (a pure
-/// field chain). A SIMD lane isn't a `Value` slot; use `store_place`/`load_place`
-/// for a place that may end in a lane.
-fn nav_mut<'a>(
-    vars: &'a mut [Value],
-    regs: &[Value],
-    place: &MirPlace,
-) -> Result<&'a mut Value, RuntimeError> {
-    let mut slot = &mut vars[place.root as usize];
-    for proj in &place.proj {
-        slot = nav_step(slot, proj, regs)?;
-    }
-    Ok(slot)
-}
-
-/// Write `value` into a place, handling a **SIMD lane** target (`v[i] = e`,
-/// `obj.vec[i] = e`) — a lane isn't a `Value` slot, so it is set via
-/// `set_simd_lane` (dtype wrap/round) after navigating the container.
-fn store_place(
-    vars: &mut [Value],
-    regs: &[Value],
-    place: &MirPlace,
-    value: Value,
-) -> Result<(), RuntimeError> {
-    match place.proj.split_last() {
-        None => {
-            vars[place.root as usize] = value;
-            Ok(())
-        }
-        Some((last, prefix)) => {
-            let mut slot = &mut vars[place.root as usize];
-            for proj in prefix {
-                slot = nav_step(slot, proj, regs)?;
-            }
-            if let Proj::Index(ireg) = last
-                && let Value::Simd { dtype, lanes } = slot
-            {
-                let idx = value_as_index(&regs[ireg.0 as usize])?;
-                return crate::runtime::set_simd_lane(*dtype, lanes, idx, value);
-            }
-            *nav_step(slot, last, regs)? = value;
-            Ok(())
-        }
-    }
-}
-
-/// Read (clone) the value at a place, handling a **SIMD lane** read (`v[i]`,
-/// `obj.vec[i]`) via `read_simd_lane`.
-fn load_place(vars: &mut [Value], regs: &[Value], place: &MirPlace) -> Result<Value, RuntimeError> {
-    if let Some((Proj::Index(ireg), prefix)) = place.proj.split_last() {
-        let mut slot = &mut vars[place.root as usize];
-        for proj in prefix {
-            slot = nav_step(slot, proj, regs)?;
-        }
-        if let Value::Simd { dtype, lanes } = slot {
-            let idx = value_as_index(&regs[ireg.0 as usize])?;
-            return read_simd_lane(*dtype, lanes, idx);
-        }
-        // Not a SIMD parent — fall through to the final index step below.
-        return Ok(nav_step(slot, &Proj::Index(*ireg), regs)?.clone());
-    }
-    Ok(nav_mut(vars, regs, place)?.clone())
-}
-
+mod places;
+use places::*;
 /// Whether a branch condition register holds `True`.
 fn is_true(v: &Value) -> bool {
     matches!(v, Value::Bool(true))

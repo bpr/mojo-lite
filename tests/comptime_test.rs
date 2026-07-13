@@ -10,9 +10,7 @@ fn run(src: &str) -> Result<String, String> {
     let program = elaborate(program).map_err(|e| format!("comptime: {e}"))?;
     let checked = mojito::check_program(&program).map_err(|e| format!("check: {e:?}"))?;
     let mut backend = BackendKind::Vm.make();
-    backend
-        .run_checked(&checked)
-        .map_err(|e| format!("run: {e:?}"))?;
+    backend.run(&checked).map_err(|e| format!("run: {e:?}"))?;
     Ok(backend.output())
 }
 

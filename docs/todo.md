@@ -6,8 +6,6 @@ milestones belong in `roadmap.md`; architectural invariants belong in
 
 Tasks are grouped in the same approximate dependency order as the roadmap.
 
-## Correctness and Interface Gaps
-
 ## Self-Hosted Collections
 
 ### HashSet growth and rehashing

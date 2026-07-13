@@ -4,8 +4,22 @@
 /// and the MIR (whose `SpanTable` maps each temporary back to its origin span).
 pub type Span = (usize, usize);
 
+/// A byte range together with the linked source file it belongs to. Parser-only
+/// programs use `None`; the module linker stamps every nested AST node.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SourceSpan {
+    pub source: Option<String>,
+    pub span: Span,
+}
+
+impl SourceSpan {
+    pub fn new(source: Option<String>, span: Span) -> Self {
+        Self { source, span }
+    }
+}
+
 /// The zero-width, position-`0` span used for synthetic nodes that have no source
-/// text (e.g. the `main()` call the evaluator synthesizes as a program entry).
+/// text (e.g. compiler-generated program-entry operations).
 pub const DUMMY_SPAN: Span = (0, 0);
 
 /// The token set for the implemented subset of Mojo.

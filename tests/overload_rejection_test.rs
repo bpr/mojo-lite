@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use mojito::mir::lower_program;
-use mojito::{BackendKind, TypeError, check, elaborate, link, parse};
+use mojito::{BackendKind, TypeError, check, check_program, elaborate, link, parse};
 
 /// Parse + elaborate + type-check, returning the checker's verdict.
 fn check_source(source: &str) -> Result<(), TypeError> {
@@ -59,9 +59,9 @@ fn assert_ambiguous(source: &str, func: &str) {
 fn vm(source: &str) -> String {
     let program = parse(source).expect("parse error");
     let program = elaborate(program).expect("comptime error");
-    check(&program).expect("type error");
+    let checked = check_program(&program).expect("type error");
     let mut backend = BackendKind::Vm.make();
-    backend.run(&program).expect("runtime error");
+    backend.run(&checked).expect("runtime error");
     backend.output()
 }
 
@@ -69,6 +69,7 @@ fn vm(source: &str) -> String {
 /// preserved — a repeated name is a symbol collision).
 fn lowered_names(source: &str) -> Vec<String> {
     lower_program(&parse(source).expect("parse error"))
+        .expect("type error")
         .functions
         .into_iter()
         .map(|(name, _)| name)
@@ -594,8 +595,8 @@ fn importing_a_name_extends_the_local_overload_set() {
         "from lib import f\n\ndef f(x: String) -> Int:\n    return 20\n\ndef main():\n    var i: Int = 1\n    print(f(i), f(\"abc\"))\n",
     );
     let program = link(&entry).expect("link error");
-    check(&program).expect("type error");
+    let checked = check_program(&program).expect("type error");
     let mut backend = BackendKind::Vm.make();
-    backend.run(&program).expect("runtime error");
+    backend.run(&checked).expect("runtime error");
     assert_eq!(backend.output(), "10 20\n");
 }

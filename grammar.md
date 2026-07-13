@@ -135,9 +135,8 @@ error). A place write mutates the root variable's binding **in place** (value
 semantics: only that binding changes).
 
 `x = e` on an **undeclared** name is a Mojo **`var`-less variable introduction**
-(implicit declaration). mojo-lite parses and type-checks it (binding the implicit
-variable), but the evaluator reports it as an **unsupported feature** — a
-"parse now, run later" gap (write an explicit `var x: T = e`).
+(implicit declaration). Mojito binds its inferred type and lowers it like an
+explicit inferred `var` declaration.
 
 **Tuple unpacking** `a, b, … = e` binds each target to the corresponding element of
 the tuple `e` (Mojo's `x, y = example_tuple`; a top-level comma in the target list is
@@ -315,17 +314,14 @@ trait_comptime: 'comptime' NAME ':' type NEWLINE              # a compile-time m
 
 A `trait` declares **method requirements**: each is a `def` header (with the implicit
 `self` first parameter, like a struct method) whose body is exactly `...` (the ellipsis
-token) — a requirement, not an implementation. A struct that conforms must supply a
-method of matching signature. **Fully modeled:** a *pure* trait (only `...`-bodied
-methods, no super-traits, no `comptime` members) and struct conformance to it.
+token) — a requirement, not an implementation. A conforming struct must supply
+matching methods and associated `comptime` members. Receiver conventions and
+associated type/value facts participate in conformance and generic bounds.
 
-Three further, valid-Mojo trait forms are **parsed and grammar-documented, but the
-checker flags each as an unsupported feature** (semantics deferred — "parse now, run
-later"): **trait inheritance / refinement** (`trait Bird(Animal, Named):` — a
+Two further valid-Mojo trait forms are parsed but rejected by the checker:
+**trait inheritance / refinement** (`trait Bird(Animal, Named):` — a
 parenthesized super-trait list, reusing the struct `conformance` grammar), **default
-method implementations** (a real block body instead of `...`), and **`comptime`
-members** (`comptime count: Int`, `comptime EltType: Copyable` — a compile-time
-constant/associated-alias requirement). **Generic traits** `trait T[U]:` are **not**
+method implementations** (a real block body instead of `...`). **Generic traits** `trait T[U]:` are **not**
 valid current Mojo (verified — only conforming *structs* are parameterized), so per the
 strict-subset rule no trait `[type_params]` is parsed. Also deferred: trait runtime
 fields (Mojo has none — members are `comptime`).
@@ -396,8 +392,8 @@ block (`with open(p) as f:`, `with lock():`, or several comma-separated
 result bound to `NAME` if present — and `__exit__` on exit). The `as` target is a
 plain `NAME`; the **parenthesized** and **tuple-target** forms are not in the Mojo
 docs, so (strict-subset) they are not parsed. The statement is **parsed and
-grammar-documented, but the checker flags it as an unsupported feature** (the
-`__enter__`/`__exit__` protocol is deferred) — a "parse now, run later" gap.
+grammar-documented, but the checker rejects it because the
+`__enter__`/`__exit__` protocol is not implemented.
 
 ### try_stmt
 
@@ -475,7 +471,7 @@ primary:
     | NAME param_args                    # parameterized type in expr position (TypeApply), e.g. UnsafePointer[Int]
     | primary '[' expression ']'         # subscript: index, v[i], ptr[i]
     | primary '[' [expression] ':' [expression] [':' [expression]] ']'  # slice `a[i:j:k]` on List/String (implemented)
-    | primary '^'                        # transfer sigil (ownership move); parsed, not modeled
+    | primary '^'                        # transfer sigil; lowered and ownership-checked as a move
     | atom
 atom:
     | NAME
@@ -517,8 +513,8 @@ Notes:
   parses as `not (x in c)` (the same truth value).
 - **The walrus / named expression `NAME := e`** binds looser than every operator (so
   `(n := a + b)` is `n := (a + b)`); the target must be a bare `NAME`. It is **parsed**
-  (AST `Expr::Named`) and type-checks as `e`'s type, but the evaluator reports it as an
-  **unsupported feature** (a "parse now, run later" gap); since it isn't run, the checker
+  (AST `Expr::Named`) and type-checks as `e`'s type, but MIR execution reports an
+  **unsupported feature**; since it isn't run, the checker
   does not bind the name, so a program that *uses* the walrus-bound name later won't
   type-check.
 - **`primary` is left-recursive over `.NAME` (field access) and `.NAME(args)` (method
@@ -527,15 +523,14 @@ Notes:
   struct constructor — so `(f)(x)` works but `f(x)(y)` does not (the result of a call is
   not a `NAME`; chain through a method instead).
 - **`[` after a `primary` is disambiguated by what follows**: `NAME '[' param_args ']'
-  '(' args ')'` is a call/construction with explicit compile-time parameters (Phase 2);
-  `primary '[' expression ']'` *not* followed by `(` is a **subscript** — a SIMD lane
-  read `v[i]` (the only subscriptable value; there is no list/dict indexing, and no lane
-  *write* `v[i] = x`).
+  '(' args ')'` is a call/construction with explicit compile-time parameters;
+  `primary '[' expression ']'` *not* followed by `(` is a **subscript**. Lists,
+  tuples, SIMD values, unsafe pointers, and supported user indexing
+  protocols provide reads; writable containers also support indexed assignment.
 - **`^` (transfer sigil)** is a postfix that marks an ownership *move* of its operand
-  (`x^`, `raise e^`). mojo-lite **parses** it anywhere a `primary` can appear but does
-  **not model** ownership/move — the value semantics are unchanged, so `x^` evaluates to
-  `x`. (Real move semantics — argument conventions `owned`/`mut`, `__moveinit__` — are
-  deferred; the sigil is parsed for completeness.)
+  (`x^`, `raise e^`). MIR represents whole-value and projected-field moves;
+  ownership analysis rejects use-after-move, double moves, conditional moves,
+  and invalid partial-move uses.
 - **`factor`** has only unary `-` (no unary `+`, no `~`). Unary `-` applies to `Int`
   and `Float64` (not `UInt`).
 - **`power` (`**`) is right-associative and binds tighter than unary `-`** (so
@@ -545,8 +540,9 @@ Notes:
   `+ - * // % **` take same-type operands and return that type (`+` also concatenates
   `String`); `/` (true division) returns `Float64` for any numeric operands
   (`Int / Int → Float64`). Integer `//` / `%` by zero is a runtime error.
-- **`args`** is a non-empty comma-separated list: no trailing comma, no
-  `*` / `**` / keyword arguments.
+- **`args`** accepts positional arguments followed by keyword arguments. Callee
+  signatures may use defaults, `/`, bare `*`, homogeneous `*args`, and homogeneous
+  `**kwargs`; structural matching is shared by checking and VM frame binding.
 
 ## Types
 
@@ -574,7 +570,7 @@ or the conforming type (in a trait method). Inside a value-parameterized struct,
 `Self` as a *type* is not supported (a value parameter can't appear in a type).
 A **function/closure type** `def(T1, …) [thin] [raises] -> R` (parameters are types
 only; `thin` marks a non-capturing function pointer, default capturing) **parses**
-into `Type::Func` but the checker flags any function-typed binding as unsupported
+into `Type::Func`, but the checker flags function-typed bindings as unsupported
 (semantics deferred). Capture lists `{…}` on a closure are **not** parsed yet
 (their current-Mojo grammar is unsettled — the old `unified` keyword was removed).
 A **reference type** `ref[origin] T` (used in a `ref` return, `def f(…) -> ref[o] T:`)
@@ -615,12 +611,12 @@ time and keeps only the taken branch — the others are **dropped before type-ch
 so an unselected branch may contain code valid only for other specializations; `comptime
 for` unrolls over a compile-time **`range(...)` or a compile-time tuple/list**
 (`comptime for s in ("a", "b"):`), substituting the loop variable with its literal value
-in each body copy, bounded by an iteration **quota**. The evaluator's compile-time values
+in each body copy, bounded by an iteration **quota**. Shared compile-time values
 are `Int`/`Bool`/`String`/`Tuple`/`List` (integer arithmetic & comparisons, `and`/`or`/
 `not`, `String` `+`/`==`, indexing a comptime tuple/list) and it reads `comptime NAME`
-constants. **CTFE:** a `comptime` context may call a **pure top-level function** — run by a
-small, fuel-bounded AST interpreter (`comptime CAP = next_power_of_two(17)`; supports
-`if`/`while`/`for`/recursion over compile-time values, no I/O or runtime state).
+constants. **CTFE:** a `comptime` context may call a **pure top-level function** through
+the same HIR/MIR/register-VM execution machinery as runtime code, under a shared fuel
+budget (`comptime CAP = next_power_of_two(17)`).
 **Materialization:** module-level `comptime` constants are inlined as literals into runtime
 code (values, value-parameter arguments), so a top-level comptime value is usable inside
 functions. Deferred: compile-time *type* values, CTFE of methods/generic functions, and
@@ -633,7 +629,7 @@ built-ins only when not shadowed by a binding.
 
 - `range(stop)` / `range(start, stop)` / `range(start, stop, step)` — the only
   iterable (the value a `for` consumes). The checker types it (1–3 `Int` arguments,
-  result `range`); the evaluator implements it (half-open `[start, stop)`, zero `step`
+  result `range`); the VM implements it (half-open `[start, stop)`, zero `step`
   is a runtime error).
 - `Int(x)` / `UInt(x)` / `Float64(x)` — numeric conversions: one argument of type
   `Int`, `UInt`, `Float64`, or `Bool`, producing the named type. (`Float64`→integer

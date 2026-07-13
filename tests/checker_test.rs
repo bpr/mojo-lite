@@ -134,7 +134,7 @@ fn rejects_escaping_closure() {
     assert_eq!(e, TypeError::ClosureEscape);
 }
 
-// --- Rules Mojo enforces statically but the evaluator did not ---
+// --- Statically enforced Mojo rules ---
 
 #[test]
 fn rejects_same_scope_redeclaration() {
@@ -502,7 +502,7 @@ fn rejects_wrong_struct_type_argument() {
 fn rejects_conflicting_type_parameter_solutions() {
     // A concrete Float64 parameter and an Int-literal argument do not unify:
     // the literal is defaulted to Int, so `Pair(1.0, 2)` is a conflict, not
-    // `Pair[Float64]` (keeps the type-erased evaluator sound).
+    // `Pair[Float64]` (keeps generic specialization and VM storage consistent).
     let e = err(&format!("{PAIR}var p: Pair[Float64] = Pair(1.0, 2)\n"));
     assert!(matches!(e, TypeError::TypeMismatch { .. }), "got {:?}", e);
 }

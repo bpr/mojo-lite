@@ -38,7 +38,7 @@ fn run(entry: &Path) -> Result<String, String> {
     let checked = mojito::check_program(&program).map_err(|e| format!("type error: {e:?}"))?;
     let mut backend = BackendKind::Vm.make();
     backend
-        .run_checked(&checked)
+        .run(&checked)
         .map_err(|e| format!("runtime error: {e:?}"))?;
     Ok(backend.output())
 }

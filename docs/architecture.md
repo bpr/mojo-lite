@@ -1,5 +1,9 @@
 # Architecture After Parsing
 
+Companion references: [feature support](features.md),
+[symbol ownership and navigation](symbol-map.md), and the
+[VM instruction set](vm-instruction-set.md).
+
 This document describes mojito after parsing. Its simplest input is the parsed
 program:
 
@@ -9,7 +13,7 @@ Vec<ast::Stmt>
 
 When the compiler is running from a file path, the first post-parse stage may
 also parse imported modules and link them into that same shape. Lexing and
-parsing are intentionally out of scope here; see `docs/frontend.md` for those.
+parsing are intentionally out of scope here; see [the frontend guide](frontend.md).
 This file starts where the parser stops and follows a program through module
 linking, compile-time elaboration, semantic checking, HIR lowering, MIR lowering,
 compiler analyses, drop elaboration, and execution on the register VM.
@@ -29,6 +33,20 @@ Vec<Stmt>
   -> drop elaboration
   -> register VM
 ```
+
+Normal whole-program clients use `compiler::Compiler`, which embodies this
+ordering rather than requiring callers to compose stages manually:
+
+```rust
+let compiler = Compiler::default();
+let program = compiler.compile_path(path)?;
+let execution = compiler.execute(&program)?;
+```
+
+`CompiledProgram` can only be constructed after linking, comptime elaboration,
+semantic checking, and ownership analysis succeed. `CompilerError` identifies
+the failing stage. Individual stage functions remain public for compiler tests,
+diagnostic tools, and experimentation.
 
 The design is an hourglass:
 
@@ -78,6 +96,30 @@ mojito is not trying to be Mojo's production architecture. It has no MLIR
 backend, no GPU pipeline, and no optimizer stack. The register VM is the concrete
 execution model and the executable specification for the supported subset.
 
+### Source Module Boundaries
+
+Large phases keep orchestration in their root module and delegate reusable
+policy or data-model responsibilities to focused children:
+
+- `call.rs` is the phase-neutral function-call contract: it normalizes parser
+  marker indexes and matches positional, keyword, default, `*args`, and
+  `**kwargs` inputs to parameter slots. The checker and VM separately adapt its
+  structural errors and matched slots to types and runtime values.
+- `checker.rs` coordinates checking; `checker/annotations.rs`, `builtins.rs`,
+  `calls.rs`, `declarations.rs`, `generics.rs`, and `places.rs` own annotation
+  conversion, built-in rules, argument matching, declaration flow checks,
+  substitution, and place/alias rules.
+- `mir/mod.rs` lowers ordinary code; `mir/ir.rs` defines the MIR data model and
+  `mir/nested.rs` owns capture analysis and nested-function lifting.
+- `backend/vm.rs` drives execution; `backend/vm/calls.rs` owns runtime argument
+  binding and construction, while `backend/vm/places.rs` owns projected storage
+  navigation and access.
+- `comptime.rs` runs elaboration and specialization;
+  `comptime/rewrite.rs` owns AST substitution and value materialization.
+
+Child modules expose only the phase-internal operations their coordinator needs.
+The public entry points for each compiler phase remain in its root module.
+
 ## Stage 1: Module Linking
 
 Module:
@@ -117,10 +159,13 @@ overload set in the ordinary flat program scope.
 Plain `import module` is parsed but still acts as a no-op because qualified
 `module.Name` lookup is not modeled yet. Aliases are also deferred.
 
-Linking retains flat name-binding semantics, but each hoisted and entry statement
-now carries its source module path. `CheckedProgram` preserves that provenance for
-diagnostics and future interchange without reintroducing module namespaces into
-ordinary lookup.
+Linking retains flat name-binding semantics, but recursively stamps every
+statement and expression with its source module path. A `SourceSpan` combines
+that path with the node's file-local byte range, so identical offsets in
+different modules remain distinct. `CheckedProgram`, overload selection, MIR
+register provenance, and ownership diagnostics preserve these locations without
+reintroducing module namespaces into ordinary lookup. Compile-time rewriting
+re-stamps generated subtrees from their owning declaration.
 
 ## Stage 2: Comptime Elaboration
 
@@ -355,7 +400,7 @@ does not inspect runtime value tags to choose between same-arity candidates.
 Instead, the checker records a side table:
 
 ```text
-source span -> lowered callee name
+source-aware span -> lowered callee name
 ```
 
 MIR lowering consults that table when it sees an overloaded call expression.
@@ -540,9 +585,14 @@ Main entry points:
 
 ```rust
 lower_cfg(cfg: &hir::Cfg) -> MirFunction
-lower_program(program: &[Stmt]) -> MirProgram
+lower_program(program: &[Stmt]) -> Result<MirProgram, TypeError>
 lower_checked_program(program: &CheckedProgram) -> MirProgram
 ```
+
+Normal compilation uses `lower_checked_program`. The compatibility
+`lower_program` entry point performs semantic checking and propagates any
+`TypeError`; it never manufactures unchecked semantic data. VM-backed CTFE has
+one separate internal path for fragments already validated by the elaborator.
 
 MIR is the stable waist of the compiler. HIR still has nested expressions; MIR
 flattens them into A-normal form / three-address code.
@@ -766,11 +816,19 @@ special-casing `name#arity`.
 
 Signature identity and this name scheme are owned by one canonical module,
 `src/symbol.rs`: a signature is typed data (`SignatureKey`, built from either
-the declared `ast::Type` or the checker-resolved `Ty` — both spell a type from
-its annotation, e.g. `Point`, `Pair$Int`) and only the module formats the
+the declared `ast::SourceType` or the checker-resolved `Ty` — both spell a type
+from its annotation, e.g. `Point`, `Pair$Int`) and only the module formats the
 final symbol. Checker, MIR, and VM all route through it, so the recorded
 callee always names the emitted function; `tests/symbol_test.rs` pins the
 spellings and scans `src/` for stray hand-built `$ov$` strings.
+
+Across phase boundaries, Mojito names source syntax and checked semantics
+explicitly. `SourceType`, `source_annotation`, and `param_annotations` retain
+AST syntax; `Ty`, `checked_type`, and `param_types` mean checker-resolved facts.
+`AnnotationSite` keys the relationship between the two. Missing checked facts
+are compiler invariant diagnostics carried by the lowering/backend result—not
+panic assumptions—so compatibility APIs cannot silently proceed on unchecked
+input.
 
 ### Try In MIR
 
@@ -804,7 +862,7 @@ The structure mirrors source-level exception semantics:
 MIR records source spans for generated registers:
 
 ```rust
-pub struct SpanTable(pub HashMap<u32, (Span, Option<VarId>)>);
+pub struct SpanTable(pub HashMap<u32, (SourceSpan, Option<VarId>)>);
 ```
 
 This is what lets ownership diagnostics point back to the original source even

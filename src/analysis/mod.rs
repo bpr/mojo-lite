@@ -9,12 +9,10 @@
 //! but not others). Diagnostics carry the source [`Span`](crate::mir::Span) of the
 //! offending use, recovered from the MIR `SpanTable`.
 //!
-//! This is deliberately a **separate compiler stage** (`check_ownership`), not part
-//! of the default lex→parse→check→eval pipeline: the tree-walker treats `^` as an
-//! identity (value semantics), so wiring ownership into `run` would change existing
-//! behaviour. Later phases (liveness-based ASAP-drop insertion, borrow checking,
-//! and flipping the checker's `Unsupported` flags for conventions / `__del__`)
-//! build on this move/init foundation — see `vm-compiler-plan.md`.
+//! This is a distinct compiler stage after MIR lowering. The production
+//! [`Compiler`](crate::compiler::Compiler) always runs it before drop elaboration
+//! and VM execution. Backward liveness then builds on this move/init foundation
+//! to insert ASAP drops and control-flow-edge cleanup.
 
 use crate::ast::Stmt;
 use crate::error::OwnershipError;
@@ -29,7 +27,8 @@ use std::collections::{BTreeMap, HashSet};
 /// violation found (in function, then block, then instruction order), or `Ok` if
 /// every value is used consistently with having been moved.
 pub fn check_ownership(program: &[Stmt]) -> Result<(), OwnershipError> {
-    let prog = lower_program(program);
+    let prog =
+        lower_program(program).map_err(|error| OwnershipError::InvalidInput(error.to_string()))?;
     check_ownership_mir(&prog)
 }
 
@@ -71,6 +70,7 @@ pub fn elaborate_drops_program(prog: MirProgram) -> MirProgram {
             })
             .collect(),
         declarations: prog.declarations,
+        invariant_errors: prog.invariant_errors,
     }
 }
 
@@ -336,7 +336,7 @@ fn elaborate_drops(f: &MirFunction) -> MirFunction {
         n_vars: f.n_vars,
         var_names: f.var_names.clone(),
         n_params: f.n_params,
-        param_types: f.param_types.clone(),
+        param_annotations: f.param_annotations.clone(),
         owned_params: f.owned_params.clone(),
         ref_params: f.ref_params.clone(),
         spans: SpanTable(f.spans.0.clone()),
@@ -910,7 +910,12 @@ fn analyze_moves(f: &MirFunction) -> Result<(), OwnershipError> {
                     Touch::WriteParent => node.base_at(&path),
                 };
                 if sev != Own::Owned {
-                    let span = f.spans.0.get(&reg.0).map(|(s, _)| *s).unwrap_or((0, 0));
+                    let span = f
+                        .spans
+                        .0
+                        .get(&reg.0)
+                        .map(|(s, _)| s.clone())
+                        .unwrap_or_else(|| crate::token::SourceSpan::new(None, (0, 0)));
                     let var = place_display(&f.var_names[root as usize], &blame);
                     return Err(match sev {
                         Own::Moved => OwnershipError::UseAfterMove { var, span },

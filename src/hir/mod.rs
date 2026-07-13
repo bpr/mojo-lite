@@ -8,7 +8,7 @@
 //! (`if`/`while`/`for`/`break`/`continue`/`return`) becomes blocks + edges, so
 //! later passes are pure graph traversal.
 
-use crate::ast::{Expr, ExprKind, Stmt, StmtKind, Type};
+use crate::ast::{Expr, ExprKind, Stmt, StmtKind, Type as SourceType};
 use crate::token::DUMMY_SPAN;
 use petgraph::stable_graph::{NodeIndex, StableGraph};
 use std::collections::{HashMap, HashSet};
@@ -101,14 +101,14 @@ fn rename_expr(e: &mut Expr, resolve: &impl Fn(&str) -> String) {
 #[derive(Debug, Clone)]
 pub enum HirInstr {
     /// A variable definition (`var x = e`, or a reassignment): a dataflow *def*.
-    /// `ty` is the declaration's annotation (`var x: T = …`), carried so a backend
-    /// can materialize a numeric literal to `T` exactly as the tree-walker's
-    /// `coerce` does; `None` for an inferred `var` or a reassignment (which keeps
+    /// `source_annotation` is the parsed annotation (`var x: T = …`), carried so a backend
+    /// can materialize a numeric literal to `T` through checked coercion;
+    /// `None` for an inferred `var` or a reassignment (which keeps
     /// the binding's existing type — a `coerce_like`).
     Bind {
         dest: VarId,
         expr: Expr,
-        ty: Option<Type>,
+        source_annotation: Option<SourceType>,
     },
     /// A bare expression evaluated for its effect/value (`f(x)`).
     Eval(Expr),
@@ -398,10 +398,12 @@ impl Lower {
         } else {
             name.to_string()
         };
-        self.scopes
-            .last_mut()
-            .unwrap()
-            .insert(name.to_string(), runtime.clone());
+        if self.scopes.is_empty() {
+            self.scopes.push(HashMap::new());
+        }
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.insert(name.to_string(), runtime.clone());
+        }
         self.var(&runtime)
     }
 
@@ -483,7 +485,7 @@ impl Lower {
                 self.push(HirInstr::Bind {
                     dest: it_var,
                     expr: iter.clone(),
-                    ty: None,
+                    source_annotation: None,
                 });
                 // Normalize the iterable to an iterator (a user struct's `__iter__`;
                 // a no-op for a built-in `range`/`List`).
@@ -527,10 +529,10 @@ impl Lower {
             }
 
             StmtKind::Break => {
-                let f = *self
-                    .loops
-                    .last()
-                    .expect("break outside a loop (checker guards this)");
+                let Some(f) = self.loops.last().copied() else {
+                    self.push(HirInstr::Stmt(s.clone()));
+                    return;
+                };
                 // A loop in this CFG → a plain `Jump` to its exit; an enclosing
                 // function loop (seeded into a `try` region) → an `EscapeJump`.
                 self.seal(if f.escape {
@@ -540,7 +542,10 @@ impl Lower {
                 });
             }
             StmtKind::Continue => {
-                let f = *self.loops.last().expect("continue outside a loop");
+                let Some(f) = self.loops.last().copied() else {
+                    self.push(HirInstr::Stmt(s.clone()));
+                    return;
+                };
                 self.seal(if f.escape {
                     Terminator::EscapeJump(f.header)
                 } else {
@@ -555,24 +560,22 @@ impl Lower {
                 self.push(HirInstr::Bind {
                     dest: v,
                     expr: value,
-                    ty: ty.clone(), // annotation drives literal coercion
+                    source_annotation: ty.clone(),
                 });
             }
             StmtKind::Assign { name, value } => {
                 let value = self.expr(value);
                 let captured = self.captures.remove(name);
-                if !self.scopes.iter().any(|s| s.contains_key(name)) {
-                    self.scopes
-                        .last_mut()
-                        .unwrap()
-                        .insert(name.clone(), name.clone());
+                if !self.scopes.iter().any(|s| s.contains_key(name))
+                    && let Some(scope) = self.scopes.last_mut()
+                {
+                    scope.insert(name.clone(), name.clone());
                 }
                 let v = if captured {
                     let runtime = format!("{name}$shadow{}", self.vars.len());
-                    self.scopes
-                        .last_mut()
-                        .unwrap()
-                        .insert(name.clone(), runtime.clone());
+                    if let Some(scope) = self.scopes.last_mut() {
+                        scope.insert(name.clone(), runtime.clone());
+                    }
                     self.var(&runtime)
                 } else {
                     self.var(&self.resolved(name))
@@ -580,7 +583,7 @@ impl Lower {
                 self.push(HirInstr::Bind {
                     dest: v,
                     expr: value,
-                    ty: None, // reassignment keeps the binding's existing type
+                    source_annotation: None,
                 });
             }
             StmtKind::Expr(e) => self.push(HirInstr::Eval(self.expr(e))),

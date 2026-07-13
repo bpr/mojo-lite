@@ -69,9 +69,13 @@ fn temps_carry_real_source_spans() {
             _ => None,
         })
         .expect("a Const temp");
-    let (cspan, _) = spans[&const_reg];
-    assert_eq!(&src[cspan.0..cspan.1], "100");
-    assert_ne!(cspan, (0, 0), "spans must be real, not the placeholder");
+    let (cspan, _) = &spans[&const_reg];
+    assert_eq!(&src[cspan.span.0..cspan.span.1], "100");
+    assert_ne!(
+        cspan.span,
+        (0, 0),
+        "spans must be real, not the placeholder"
+    );
 
     let use_reg = mir.blocks[0]
         .instrs
@@ -81,8 +85,8 @@ fn temps_carry_real_source_spans() {
             _ => None,
         })
         .expect("a UseVar temp");
-    let (uspan, origin) = spans[&use_reg];
-    assert_eq!(&src[uspan.0..uspan.1], "y");
+    let (uspan, origin) = &spans[&use_reg];
+    assert_eq!(&src[uspan.span.0..uspan.span.1], "y");
     assert!(origin.is_some(), "a variable read records its origin VarId");
 }
 
@@ -238,7 +242,7 @@ fn program_driver_makes_a_function_per_def_and_method() {
         "def f() -> Int:\n    return 1\n\n@fieldwise_init\nstruct P:\n    var x: Int\n    def get(self) -> Int:\n        return self.x\n\nvar top: Int = 0\n",
     )
     .unwrap();
-    let mir = lower_program(&program);
+    let mir = lower_program(&program).expect("type error");
     let names: Vec<&str> = mir.functions.iter().map(|(n, _)| n.as_str()).collect();
     assert!(names.contains(&"f"), "a def becomes a function: {names:?}");
     assert!(
@@ -266,6 +270,50 @@ fn checked_lowering_owns_typed_declarations_and_normalized_defaults() {
     assert!(matches!(
         declaration.defaults.as_slice(),
         [Some(mojito::CheckedConst::Int(3))]
+    ));
+}
+
+#[test]
+fn checked_declaration_types_are_keyed_by_source_site_not_type_syntax() {
+    let program = parse(
+        "def keep_any[T: AnyType](x: T):\n    pass\n\
+         def keep_hashable[T: Hashable](x: T):\n    pass\n",
+    )
+    .expect("parse");
+    let checked = mojito::check_program(&program).expect("check");
+    let mir = mojito::mir::lower_checked_program(&checked);
+
+    let param_type = |name: &str| {
+        mir.declarations
+            .functions
+            .iter()
+            .find(|declaration| declaration.lowered_name.starts_with(name))
+            .expect("function declaration")
+            .param_types[0]
+            .clone()
+    };
+    assert_eq!(
+        param_type("keep_any"),
+        mojito::Ty::Param {
+            name: "T".into(),
+            bounds: vec!["AnyType".into()],
+        }
+    );
+    assert_eq!(
+        param_type("keep_hashable"),
+        mojito::Ty::Param {
+            name: "T".into(),
+            bounds: vec!["Hashable".into()],
+        }
+    );
+}
+
+#[test]
+fn compatibility_lowering_propagates_checker_errors() {
+    let program = parse("def bad() -> Int:\n    return missing\n").expect("parse");
+    assert!(matches!(
+        lower_program(&program),
+        Err(mojito::TypeError::UndefinedVariable(name)) if name == "missing"
     ));
 }
 
@@ -321,6 +369,7 @@ fn break_crossing_try_lowers_to_escape_jump() {
     // the try's body region — not a `MirInstr::Unsupported`.
     let src = "def main():\n    for i in range(3):\n        try:\n            break\n        finally:\n            print(i)\n";
     let prog = lower_program(&parse(src).expect("parse"));
+    let prog = prog.expect("type error");
     let (_, main) = prog
         .functions
         .iter()

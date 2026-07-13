@@ -18,6 +18,10 @@ studying the shape of a modern systems programming language compiler. Mojo was c
 
 ## Status
 
+See [the authoritative feature matrix](docs/features.md) for the distinction
+between executable, checked-only, parse-only, and unsupported features. The list
+below is only a high-level snapshot.
+
 mojito currently has:
 
 - a lexer and Pratt parser for a useful slice of Mojo-like syntax
@@ -118,6 +122,10 @@ source
   -> register VM
 ```
 
+The `Compiler` driver owns this ordering for normal whole-program use and
+returns a `CompiledProgram` only after all compile stages succeed. Individual
+stage APIs remain available for syntax tools and compiler development.
+
 The major source directories are:
 
 - `src/lexer.rs`, `src/parser.rs`, `src/ast.rs`: tokens, AST, Pratt parser, and
@@ -135,8 +143,13 @@ The major source directories are:
 - `assets/`: executable and negative test fixtures
 - `tests/`: parser, checker, HIR, MIR, VM, ownership, and drop tests
 
+For code navigation and responsibility ownership, see the
+[symbol-level architecture map](docs/symbol-map.md). For the complete pipeline,
+see [the architecture guide](docs/architecture.md).
+
 The surface syntax is documented in [`grammar.md`](grammar.md). The VM transition
-history and design notes live in [`vm-compiler-plan.md`](vm-compiler-plan.md).
+and instruction model are documented in
+[`docs/vm-instruction-set.md`](docs/vm-instruction-set.md).
 
 ## Build And Test
 
@@ -399,11 +412,11 @@ For execution, use the backend trait:
 use mojito::{BackendKind, Backend};
 
 let program = mojito::parse(source)?;
-mojito::check(&program)?;
-mojito::check_ownership(&program)?;
+let checked = mojito::check_program(&program)?;
+mojito::check_ownership_checked(&checked)?;
 
 let mut backend = BackendKind::Vm.make();
-backend.run(&program)?;
+backend.run(&checked)?;
 println!("{}", backend.output());
 ```
 

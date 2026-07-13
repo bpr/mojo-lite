@@ -13,6 +13,7 @@ use mojito::parse;
 /// The lowered function names `lower_program` emits for `src`.
 fn lowered_names(src: &str) -> HashSet<String> {
     lower_program(&parse(src).expect("parse error"))
+        .expect("type error")
         .functions
         .into_iter()
         .map(|(name, _)| name)
@@ -115,6 +116,7 @@ fn checker_recorded_callees_name_real_mir_functions() {
     let program = parse(src).expect("parse error");
     let targets = resolve_overload_targets(&program).expect("check error");
     let names: HashSet<String> = lower_program(&program)
+        .expect("type error")
         .functions
         .into_iter()
         .map(|(name, _)| name)

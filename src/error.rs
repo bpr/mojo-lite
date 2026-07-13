@@ -63,11 +63,8 @@ impl ParseError {
     }
 }
 
-/// Errors from the static type checker (`checker.rs`), which runs after parsing
-/// and before evaluation. These are the compile-time analogues of the
-/// `RuntimeError`s the dynamically typed evaluator would otherwise raise — plus
-/// rules Mojo enforces statically that the evaluator does not (same-scope
-/// redeclaration, `return` outside a function).
+/// Errors from semantic checking, produced before HIR/MIR lowering. These cover
+/// type, declaration, call, trait, convention, and locally decidable borrow rules.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeError {
     UndefinedVariable(String),
@@ -95,8 +92,7 @@ pub enum TypeError {
         expected: usize,
         got: usize,
     },
-    /// Re-declaring a name already bound in the same scope. Mojo rejects this;
-    /// the evaluator used to silently overwrite the binding.
+    /// Re-declaring a name already bound in the same scope.
     Redeclaration(String),
     /// Assignment attempted through an immutable binding, such as an ordinary
     /// function parameter. Mojo function arguments are immutable unless their
@@ -250,6 +246,9 @@ pub enum TypeError {
     /// Carries a message describing the feature. The runtime analogue is
     /// `RuntimeError::Unsupported`.
     Unsupported(String),
+    /// A compiler phase received state that violates a contract established by
+    /// an earlier phase. This is a Mojito bug, not an error in the source file.
+    InvariantViolation(String),
     /// A call whose arguments don't match the callee's parameters in a way arity
     /// alone doesn't capture: an unknown keyword name, a parameter bound twice
     /// (positionally and by keyword, or a duplicate keyword), or a required
@@ -275,13 +274,10 @@ pub enum RuntimeError {
     /// only. See the strict-subset design notes.
     ClosureEscape,
     /// An error raised by `raise` that was not caught by any `try`/`except`. It
-    /// propagates through the evaluator via `?` and, if it reaches the top, is
-    /// reported here. Carries the error message.
+    /// propagates through VM execution and is reported if it reaches the top.
     Raised(String),
-    /// A valid-Mojo construct that mojito **parses** (and the AST/checker carry)
-    /// but the evaluator does not implement yet — the "parse now, run later"
-    /// gaps (e.g. `var`-less variable introduction, the walrus operator `:=`).
-    /// Carries a message describing the feature.
+    /// A valid-Mojo construct that reaches a compiler/backend boundary whose
+    /// semantics Mojito does not implement. Carries a feature description.
     Unsupported(String),
 }
 
@@ -548,6 +544,9 @@ impl fmt::Display for TypeError {
                 write!(f, "invalid assignment target: {}", what)
             }
             TypeError::Unsupported(what) => write!(f, "unsupported feature: {}", what),
+            TypeError::InvariantViolation(detail) => {
+                write!(f, "compiler invariant violated: {detail}")
+            }
             TypeError::BadCall { func, reason } => {
                 write!(f, "call to '{}': {}", func, reason)
             }
@@ -591,16 +590,29 @@ impl fmt::Display for RuntimeError {
 /// from the MIR `SpanTable`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OwnershipError {
+    /// Ownership analysis was requested for a program that did not pass semantic
+    /// checking. The production compiler reports the earlier error directly;
+    /// this variant protects the compatibility API from panicking.
+    InvalidInput(String),
     /// A variable is used after it was transferred (`x^`) on every path to here.
-    UseAfterMove { var: String, span: (usize, usize) },
+    UseAfterMove {
+        var: String,
+        span: crate::token::SourceSpan,
+    },
     /// A variable is used after being transferred on *some* (not all) paths — a
     /// move inside one branch of an `if`, then a use after the merge.
-    ConditionallyMoved { var: String, span: (usize, usize) },
+    ConditionallyMoved {
+        var: String,
+        span: crate::token::SourceSpan,
+    },
 }
 
 impl fmt::Display for OwnershipError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            OwnershipError::InvalidInput(error) => {
+                write!(f, "ownership analysis requires a checked program: {error}")
+            }
             OwnershipError::UseAfterMove { var, .. } => {
                 write!(
                     f,
@@ -619,8 +631,17 @@ impl OwnershipError {
     /// The source span (byte range) of the offending use.
     pub fn span(&self) -> (usize, usize) {
         match self {
+            OwnershipError::InvalidInput(_) => crate::token::DUMMY_SPAN,
             OwnershipError::UseAfterMove { span, .. }
-            | OwnershipError::ConditionallyMoved { span, .. } => *span,
+            | OwnershipError::ConditionallyMoved { span, .. } => span.span,
+        }
+    }
+
+    pub fn source(&self) -> Option<&str> {
+        match self {
+            OwnershipError::InvalidInput(_) => None,
+            OwnershipError::UseAfterMove { span, .. }
+            | OwnershipError::ConditionallyMoved { span, .. } => span.source.as_deref(),
         }
     }
 }

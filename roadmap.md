@@ -45,53 +45,13 @@ The order below expresses dependencies, not a promise that every item must be
 implemented. Demand-driven items should be promoted only when a concrete stdlib
 or user program needs them.
 
-### 1. Close Small Correctness and Interface Gaps
+### 1. Finish Self-Hosted Collection Growth
 
-- [x] **Overload rejection coverage** — 46 required tests cover duplicate
-  signatures, ambiguity, no-match behavior, generic ranking, bound-aware
-  symbols, method/constructor diagnostics, and namespace collisions; the fixed
-  findings are retained in `overload_errors.md`.
-- [x] **CLI module search paths** — repeatable `--module-path`/`-I` and
-  `--stdlib` roots are searched after the importer directory, in command-line
-  order, before the bundled stdlib fallback.
-- [x] **Method argument binding parity** — ordinary method calls use the same
-  keyword, default, positional-only, keyword-only, and variadic binding rules as
-  free functions while preserving receiver and ordinary-parameter write-back.
-- [x] **Generic call binding parity** — generic free functions use the same
-  default, keyword, positional-only, keyword-only, variadic, convention, and
-  alias-aware argument binding as non-generic functions.
-- [x] **Diagnostic-mode parser recovery** — normal compilation remains fail-fast;
-  the parse CLI uses a capped, statement-synchronized diagnostic mode that
-  reports multiple spanned errors and quarantines its partial AST.
+- [ ] **HashSet growth and rehashing** — port `HashDict`'s explicit bucket growth
+  to the self-hosted `HashSet`, preserving collision behavior and deep-copy
+  semantics while rebuilding nested-list buckets.
 
-### 2. Strengthen Self-Hosted Collections
-
-- [x] **Nested self-hosted lists** — pointer-backed element reads deep-copy values,
-  indexed mut-self writeback uses `__setitem__`, and `HashSet` now uses the
-  self-hosted `List[List[T]]` bucket shape.
-- [x] **Dictionary views** — `Dict` provides insertion-ordered key iteration,
-  public `DictEntry` items, snapshot `keys`/`values`/`items`, and Mojo-shaped
-  overloaded `get` accessors.
-- [x] **Hash-backed dictionary** — `HashDict` combines dense insertion-ordered
-  entries with nested-list hash indexes, explicit growth/rehashing, snapshots,
-  overloaded accessors, and deep value-semantic copying.
-- [x] **Keyword-map value** — homogeneous free-function `**kwargs: T` uses ordered
-  keyword pairs as its call ABI and materializes an owned self-hosted
-  `HashDict[String, T]` in the callee; representation rationale is retained in
-  `docs/kwargs_dict_memo.md`.
-
-### 3. Centralize Checked Semantic Data
-
-- [x] **Checked program representation** — `CheckedProgram` owns the checked AST,
-  resolved annotations, overload targets, and declaration provenance consumed by
-  ownership analysis and backend lowering.
-- [x] **Typed MIR declarations** — `MirDeclarations` stores checked `Ty` values
-  and normalized constants rather than AST types and default expressions.
-- [x] **Module identity preservation** — linked statements retain their source
-  module path through checking and lowering instead of becoming anonymous after
-  flattening.
-
-### 4. Add Origin and Reference Semantics
+### 2. Add Origin and Reference Semantics
 
 Mojo origins symbolically identify the storage governing a reference and whether
 that reference permits mutation. They extend owner lifetimes, constrain mutable
@@ -115,7 +75,7 @@ project, not a checker-only feature. See the detailed assessment in
 - [ ] **Origin conformance suite** — cover immutable/mutable inference, unions,
   disjoint fields, ref returns, premature destruction, and invalid escapes.
 
-### 5. Expand Protocol Semantics When Libraries Need Them
+### 3. Expand Protocol Semantics When Libraries Need Them
 
 - [ ] **Opaque indexing protocol** — define the index and result associated facts
   needed for `T: Indexer`, then type generic subscripting without container
@@ -131,7 +91,7 @@ project, not a checker-only feature. See the detailed assessment in
   `TrivialRegisterPassable` only when a backend or ABI can observe the
   distinction.
 
-### 6. Deepen Compile-Time Specialization on Demand
+### 4. Deepen Compile-Time Specialization on Demand
 
 - [ ] **Nested generic CTFE specialization** — specialize transitive helper calls
   by compile-time argument tuple when stdlib code needs `outer[T]()` to call an
@@ -140,7 +100,7 @@ project, not a checker-only feature. See the detailed assessment in
   for concrete associated-value, declaration-generation, or specialization use
   cases.
 
-### 7. Grow Overloading Only With Evidence
+### 5. Grow Overloading Only With Evidence
 
 - [ ] **Richer overload ranking** — extend the current exact-versus-coercion model
   only after negative coverage is strong and real APIs require more ranking
@@ -149,7 +109,7 @@ project, not a checker-only feature. See the detailed assessment in
   non-generic candidates, constraints, and value-parameter specializations as a
   separate design task rather than an accidental extension of coercion scoring.
 
-### 8. Optional Interchange and Backend Experiments
+### 6. Optional Interchange and Backend Experiments
 
 - [ ] **NIF exporter spike** — prototype an export-only `mojito-mir-v0` subset for
   representative MIR programs and evaluate readability, fidelity, and tooling

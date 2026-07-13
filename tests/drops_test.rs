@@ -3,19 +3,19 @@
 //! The VM elaborates drops (`analysis::elaborate_drops_program`) before executing,
 //! splicing a `DropVar` at each variable's last use. A struct's `__del__` runs
 //! there — *at last use*, not at scope end — and a value's fields (and `List`/
-//! `Tuple` elements) are destroyed in reverse declaration order. The tree-walker
-//! has no destructors, so these are VM-only behaviors asserted directly on output.
+//! `Tuple` elements) are destroyed in reverse declaration order. These behaviors
+//! are asserted directly on VM output.
 //!
 //! `__del__` uses Mojo's real `def __del__(deinit self)` signature (now recognized (current Mojo spelling; the older `owned self` is also accepted)
 //! by the checker); the VM treats a method named `__del__` as the destructor.
 
-use mojito::{BackendKind, check, parse};
+use mojito::{BackendKind, check_program, parse};
 
 fn vm(src: &str) -> String {
     let program = parse(src).expect("parse error");
-    check(&program).expect("type error");
+    let checked = check_program(&program).expect("type error");
     let mut backend = BackendKind::Vm.make();
-    backend.run(&program).expect("vm run failed");
+    backend.run(&checked).expect("vm run failed");
     backend.output()
 }
 

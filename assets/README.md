@@ -12,7 +12,7 @@ right folder**; no code changes.
 | `ok/`             | lex + parse + check + eval all succeed                        |
 | `parse_error/`    | rejected by the lexer or parser (a syntax gap/error)          |
 | `type_error/`     | parses, but the checker rejects it                            |
-| `runtime_error/`  | type-checks, but fails at eval — includes the `Unsupported` "parse now, run later" gaps |
+| `runtime_error/`  | compiles, but fails during VM execution, including explicit late `Unsupported` boundaries |
 
 Grab a Mojo file off the net, decide where mojito should currently land on it,
 and drop it in that folder. When mojito gains a feature, a file "graduates" to an

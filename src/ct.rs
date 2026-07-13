@@ -45,7 +45,11 @@ impl CtValue {
             CtValue::Type(_) => return None,
             CtValue::Param(_) => return None,
         };
-        Some(Expr { kind, span })
+        Some(Expr {
+            kind,
+            span,
+            source: None,
+        })
     }
 }
 

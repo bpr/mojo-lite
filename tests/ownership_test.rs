@@ -16,6 +16,15 @@ fn own(src: &str) -> Result<(), OwnershipError> {
     check_ownership(&program)
 }
 
+#[test]
+fn ownership_reports_invalid_unchecked_input_instead_of_panicking() {
+    let program = parse("def main():\n    print(missing)\n").expect("parse error");
+    assert!(matches!(
+        check_ownership(&program),
+        Err(OwnershipError::InvalidInput(message)) if message.contains("missing")
+    ));
+}
+
 const THING: &str = "@fieldwise_init\nstruct Thing:\n    var x: Int\n\n";
 
 #[test]
@@ -53,7 +62,7 @@ fn use_after_move_is_rejected() {
             assert_eq!(var, "a");
             // The message names the moved variable `a`; the span points at the
             // offending use expression `a.x` in `print(a.x)`.
-            assert_eq!(&src[span.0..span.1], "a.x");
+            assert_eq!(&src[span.span.0..span.span.1], "a.x");
         }
         other => panic!("expected UseAfterMove, got {other:?}"),
     }

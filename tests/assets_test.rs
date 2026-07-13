@@ -5,13 +5,13 @@
 //! Categories: `ok` (lex+parse+check+**ownership**+eval all succeed), `parse_error`
 //! (rejected at lex/parse), `type_error` (checker rejects), `ownership_error` (the
 //! Phase-4 move analysis rejects — use-after-move / conditional move), and
-//! `runtime_error` (fails at eval, including the `Unsupported` gaps).
+//! `runtime_error` (fails during VM execution, including late `Unsupported` gaps).
 //!
 //! A file may optionally pin the exact message with a top comment
 //! `# expect: <substring>` (valid Mojo, skipped by the lexer): the reported error
 //! must then contain `<substring>`.
 
-use mojito::BackendKind;
+use mojito::{Compiler, CompilerError};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -39,30 +39,21 @@ impl Outcome {
 
 /// Run the full pipeline, returning where it first fails and the message.
 fn classify(path: &Path) -> (Outcome, String) {
-    let program = match mojito::link(path) {
-        Ok(p) => p,
-        Err(mojito::ModuleError::Parse { err, .. }) => {
+    let compiler = Compiler::default();
+    let compiled = match compiler.compile_path(path) {
+        Ok(program) => program,
+        Err(CompilerError::Module(mojito::ModuleError::Parse { err, .. })) => {
             return (Outcome::ParseError, err.to_string());
         }
-        Err(e) => return (Outcome::TypeError, e.to_string()),
+        Err(CompilerError::Parse(error)) => return (Outcome::ParseError, error.to_string()),
+        Err(CompilerError::Ownership(error)) => {
+            return (Outcome::OwnershipError, error.to_string());
+        }
+        Err(error) => return (Outcome::TypeError, error.to_string()),
     };
-    // Compile-time elaboration (resolve `comptime if`/`comptime for`) — its errors
-    // are compile-time rejections, classified with the type-error stage.
-    let program = match mojito::elaborate(program) {
-        Ok(p) => p,
-        Err(e) => return (Outcome::TypeError, e.to_string()),
-    };
-    let checked = match mojito::check_program(&program) {
-        Ok(checked) => checked,
-        Err(e) => return (Outcome::TypeError, e.to_string()),
-    };
-    if let Err(e) = mojito::check_ownership_checked(&checked) {
-        return (Outcome::OwnershipError, e.to_string());
-    }
-    let mut backend = BackendKind::Vm.make();
-    match backend.run_checked(&checked) {
-        Ok(()) => (Outcome::Ok, String::new()),
-        Err(e) => (Outcome::RuntimeError, e.to_string()),
+    match compiler.execute(&compiled) {
+        Ok(_) => (Outcome::Ok, String::new()),
+        Err(error) => (Outcome::RuntimeError, error.to_string()),
     }
 }
 

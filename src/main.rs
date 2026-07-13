@@ -1,5 +1,6 @@
 use mojito::{
-    BackendKind, LinkOptions, ModuleError, ParseError, Stmt, check, lex, parse, parse_diagnostics,
+    BackendKind, Compiler, CompilerError, LinkOptions, ModuleError, ParseError, Stmt, check, lex,
+    parse, parse_diagnostics,
 };
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -183,17 +184,23 @@ fn run_program(
     backend: BackendKind,
     link_options: &LinkOptions,
 ) -> Result<(), String> {
-    let program = load_program(file, link_options)?;
-    let checked = mojito::check_program(&program).map_err(|e| e.to_string())?;
-    // Ownership (move) analysis is a real compile stage: reject use-after-move.
-    mojito::check_ownership_checked(&checked).map_err(|e| e.to_string())?;
-    let mut backend = backend.make(); // Box<dyn Backend>
-    backend.run_checked(&checked).map_err(|e| e.to_string())?;
-    let output = backend.output();
-    if !output.is_empty() {
-        print!("{output}");
+    let source = read_source(file).map_err(|e| format!("cannot read input: {e}"))?;
+    let compiler = Compiler::new(link_options.clone(), backend);
+    let compiled = match file {
+        Some(path) if path != "-" => compiler.compile_source(&source, Path::new(path)),
+        _ => compiler.compile_unlinked(&source),
     }
-    for (n, v) in backend.bindings() {
+    .map_err(|error| match &error {
+        CompilerError::Module(module) => format_module_error(module, file.unwrap_or("-"), &source),
+        _ => error.to_string(),
+    })?;
+    let execution = compiler
+        .execute(&compiled)
+        .map_err(|error| error.to_string())?;
+    if !execution.output.is_empty() {
+        print!("{}", execution.output);
+    }
+    for (n, v) in execution.bindings {
         println!("{n} = {v}");
     }
     Ok(())
@@ -201,7 +208,7 @@ fn run_program(
 
 fn print_usage() {
     eprint!(
-        "mojito — a lexer/parser/checker/evaluator for a subset of Mojo\n\n\
+        "mojito — a compiler and register VM for a subset of Mojo\n\n\
          usage: mojito [COMMAND] [FILE]\n\n\
          global options:\n\
          \x20 -I, --module-path PATH  add a module search root (repeatable)\n\
