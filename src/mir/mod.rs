@@ -110,6 +110,10 @@ struct Flatten<'a> {
     overloads: crate::symbol::OverloadSets,
     /// Checker-selected lowered callee names for overloaded call expressions.
     overload_targets: HashMap<SourceSpan, String>,
+    /// Local reference slot to its frozen owner place and permission.
+    aliases: HashMap<VarId, (MirPlace, bool)>,
+    runtime_aliases: std::collections::HashSet<VarId>,
+    returns_reference: bool,
 }
 
 impl Flatten<'_> {
@@ -143,6 +147,22 @@ impl Flatten<'_> {
             self.vars.push(name.to_string());
             (self.vars.len() - 1) as VarId
         }
+    }
+
+    fn resolved_place(&mut self, name: &str) -> MirPlace {
+        let var = self.var(name);
+        self.aliases
+            .get(&var)
+            .map(|(place, _)| {
+                let mut place = place.clone();
+                place.through = Some(var);
+                place
+            })
+            .unwrap_or(MirPlace {
+                root: var,
+                proj: Vec::new(),
+                through: None,
+            })
     }
 
     /// Flatten one or more argument expressions to their result registers.
@@ -319,11 +339,16 @@ impl Flatten<'_> {
             ExprKind::Identifier(name) => {
                 let var = self.var(name);
                 let d = self.fresh(span(e), Some(var));
-                self.emit(MirInstr::UseVar {
-                    dest: d,
-                    var,
-                    mode: UseMode::Copy,
-                });
+                if let Some((mut place, _)) = self.aliases.get(&var).cloned() {
+                    place.through = Some(var);
+                    self.emit(MirInstr::LoadPlace { dest: d, place });
+                } else {
+                    self.emit(MirInstr::UseVar {
+                        dest: d,
+                        var,
+                        mode: UseMode::Copy,
+                    });
+                }
                 d
             }
             // `x^`: a move out of a variable. `p.a^` (a pure field chain) is a
@@ -659,6 +684,7 @@ impl Flatten<'_> {
             arg_places.push(Some(MirPlace {
                 root: var,
                 proj: Vec::new(),
+                through: None,
             }));
         }
         for a in args {
@@ -697,11 +723,30 @@ impl Flatten<'_> {
                 source_annotation,
             } => {
                 let src = self.expr(expr);
-                self.emit(MirInstr::DefVar {
-                    var: *dest,
-                    src,
-                    source_annotation: source_annotation.clone(),
-                });
+                if let Some((mut place, _)) = self.aliases.get(dest).cloned() {
+                    place.through = Some(*dest);
+                    self.emit(MirInstr::Store { place, src });
+                } else if self.runtime_aliases.contains(dest) {
+                    let handle = self.fresh(expr.source_span(), Some(*dest));
+                    self.emit(MirInstr::MakeRef {
+                        dest: handle,
+                        place: MirPlace {
+                            root: *dest,
+                            proj: Vec::new(),
+                            through: Some(*dest),
+                        },
+                    });
+                    self.emit(MirInstr::WriteRef {
+                        reference: handle,
+                        value: src,
+                    });
+                } else {
+                    self.emit(MirInstr::DefVar {
+                        var: *dest,
+                        src,
+                        source_annotation: source_annotation.clone(),
+                    });
+                }
             }
             HirInstr::Eval(e) => {
                 let _ = self.expr(e); // evaluated for its effect; result discarded
@@ -768,10 +813,7 @@ impl Flatten<'_> {
     /// is a variable (or `self`), so a non-variable root is unreachable.
     fn place(&mut self, e: &Expr) -> MirPlace {
         match &e.kind {
-            ExprKind::Identifier(name) => MirPlace {
-                root: self.var(name),
-                proj: Vec::new(),
-            },
+            ExprKind::Identifier(name) => self.resolved_place(name),
             ExprKind::Member { object, field } => {
                 let mut p = self.place(object);
                 p.proj.push(Proj::Field(field.clone()));
@@ -790,6 +832,7 @@ impl Flatten<'_> {
                 MirPlace {
                     root: self.var("$invalid_place"),
                     proj: Vec::new(),
+                    through: None,
                 }
             }
         }
@@ -820,6 +863,7 @@ impl Flatten<'_> {
             param_annotations: Vec::new(),
             owned_params: Vec::new(),
             ref_params: Vec::new(),
+            returns_reference: self.returns_reference,
             spans: std::mem::take(&mut self.f.spans), // accumulate into the shared table
         };
         let mut map: HashMap<hir::BlockId, MirBlockId> = HashMap::new();
@@ -839,6 +883,9 @@ impl Flatten<'_> {
                 nested: self.nested.clone(), // a `try` region may call a nested `def`
                 overloads: self.overloads.clone(),
                 overload_targets: self.overload_targets.clone(),
+                aliases: self.aliases.clone(),
+                runtime_aliases: self.runtime_aliases.clone(),
+                returns_reference: self.returns_reference,
             };
             for hb in region_cfg.g.node_indices() {
                 fl.cur = map[&hb];
@@ -904,10 +951,7 @@ impl Flatten<'_> {
     /// the VM). Distinct from [`Self::try_place`], which emits index evaluations.
     fn simple_place(&mut self, e: &Expr) -> Option<MirPlace> {
         match &e.kind {
-            ExprKind::Identifier(name) => Some(MirPlace {
-                root: self.var(name),
-                proj: Vec::new(),
-            }),
+            ExprKind::Identifier(name) => Some(self.resolved_place(name)),
             ExprKind::Member { object, field } => {
                 let mut p = self.simple_place(object)?;
                 p.proj.push(Proj::Field(field.clone()));
@@ -930,10 +974,7 @@ impl Flatten<'_> {
                 // searches a struct's `value_params`. `Self` never appears bare in an
                 // expression (only `Self.field`), so this alias is safe.
                 let root = if name == "Self" { "self" } else { name };
-                Some(MirPlace {
-                    root: self.var(root),
-                    proj: Vec::new(),
-                })
+                Some(self.resolved_place(root))
             }
             ExprKind::Member { object, field } => {
                 let mut p = self.pure_field_place(object)?;
@@ -946,10 +987,7 @@ impl Flatten<'_> {
 
     fn try_place(&mut self, e: &Expr) -> Option<MirPlace> {
         match &e.kind {
-            ExprKind::Identifier(name) => Some(MirPlace {
-                root: self.var(name),
-                proj: Vec::new(),
-            }),
+            ExprKind::Identifier(name) => Some(self.resolved_place(name)),
             ExprKind::Member { object, field } => {
                 let mut p = self.try_place(object)?;
                 p.proj.push(Proj::Field(field.clone()));
@@ -970,9 +1008,59 @@ impl Flatten<'_> {
     /// threads the enclosing function's block map for a fallback-path `try`.
     fn lower_stmt(&mut self, s: &Stmt, outer_map: &HashMap<hir::BlockId, MirBlockId>) {
         match &s.kind {
-            StmtKind::RefDecl { .. } => self.emit(MirInstr::Unsupported(
-                "reference binding and origin semantics".to_string(),
-            )),
+            StmtKind::RefDecl { name, value } => {
+                let reference = self.var(name);
+                if !matches!(
+                    value.kind,
+                    ExprKind::Identifier(_) | ExprKind::Member { .. } | ExprKind::Index { .. }
+                ) {
+                    let source = self.expr(value);
+                    self.runtime_aliases.insert(reference);
+                    self.emit(MirInstr::DefVar {
+                        var: reference,
+                        src: source,
+                        source_annotation: None,
+                    });
+                    let candidates: Vec<&Expr> = match &value.kind {
+                        ExprKind::Call { args, kwargs, .. } => args
+                            .iter()
+                            .chain(kwargs.iter().map(|argument| &argument.value))
+                            .collect(),
+                        ExprKind::MethodCall {
+                            object,
+                            args,
+                            kwargs,
+                            ..
+                        } => std::iter::once(object.as_ref())
+                            .chain(args.iter())
+                            .chain(kwargs.iter().map(|argument| &argument.value))
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    for candidate in candidates {
+                        if let Some(place) = self.simple_place(candidate) {
+                            let marker = self.fresh(candidate.source_span(), Some(place.root));
+                            self.emit(MirInstr::BeginLoan {
+                                reference,
+                                place,
+                                mutable: true,
+                                marker,
+                            });
+                        }
+                    }
+                    return;
+                }
+                let place = self.place(value);
+                let mutable = true;
+                self.aliases.insert(reference, (place.clone(), mutable));
+                let marker = self.fresh(s.source_span(), Some(place.root));
+                self.emit(MirInstr::BeginLoan {
+                    reference,
+                    place,
+                    mutable,
+                    marker,
+                });
+            }
             // --- Writes through a place (any nesting) --------------------------
             StmtKind::SetPlace { place, value } => {
                 let src = self.expr(value);
@@ -1168,7 +1256,16 @@ impl Flatten<'_> {
                     else_b: map[else_b],
                 }
             }
-            Terminator::Return(e) => MirTerm::Return(e.as_ref().map(|e| self.expr(e))),
+            Terminator::Return(e) => MirTerm::Return(e.as_ref().map(|e| {
+                if self.returns_reference {
+                    let place = self.place(e);
+                    let dest = self.fresh(e.source_span(), Some(place.root));
+                    self.emit(MirInstr::MakeRef { dest, place });
+                    dest
+                } else {
+                    self.expr(e)
+                }
+            })),
             Terminator::FallOff => MirTerm::FallOff,
             // An outward `break`/`continue`: the target is an enclosing-function
             // block, resolved via `outer_map` (`cleanup` filled by drop elaboration).
@@ -1190,6 +1287,7 @@ pub fn lower_cfg(cfg: &Cfg) -> MirFunction {
         &HashMap::new(),
         &crate::symbol::OverloadSets::default(),
         &HashMap::new(),
+        false,
     )
 }
 
@@ -1201,6 +1299,7 @@ fn lower_cfg_nested(
     nested: &HashMap<String, NestedInfo>,
     overloads: &crate::symbol::OverloadSets,
     overload_targets: &HashMap<SourceSpan, String>,
+    returns_reference: bool,
 ) -> MirFunction {
     let mut mir = MirFunction {
         blocks: Vec::new(),
@@ -1211,6 +1310,7 @@ fn lower_cfg_nested(
         param_annotations: Vec::new(),
         owned_params: Vec::new(),
         ref_params: Vec::new(),
+        returns_reference,
         spans: SpanTable::default(),
     };
 
@@ -1234,6 +1334,9 @@ fn lower_cfg_nested(
             nested: nested.clone(),
             overloads: overloads.clone(),
             overload_targets: overload_targets.clone(),
+            aliases: HashMap::new(),
+            runtime_aliases: std::collections::HashSet::new(),
+            returns_reference,
         };
         for hb in cfg.g.node_indices() {
             fl.cur = map[&hb];
@@ -1350,6 +1453,7 @@ pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
                 params,
                 positional_only,
                 keyword_only,
+                ret,
                 body,
                 ..
             } => {
@@ -1428,6 +1532,7 @@ pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
                         parameter_annotations: ptys,
                         owned_parameters: owned,
                         reference_parameters: refp,
+                        returns_reference: matches!(ret, Some(SourceType::Ref { .. })),
                         body,
                         overloads: &overloads,
                         overload_targets: &overload_targets,
@@ -1445,7 +1550,12 @@ pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
             } => {
                 let mut_self_methods = methods
                     .iter()
-                    .filter(|m| matches!(m.self_convention, Some(ArgConvention::Mut)))
+                    .filter(|m| {
+                        matches!(
+                            m.self_convention,
+                            Some(ArgConvention::Mut | ArgConvention::Ref)
+                        )
+                    })
                     .map(|m| {
                         let method_name = crate::symbol::lifecycle_method_name(m);
                         let source = format!("{name}.{method_name}");
@@ -1575,7 +1685,7 @@ pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
                         // the exact type only needs to be non-numeric.
                         ptys.push(SourceType::Named(name.clone(), Vec::new()));
                         owned.push(is_owned(&m.self_convention));
-                        refp.push(false); // `self` is handled via `recv_place`, not `ref_params`
+                        refp.push(is_ref(&m.self_convention));
                     }
                     names.extend(m.params.iter().map(|p| p.name.clone()));
                     ptys.extend(m.params.iter().map(|p| p.ty.clone()));
@@ -1588,6 +1698,7 @@ pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
                             parameter_annotations: ptys,
                             owned_parameters: owned,
                             reference_parameters: refp,
+                            returns_reference: matches!(m.ret, Some(SourceType::Ref { .. })),
                             body: &m.body,
                             overloads: &overloads,
                             overload_targets: &overload_targets,
@@ -1609,6 +1720,7 @@ pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
             &HashMap::new(),
             &overloads,
             &overload_targets,
+            false,
         ),
     ));
     MirProgram {

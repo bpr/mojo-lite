@@ -20,27 +20,27 @@ a reference and of the mutability available through it. They are used to extend
 owner lifetimes, enforce exclusivity, and reject references that outlive their
 owners. They have no runtime identity and are erased after lifetime checking.
 
-Mojito now parses the principal surface forms, but origin clauses are discarded
-and reference bindings/types are deliberately rejected by the checker. Existing
-infrastructure provides only part of the semantic foundation:
+Mojito retains the principal surface forms and implements the safe caller-owned
+subset. Stable checked owner IDs and a canonical origin algebra feed local and
+cross-call aliases. MIR records persistent loans, uses CFG liveness to end them
+at last use, and rejects overlapping owner access while they remain live.
+The remaining work is demand-driven unsafe/static origin support:
 
 - MIR places already identify rooted field/index projections.
 - Call checking already rejects overlapping mutable/shared argument places and
   permits statically disjoint fields.
-- MIR use modes distinguish copy, move, shared borrow, and mutable borrow.
+- MIR places record whether access occurs directly or through a local loan.
 - Ownership analysis already tracks moves through CFG joins and loops.
 - Liveness and drop elaboration already insert ASAP destruction and edge cleanup.
-- `mut` and `ref` parameters currently use value cloning plus post-call
-  write-back, not persistent reference identity.
+- reference-bearing parameters and returns use persistent frame/slot identity.
 
-The last point is the largest architectural gap. A reference binding or ref
-return can remain live beyond one call and must continue to alias its owner's
-storage. That cannot be modeled faithfully by copying a value into a callee
-frame and writing it back once when the call returns.
+Statically resolvable local aliases compile to verified owner-place accesses;
+cross-call aliases materialize frame/slot handles that continue to identify
+caller storage after the callee returns.
 
-### Origin representation
+### Origin representation — foundation complete
 
-Replace discarded origin syntax with typed source data:
+Implemented source/checked foundations include:
 
 - origin expressions for named origins, `origin_of(place)`, arbitrary
   `origin_of` expressions, `_`, and unions
@@ -49,23 +49,21 @@ Replace discarded origin syntax with typed source data:
 - origin-bearing `ref` parameter and return types
 - source spans for origin diagnostics
 
-Define a small canonical checked algebra rather than retaining arbitrary AST
-expressions indefinitely. At minimum it needs owner declarations, field
-derivation, union, inferred/unbound origins, static/untracked origins needed by
-supported APIs, and mutability.
+The canonical algebra has stable owner/origin-parameter IDs, projected places,
+normalized unions, static/untracked placeholders, and explicit mutability.
+Signature clauses lower into this algebra during checking.
 
-### Reference type and binding semantics
+### Local reference binding semantics — complete
 
-Add a checked reference type containing the referent type, origin, and
-mutability. Type `ref name = expression` as an alias rather than an owned
-binding. Require a place-producing expression for safe tracked references, while
-keeping any future unsafe/untracked form explicit.
+`RefTy` contains referent type, origin, and mutability. `ref name = place` is an
+alias rather than an owned binding and accepts variable, field, and indexed
+places. Reads auto-dereference, writes target the owner, and index operands are
+frozen at binding time.
 
-Define how reference reads, writes, assignment, copying of reference handles,
-and end-of-reference lifetime interact with existing place and ownership rules.
-Do not represent references as ordinary copied `Value`s.
+Local references use owner-place operations where statically resolvable and
+frame/slot handles where dynamic identity crosses a call.
 
-### Origin inference and call substitution
+### Origin inference and call substitution — complete
 
 For each call:
 
@@ -82,26 +80,25 @@ The first implementation can omit wildcard and complex unsafe origins. Static
 and untracked origins should be added only when a supported pointer or literal
 API needs them.
 
-### Lifetime extension analysis
+### Lifetime extension analysis — complete for caller-owned origins
 
-Extend MIR ownership/liveness dataflow with reference dependencies:
+Implemented for local references:
 
 - a live reference keeps every owner in its normalized origin live
-- a union origin keeps all possible owners live
 - field origins overlap their parent but can remain disjoint from sibling fields
 - moving or destroying an owner while a reference is live is rejected
-- returning a reference to a local owner is rejected
 - branch joins merge possible origins conservatively
 - loops reach a fixed point when reference state crosses a back-edge
 - drop elaboration places owner destruction after the last dependent reference
 
-This analysis should consume checked origin facts carried into MIR. It should
-not reconstruct origins from source expressions or variable names.
+Union/substituted owners and return escape rejection are now checked as callable
+origin contracts are lowered and substituted.
 
-### Reference-capable VM ABI
+### Reference-capable VM ABI — core complete
 
-Design a runtime representation for references to variable slots and projected
-places. It must support:
+Runtime references are shallow `{ frame, slot, projection }` handles. Field
+names and evaluated list indexes are captured into the handle, and stale frame
+identities fail loudly. The implemented core supports:
 
 - mutation through a local reference binding
 - references to fields and indexed elements where stable identity is valid
@@ -110,15 +107,13 @@ places. It must support:
 - parametric mutability
 - invalidation consistent with statically checked moves and drops
 
-The current frame-local `Vec<Value>` plus clone/write-back ABI does not provide
-stable cross-frame aliases. Likely options include stable heap-allocated cells,
-frame/slot handles with explicit caller relationships, or lowering verified
-references into an addressable storage layer. Choose this only after the checked
-origin model and lifetime analysis define exactly which aliases may survive.
+MIR exposes `MakeRef`, `ReadRef`, and `WriteRef` as the representation-neutral
+boundary. Direct reference-producing calls pass handles instead of copying and
+writing back, and returned handles keep the dynamically selected caller place.
 
-### Origin conformance suite
+### Origin conformance suite — complete
 
-Build the feature in vertical slices with positive and negative cases for:
+The fixture suite contains positive and negative cases for:
 
 - inferred immutable and mutable `ref` arguments
 - an explicit named origin shared by an argument and return
@@ -134,17 +129,11 @@ Build the feature in vertical slices with positive and negative cases for:
 
 Syntax support is small and present. Full semantics are **large**: they touch the
 AST, generic parameter model, checked types, overload/call substitution, MIR,
-CFG dataflow, drop elaboration, runtime storage, and the call ABI. Implement in
-this order:
-
-1. checked origin and reference types
-2. local reference bindings to simple variable/field places
-3. lifetime extension and invalid-escape diagnostics
-4. inferred origins on `ref` arguments
-5. origin-bearing ref returns and call substitution
-6. union and field-sensitive origins
-7. reference-capable VM behavior beyond simple places
-8. unsafe/static/untracked origin forms only when demanded
+CFG dataflow, drop elaboration, runtime storage, and the call ABI. The checked
+foundation, persistent-loan analysis, parameter and return substitution, VM
+frame stack, reference ABI, and conformance consolidation are complete.
+Unsafe/static/untracked origin forms remain deferred until a concrete pointer or
+literal API requires them.
 
 Do not start by reproducing Mojo's complete internal origin attribute algebra.
 The first useful stop point is a local or returned reference tied to a named

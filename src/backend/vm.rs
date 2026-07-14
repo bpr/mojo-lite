@@ -14,9 +14,9 @@ use crate::error::RuntimeError;
 use crate::hir::VarId;
 use crate::mir::{Const, MirBlock, MirInstr, MirPlace, MirProgram, MirTerm, Proj, Reg};
 use crate::runtime::{
-    Value, apply_infix, apply_list_method, apply_prefix, builtin_abs, builtin_convert,
-    builtin_divmod, builtin_error, builtin_input, builtin_min_max, builtin_round, coerce,
-    is_list_mutator, list_query, promote_numeric_elems, read_simd_lane, simd_from_values,
+    RefProjection, Value, apply_infix, apply_list_method, apply_prefix, builtin_abs,
+    builtin_convert, builtin_divmod, builtin_error, builtin_input, builtin_min_max, builtin_round,
+    coerce, is_list_mutator, list_query, promote_numeric_elems, read_simd_lane, simd_from_values,
     value_as_index,
 };
 use crate::types::Ty;
@@ -88,6 +88,24 @@ struct Prog {
 struct CallerFrame<'a> {
     registers: &'a mut [Value],
     variables: &'a mut [Value],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FrameId(u64);
+
+struct ReturnContinuation {
+    dest: Reg,
+    writebacks: Vec<(usize, MirPlace)>,
+}
+
+struct Frame {
+    id: FrameId,
+    function: usize,
+    registers: Vec<Value>,
+    variables: Vec<Value>,
+    block: usize,
+    instruction: usize,
+    continuation: Option<ReturnContinuation>,
 }
 
 struct WritebackCall<'a> {
@@ -179,6 +197,8 @@ pub struct VmBackend {
     /// `None`; VM-backed CTFE sets it and every function/block/instruction burns
     /// from it so compile-time execution cannot hang the compiler.
     ctfe_fuel: Option<usize>,
+    frames: Vec<Frame>,
+    next_frame_id: u64,
 }
 
 impl VmBackend {
@@ -264,6 +284,20 @@ impl VmBackend {
         args: Vec<Value>,
         value_params: &[(String, Value)],
     ) -> Result<(Value, Vec<Value>), RuntimeError> {
+        let frame = self.make_frame(prog, fidx, args, value_params, None)?;
+        let target = frame.id;
+        self.frames.push(frame);
+        self.drive_frames(prog, target)
+    }
+
+    fn make_frame(
+        &mut self,
+        prog: &Prog,
+        fidx: usize,
+        args: Vec<Value>,
+        value_params: &[(String, Value)],
+        continuation: Option<ReturnContinuation>,
+    ) -> Result<Frame, RuntimeError> {
         self.burn_ctfe()?;
         let f = &prog.mir.functions[fidx].1;
         // The MIR flattens only positional arguments; a mismatched count means a
@@ -272,12 +306,13 @@ impl VmBackend {
         if args.len() != f.n_params {
             return Err(RuntimeError::Unsupported(format!(
                 "vm backend does not support default/keyword/variadic arguments yet \
-                 (call passed {} args to a {}-parameter function)",
+                 (call passed {} args to {}-parameter function '{}')",
                 args.len(),
-                f.n_params
+                f.n_params,
+                prog.mir.functions[fidx].0,
             )));
         }
-        let mut regs = vec![Value::None; f.n_regs as usize];
+        let regs = vec![Value::None; f.n_regs as usize];
         let mut vars = vec![Value::None; f.n_vars];
         for (i, arg) in args.into_iter().enumerate() {
             vars[i] = match f.param_annotations.get(i) {
@@ -294,49 +329,426 @@ impl VmBackend {
             }
         }
 
-        let mut block = 0usize;
-        let ret = 'run: loop {
+        let id = FrameId(self.next_frame_id);
+        self.next_frame_id += 1;
+        Ok(Frame {
+            id,
+            function: fidx,
+            registers: regs,
+            variables: vars,
+            block: 0,
+            instruction: 0,
+            continuation,
+        })
+    }
+
+    fn drive_frames(
+        &mut self,
+        prog: &Prog,
+        target: FrameId,
+    ) -> Result<(Value, Vec<Value>), RuntimeError> {
+        loop {
+            let mut frame = self.frames.pop().ok_or_else(|| {
+                RuntimeError::Unsupported("vm: frame stack underflow".to_string())
+            })?;
             self.burn_ctfe()?;
-            let b = &f.blocks[block];
-            for instr in &b.instrs {
-                // A `return`/`break`/`continue` that crossed a `try` boundary
-                // surfaces here from the `try` instruction: a `Return` ends the
-                // function; a `Jump` targets an enclosing loop block, so continue
-                // there (skipping the rest of this block).
-                match self.exec_instr(prog, instr, &mut regs, &mut vars)? {
-                    Flow::Normal => {}
-                    Flow::Return(v) => break 'run v,
-                    Flow::Jump(target) => {
-                        block = target;
-                        continue 'run;
+            let function = &prog.mir.functions[frame.function].1;
+            let block = &function.blocks[frame.block];
+            if frame.instruction < block.instrs.len() {
+                let instruction = block.instrs[frame.instruction].clone();
+                frame.instruction += 1;
+                if let Some(child) = self.prepare_direct_call(prog, &frame, &instruction)? {
+                    self.frames.push(frame);
+                    self.frames.push(child);
+                    continue;
+                }
+                match self.exec_instr(
+                    prog,
+                    &instruction,
+                    frame.id,
+                    &mut frame.registers,
+                    &mut frame.variables,
+                )? {
+                    Flow::Normal => {
+                        self.frames.push(frame);
+                        continue;
+                    }
+                    Flow::Jump(block) => {
+                        frame.block = block;
+                        frame.instruction = 0;
+                        self.frames.push(frame);
+                        continue;
+                    }
+                    Flow::Return(value) => {
+                        if let Some(done) = self.finish_frame(target, frame, value)? {
+                            return Ok(done);
+                        }
+                        continue;
                     }
                 }
             }
-            match &b.term {
-                MirTerm::Jump(t) => block = *t,
+            let returned = match &block.term {
+                MirTerm::Jump(next) => {
+                    frame.block = *next;
+                    frame.instruction = 0;
+                    self.frames.push(frame);
+                    continue;
+                }
                 MirTerm::Branch {
                     cond,
                     then_b,
                     else_b,
                 } => {
-                    block = if is_true(&regs[cond.0 as usize]) {
+                    frame.block = if is_true(&frame.registers[cond.0 as usize]) {
                         *then_b
                     } else {
                         *else_b
                     };
+                    frame.instruction = 0;
+                    self.frames.push(frame);
+                    continue;
                 }
-                MirTerm::Return(r) => {
-                    break 'run r
-                        .as_ref()
-                        .map(|r| regs[r.0 as usize].clone())
-                        .unwrap_or(Value::None);
-                }
-                // A function body never ends in `FallOff`/`EscapeJump` (only `try`
-                // regions do); treat them defensively as `return None`.
-                MirTerm::FallOff | MirTerm::EscapeJump { .. } => break 'run Value::None,
+                MirTerm::Return(reg) => reg
+                    .as_ref()
+                    .map(|reg| frame.registers[reg.0 as usize].clone())
+                    .unwrap_or(Value::None),
+                MirTerm::FallOff | MirTerm::EscapeJump { .. } => Value::None,
+            };
+            if let Some(done) = self.finish_frame(target, frame, returned)? {
+                return Ok(done);
             }
+        }
+    }
+
+    fn finish_frame(
+        &mut self,
+        target: FrameId,
+        frame: Frame,
+        value: Value,
+    ) -> Result<Option<(Value, Vec<Value>)>, RuntimeError> {
+        if frame.id == target {
+            return Ok(Some((value, frame.variables)));
+        }
+        let continuation = frame.continuation.ok_or_else(|| {
+            RuntimeError::Unsupported("vm: child frame has no return continuation".to_string())
+        })?;
+        let caller = self.frames.last_mut().ok_or_else(|| {
+            RuntimeError::Unsupported("vm: returning child has no caller frame".to_string())
+        })?;
+        caller.registers[continuation.dest.0 as usize] = value;
+        for (parameter, place) in continuation.writebacks {
+            *nav_mut(&mut caller.variables, &caller.registers, &place)? =
+                frame.variables[parameter].clone();
+        }
+        Ok(None)
+    }
+
+    fn prepare_direct_call(
+        &mut self,
+        prog: &Prog,
+        caller: &Frame,
+        instruction: &MirInstr,
+    ) -> Result<Option<Frame>, RuntimeError> {
+        if let MirInstr::MethodCall {
+            dest,
+            recv,
+            method,
+            resolved,
+            args,
+            kwargs,
+            recv_place,
+            arg_places,
+        } = instruction
+            && let Value::Struct { name, .. } = &caller.registers[recv.0 as usize]
+        {
+            let source_name = format!("{name}.{method}");
+            let function_name = resolved
+                .clone()
+                .unwrap_or_else(|| prog.overload_name(&source_name, args.len()));
+            let Some(index) = prog.index_of(&function_name) else {
+                return Ok(None);
+            };
+            if !prog.mir.functions[index].1.returns_reference {
+                return Ok(None);
+            }
+            let positional: Vec<Value> = args
+                .iter()
+                .map(|register| caller.registers[register.0 as usize].clone())
+                .collect();
+            let keywords: Vec<(String, Value)> = kwargs
+                .iter()
+                .map(|(key, register)| (key.clone(), caller.registers[register.0 as usize].clone()))
+                .collect();
+            let (mut bound, slots) = match prog.sigs.get(&function_name) {
+                Some(signature) => {
+                    self.bind_for_call(prog, &function_name, signature, positional, keywords)?
+                }
+                None => (
+                    positional,
+                    (0..args.len()).map(ArgSlot::Positional).collect(),
+                ),
+            };
+            let definition = &prog.mir.functions[index].1;
+            for parameter in 1..definition.ref_params.len() {
+                if !definition.ref_params[parameter] {
+                    continue;
+                }
+                let place = match slots.get(parameter - 1) {
+                    Some(ArgSlot::Positional(argument)) => {
+                        arg_places.get(*argument).and_then(|place| place.as_ref())
+                    }
+                    _ => None,
+                }
+                .ok_or_else(|| {
+                    RuntimeError::Unsupported(format!(
+                        "vm: a mut/ref argument to method '{function_name}' must be a place"
+                    ))
+                })?;
+                bound[parameter - 1] = self.reference_to_place(caller, place)?;
+            }
+            let receiver = if definition.ref_params.first().copied().unwrap_or(false) {
+                let place = recv_place.as_ref().ok_or_else(|| {
+                    RuntimeError::Unsupported(format!(
+                        "vm: mutable receiver for '{function_name}' must be a place"
+                    ))
+                })?;
+                self.reference_to_place(caller, place)?
+            } else {
+                caller.registers[recv.0 as usize].clone()
+            };
+            let mut call_args = Vec::with_capacity(bound.len() + 1);
+            call_args.push(receiver);
+            call_args.extend(bound);
+            return self
+                .make_frame(
+                    prog,
+                    index,
+                    call_args,
+                    &[],
+                    Some(ReturnContinuation {
+                        dest: *dest,
+                        writebacks: Vec::new(),
+                    }),
+                )
+                .map(Some);
+        }
+        let MirInstr::Call {
+            dest,
+            func,
+            args,
+            kwargs,
+            arg_places,
+            param_arg_regs,
+        } = instruction
+        else {
+            return Ok(None);
         };
-        Ok((ret, vars))
+        if crate::symbol::init_overload_struct(&func.0).is_some() {
+            return Ok(None);
+        }
+        let Some(index) = prog.index_of(&func.0) else {
+            return Ok(None);
+        };
+        let positional: Vec<Value> = args
+            .iter()
+            .map(|reg| caller.registers[reg.0 as usize].clone())
+            .collect();
+        let keywords: Vec<(String, Value)> = kwargs
+            .iter()
+            .map(|(name, reg)| (name.clone(), caller.registers[reg.0 as usize].clone()))
+            .collect();
+        let (mut bound, slots) = match prog.sigs.get(&func.0) {
+            Some(signature) => {
+                self.bind_for_call(prog, &func.0, signature, positional, keywords)?
+            }
+            None => (
+                positional,
+                (0..args.len()).map(ArgSlot::Positional).collect(),
+            ),
+        };
+        let value_params: Vec<(String, Value)> = prog
+            .sigs
+            .get(&func.0)
+            .map(|signature| {
+                signature
+                    .param_decls
+                    .iter()
+                    .zip(param_arg_regs)
+                    .filter(|((_, is_value), _)| *is_value)
+                    .map(|((name, _), reg)| {
+                        (
+                            name.clone(),
+                            reg.map(|reg| caller.registers[reg.0 as usize].clone())
+                                .unwrap_or(Value::None),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (parameter, is_ref) in prog.mir.functions[index].1.ref_params.iter().enumerate() {
+            if !is_ref {
+                continue;
+            }
+            let place = match slots.get(parameter) {
+                Some(ArgSlot::Positional(argument)) => {
+                    arg_places.get(*argument).and_then(|place| place.as_ref())
+                }
+                _ => None,
+            }
+            .ok_or_else(|| {
+                RuntimeError::Unsupported(format!(
+                    "vm: a mut/ref argument to '{}' must be a place",
+                    func.0
+                ))
+            })?;
+            bound[parameter] = self.reference_to_place(caller, place)?;
+        }
+        self.make_frame(
+            prog,
+            index,
+            bound,
+            &value_params,
+            Some(ReturnContinuation {
+                dest: *dest,
+                writebacks: Vec::new(),
+            }),
+        )
+        .map(Some)
+    }
+
+    fn reference_to_place(&self, frame: &Frame, place: &MirPlace) -> Result<Value, RuntimeError> {
+        let (target_frame, slot, mut projection) = match &frame.variables[place.root as usize] {
+            Value::Ref {
+                frame,
+                slot,
+                projection,
+            } => (*frame, *slot, projection.clone()),
+            _ => (frame.id.0, place.root as usize, Vec::new()),
+        };
+        for segment in &place.proj {
+            projection.push(match segment {
+                Proj::Field(name) => RefProjection::Field(name.clone()),
+                Proj::Index(register) => RefProjection::Index(value_as_index(
+                    &frame.registers[register.0 as usize],
+                )? as usize),
+            });
+        }
+        Ok(Value::Ref {
+            frame: target_frame,
+            slot,
+            projection,
+        })
+    }
+
+    fn reference_slot(&self, reference: &Value) -> Result<&Value, RuntimeError> {
+        let Value::Ref {
+            frame,
+            slot,
+            projection,
+        } = reference
+        else {
+            return Err(RuntimeError::TypeError(
+                "vm: expected reference handle".to_string(),
+            ));
+        };
+        let owner = self
+            .frames
+            .iter()
+            .find(|candidate| candidate.id.0 == *frame)
+            .ok_or_else(|| {
+                RuntimeError::TypeError(format!("vm: stale reference to frame {frame}"))
+            })?;
+        navigate_reference(&owner.variables[*slot], projection)
+    }
+
+    fn reference_slot_mut(&mut self, reference: &Value) -> Result<&mut Value, RuntimeError> {
+        let Value::Ref {
+            frame,
+            slot,
+            projection,
+        } = reference
+        else {
+            return Err(RuntimeError::TypeError(
+                "vm: expected reference handle".to_string(),
+            ));
+        };
+        let owner = self
+            .frames
+            .iter_mut()
+            .find(|candidate| candidate.id.0 == *frame)
+            .ok_or_else(|| {
+                RuntimeError::TypeError(format!("vm: stale reference to frame {frame}"))
+            })?;
+        navigate_reference_mut(&mut owner.variables[*slot], projection)
+    }
+
+    fn read_reference(
+        &self,
+        reference: &Value,
+        current: FrameId,
+        current_variables: &[Value],
+    ) -> Result<Value, RuntimeError> {
+        if let Value::Ref {
+            frame,
+            slot,
+            projection,
+        } = reference
+            && *frame == current.0
+        {
+            return Ok(navigate_reference(&current_variables[*slot], projection)?.clone());
+        }
+        Ok(self.reference_slot(reference)?.clone())
+    }
+
+    fn write_reference(
+        &mut self,
+        reference: &Value,
+        current: FrameId,
+        current_variables: &mut [Value],
+        value: Value,
+    ) -> Result<(), RuntimeError> {
+        if let Value::Ref {
+            frame,
+            slot,
+            projection,
+        } = reference
+            && *frame == current.0
+        {
+            *navigate_reference_mut(&mut current_variables[*slot], projection)? = value;
+            return Ok(());
+        }
+        *self.reference_slot_mut(reference)? = value;
+        Ok(())
+    }
+
+    fn extend_reference(
+        &self,
+        root: &Value,
+        projection_path: &[Proj],
+        registers: &[Value],
+    ) -> Result<Option<Value>, RuntimeError> {
+        let Value::Ref {
+            frame,
+            slot,
+            projection,
+        } = root
+        else {
+            return Ok(None);
+        };
+        let mut projection = projection.clone();
+        for segment in projection_path {
+            projection.push(match segment {
+                Proj::Field(name) => RefProjection::Field(name.clone()),
+                Proj::Index(register) => {
+                    RefProjection::Index(value_as_index(&registers[register.0 as usize])? as usize)
+                }
+            });
+        }
+        Ok(Some(Value::Ref {
+            frame: *frame,
+            slot: *slot,
+            projection,
+        }))
     }
 
     /// Execute a function for its return value only. `value_params` reifies a
@@ -451,6 +863,7 @@ impl VmBackend {
             let parent = MirPlace {
                 root: place.root,
                 proj: prefix.to_vec(),
+                through: place.through,
             };
             match nav_mut(vars, regs, &parent)? {
                 Value::Pointer(base) => Target::Pointer(*base, *index),
@@ -658,6 +1071,7 @@ impl VmBackend {
         let parent = MirPlace {
             root: place.root,
             proj: prefix.to_vec(),
+            through: place.through,
         };
         let recv = nav_mut(vars, regs, &parent)?.clone();
         match &recv {
@@ -790,11 +1204,49 @@ impl VmBackend {
         &mut self,
         prog: &Prog,
         i: &MirInstr,
+        frame_id: FrameId,
         regs: &mut [Value],
         vars: &mut [Value],
     ) -> Result<Flow, RuntimeError> {
         self.burn_ctfe()?;
         match i {
+            MirInstr::BeginLoan { .. } => {}
+            MirInstr::MakeRef { dest, place } => {
+                let root = vars[place.root as usize].clone();
+                let Value::Ref {
+                    frame,
+                    slot,
+                    mut projection,
+                } = root
+                else {
+                    return Err(RuntimeError::Unsupported(format!(
+                        "vm: reference creation requires caller-owned storage, got {}",
+                        crate::runtime::type_name(&root)
+                    )));
+                };
+                for segment in &place.proj {
+                    projection.push(match segment {
+                        Proj::Field(name) => RefProjection::Field(name.clone()),
+                        Proj::Index(register) => RefProjection::Index(value_as_index(
+                            &regs[register.0 as usize],
+                        )?
+                            as usize),
+                    });
+                }
+                regs[dest.0 as usize] = Value::Ref {
+                    frame,
+                    slot,
+                    projection,
+                };
+            }
+            MirInstr::ReadRef { dest, reference } => {
+                regs[dest.0 as usize] =
+                    self.read_reference(&regs[reference.0 as usize], frame_id, vars)?;
+            }
+            MirInstr::WriteRef { reference, value } => {
+                let handle = regs[reference.0 as usize].clone();
+                self.write_reference(&handle, frame_id, vars, regs[value.0 as usize].clone())?;
+            }
             MirInstr::Const { dest, k } => regs[dest.0 as usize] = const_value(k),
             MirInstr::UseVar { dest, var, mode } => {
                 let slot = *var as usize;
@@ -803,19 +1255,23 @@ impl VmBackend {
                 // already-moved slot is a use-after-move — a loud runtime error (the
                 // ownership analysis rejects this statically, so this only fires on a
                 // compiler bug).
-                let value = match mode {
-                    crate::mir::UseMode::Move => {
-                        let moved = std::mem::replace(&mut vars[slot], Value::Moved);
-                        if self.has_moveinit {
-                            self.move_value(prog, moved)?
-                        } else {
-                            moved
+                let value = if let Value::Ref { .. } = &vars[slot] {
+                    self.read_reference(&vars[slot], frame_id, vars)?
+                } else {
+                    match mode {
+                        crate::mir::UseMode::Move => {
+                            let moved = std::mem::replace(&mut vars[slot], Value::Moved);
+                            if self.has_moveinit {
+                                self.move_value(prog, moved)?
+                            } else {
+                                moved
+                            }
                         }
+                        // A copy runs `__copyinit__` (deep copy) for a lifecycle type;
+                        // otherwise a plain deep `Clone`.
+                        _ if self.has_copyinit => self.clone_value(prog, &vars[slot])?,
+                        _ => vars[slot].clone(),
                     }
-                    // A copy runs `__copyinit__` (deep copy) for a lifecycle type;
-                    // otherwise a plain deep `Clone`.
-                    _ if self.has_copyinit => self.clone_value(prog, &vars[slot])?,
-                    _ => vars[slot].clone(),
                 };
                 if matches!(value, Value::Moved) {
                     return Err(RuntimeError::TypeError(format!(
@@ -831,10 +1287,21 @@ impl VmBackend {
             } => {
                 let v = regs[src.0 as usize].clone();
                 let slot = *var as usize;
-                vars[slot] = match source_annotation {
-                    Some(t) => coerce(v, t),
-                    None => crate::runtime::coerce_like(v, &vars[slot]),
+                let current = if let Value::Ref { .. } = &vars[slot] {
+                    self.read_reference(&vars[slot], frame_id, vars)?
+                } else {
+                    vars[slot].clone()
                 };
+                let assigned = match source_annotation {
+                    Some(t) => coerce(v, t),
+                    None => crate::runtime::coerce_like(v, &current),
+                };
+                if let Value::Ref { .. } = &vars[slot] {
+                    let handle = vars[slot].clone();
+                    self.write_reference(&handle, frame_id, vars, assigned)?;
+                } else {
+                    vars[slot] = assigned;
+                }
             }
             MirInstr::UnOp { op, dest, a } => {
                 regs[dest.0 as usize] = apply_prefix(*op, regs[a.0 as usize].clone())?;
@@ -991,14 +1458,26 @@ impl VmBackend {
             }
             MirInstr::Store { place, src } => {
                 let v = regs[src.0 as usize].clone();
-                self.store_at_place(prog, place, v, regs, vars)?;
+                if let Some(reference) =
+                    self.extend_reference(&vars[place.root as usize], &place.proj, regs)?
+                {
+                    self.write_reference(&reference, frame_id, vars, v)?;
+                } else {
+                    self.store_at_place(prog, place, v, regs, vars)?;
+                }
             }
             MirInstr::LoadPlace { dest, place } => {
                 // The read half of `c[i] += e` on a user struct goes through
                 // `c.__getitem__(i)`; any other place reads its slot / SIMD lane.
-                regs[dest.0 as usize] = match self.load_index_dunder(prog, place, regs, vars)? {
-                    Some(v) => v,
-                    None => load_place(vars, regs, place)?,
+                regs[dest.0 as usize] = if let Some(reference) =
+                    self.extend_reference(&vars[place.root as usize], &place.proj, regs)?
+                {
+                    self.read_reference(&reference, frame_id, vars)?
+                } else {
+                    match self.load_index_dunder(prog, place, regs, vars)? {
+                        Some(v) => v,
+                        None => load_place(vars, regs, place)?,
+                    }
                 };
             }
             MirInstr::MovePlace { dest, place } => {
@@ -1006,8 +1485,15 @@ impl VmBackend {
                 // `Moved` tombstone so a later drop of the whole struct skips it (no
                 // double-drop) and any stray use fails loudly. The ownership analysis
                 // has already proven the moved field is not read again.
-                let slot = nav_mut(vars, regs, place)?;
-                let value = std::mem::replace(slot, Value::Moved);
+                let reference =
+                    self.extend_reference(&vars[place.root as usize], &place.proj, regs)?;
+                let value = if let Some(reference) = reference {
+                    let old = self.read_reference(&reference, frame_id, vars)?;
+                    self.write_reference(&reference, frame_id, vars, Value::Moved)?;
+                    old
+                } else {
+                    std::mem::replace(nav_mut(vars, regs, place)?, Value::Moved)
+                };
                 if matches!(value, Value::Moved) {
                     return Err(RuntimeError::TypeError(
                         "vm: partial use of an already-moved place".into(),
@@ -1142,6 +1628,7 @@ impl VmBackend {
                 // propagate that outcome to the block driver.
                 return self.exec_try(
                     prog,
+                    frame_id,
                     TryRegions {
                         body,
                         handler,
@@ -1171,6 +1658,7 @@ impl VmBackend {
     fn exec_try(
         &mut self,
         prog: &Prog,
+        frame_id: FrameId,
         regions: TryRegions<'_>,
         frame: CallerFrame<'_>,
     ) -> Result<Flow, RuntimeError> {
@@ -1185,7 +1673,7 @@ impl VmBackend {
             registers: regs,
             variables: vars,
         } = frame;
-        let outcome = match self.run_region(prog, body, regs, vars) {
+        let outcome = match self.run_region(prog, frame_id, body, regs, vars) {
             // The body raised: run the exceptional-edge cleanup (destroy the body's
             // locals as they go out of scope), then dispatch to the handler or
             // re-propagate.
@@ -1196,7 +1684,7 @@ impl VmBackend {
                         if let Some(slot) = err_slot {
                             vars[*slot as usize] = Value::Error(msg);
                         }
-                        self.run_region(prog, hblocks, regs, vars)
+                        self.run_region(prog, frame_id, hblocks, regs, vars)
                     }
                     None => Err(RuntimeError::Raised(msg)),
                 }
@@ -1210,7 +1698,7 @@ impl VmBackend {
                 self.run_cleanup(prog, cleanup, vars)?;
                 match flow {
                     Flow::Normal => match orelse {
-                        Some(eblocks) => self.run_region(prog, eblocks, regs, vars),
+                        Some(eblocks) => self.run_region(prog, frame_id, eblocks, regs, vars),
                         None => Ok(Flow::Normal),
                     },
                     ret => Ok(ret),
@@ -1221,7 +1709,7 @@ impl VmBackend {
         // (`return`/`break`/`continue`), that outcome wins over the pending one
         // (Python/Mojo semantics).
         if let Some(fblocks) = finalbody {
-            match self.run_region(prog, fblocks, regs, vars)? {
+            match self.run_region(prog, frame_id, fblocks, regs, vars)? {
                 Flow::Normal => {}
                 non_normal => return Ok(non_normal),
             }
@@ -1253,6 +1741,7 @@ impl VmBackend {
     fn run_region(
         &mut self,
         prog: &Prog,
+        frame_id: FrameId,
         blocks: &[MirBlock],
         regs: &mut [Value],
         vars: &mut [Value],
@@ -1264,7 +1753,7 @@ impl VmBackend {
                 // A non-`Normal` outcome from a nested `try` (a `return`, or a
                 // `break`/`continue` escaping to an outer loop) leaves this region
                 // carrying that outcome.
-                match self.exec_instr(prog, instr, regs, vars)? {
+                match self.exec_instr(prog, instr, frame_id, regs, vars)? {
                     Flow::Normal => {}
                     non_normal => return Ok(non_normal),
                 }
@@ -1747,6 +2236,65 @@ fn get_field(base: &Value, field: &str) -> Result<Value, RuntimeError> {
             crate::runtime::type_name(other)
         ))),
     }
+}
+
+fn navigate_reference<'a>(
+    mut value: &'a Value,
+    projection: &[RefProjection],
+) -> Result<&'a Value, RuntimeError> {
+    for segment in projection {
+        value = match (segment, value) {
+            (RefProjection::Field(name), Value::Struct { fields, .. }) => fields
+                .iter()
+                .find(|(field, _)| field == name)
+                .map(|(_, value)| value)
+                .ok_or_else(|| RuntimeError::TypeError(format!("no field '{name}'")))?,
+            (RefProjection::Index(index), Value::List(items) | Value::Tuple(items)) => {
+                items.get(*index).ok_or_else(|| {
+                    RuntimeError::TypeError("reference index out of bounds".to_string())
+                })?
+            }
+            _ => {
+                return Err(RuntimeError::TypeError(
+                    "invalid reference projection".to_string(),
+                ));
+            }
+        };
+    }
+    Ok(value)
+}
+
+fn navigate_reference_mut<'a>(
+    mut value: &'a mut Value,
+    projection: &[RefProjection],
+) -> Result<&'a mut Value, RuntimeError> {
+    for segment in projection {
+        value = match segment {
+            RefProjection::Field(name) => match value {
+                Value::Struct { fields, .. } => fields
+                    .iter_mut()
+                    .find(|(field, _)| field == name)
+                    .map(|(_, value)| value)
+                    .ok_or_else(|| RuntimeError::TypeError(format!("no field '{name}'")))?,
+                _ => {
+                    return Err(RuntimeError::TypeError(
+                        "invalid reference field".to_string(),
+                    ));
+                }
+            },
+            RefProjection::Index(index) => match value {
+                Value::List(items) => items.get_mut(*index).ok_or_else(|| {
+                    RuntimeError::TypeError("reference index out of bounds".to_string())
+                })?,
+                _ => {
+                    return Err(RuntimeError::TypeError(
+                        "invalid mutable reference index".to_string(),
+                    ));
+                }
+            },
+        };
+    }
+    Ok(value)
 }
 
 /// Index into a `List` or `Tuple` (an `Int` index, bounds-checked).

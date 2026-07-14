@@ -12,6 +12,7 @@ pub mod hir;
 pub mod lexer;
 pub mod mir;
 pub mod module;
+pub mod origin;
 pub mod parser;
 pub mod runtime;
 pub mod symbol;
@@ -35,6 +36,7 @@ pub use lexer::Lexer;
 pub use module::{
     LinkOptions, ModuleError, link, link_source, link_source_with_options, link_with_options,
 };
+pub use origin::{Mutability, Origin, OriginParamId, OriginPlace, OriginSeg, OwnerId, RefTy};
 pub use parser::{ParseReport, Parser};
 pub use runtime::Value;
 pub use token::{SourceSpan, Token};

@@ -101,12 +101,37 @@ pub enum Proj {
 pub struct MirPlace {
     pub root: VarId,
     pub proj: Vec<Proj>,
+    /// The local reference through which this place is accessed. `None` means
+    /// direct owner access. This is static metadata ignored by the VM.
+    pub through: Option<VarId>,
 }
 
 /// A single three-address instruction. Each value-producing instruction writes a
 /// fresh `dest` register; control flow lives in the block's [`MirTerm`].
 #[derive(Debug, Clone)]
 pub enum MirInstr {
+    /// Establish a persistent local loan. The reference has no runtime value in
+    /// this lowering; subsequent accesses carry `MirPlace::through` metadata.
+    BeginLoan {
+        reference: VarId,
+        place: MirPlace,
+        mutable: bool,
+        marker: Reg,
+    },
+    /// Materialize a runtime reference handle to a verified place. If the root
+    /// is already a reference parameter, its handle is forwarded and extended.
+    MakeRef {
+        dest: Reg,
+        place: MirPlace,
+    },
+    ReadRef {
+        dest: Reg,
+        reference: Reg,
+    },
+    WriteRef {
+        reference: Reg,
+        value: Reg,
+    },
     Const {
         dest: Reg,
         k: Const,
@@ -356,6 +381,7 @@ pub struct MirFunction {
     /// written back to the caller). `self` (handled via a method's `recv_place`) is
     /// always `false` here. Same order as the params.
     pub ref_params: Vec<bool>,
+    pub returns_reference: bool,
     pub spans: SpanTable,
 }
 

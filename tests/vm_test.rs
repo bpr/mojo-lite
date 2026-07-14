@@ -94,6 +94,15 @@ fn function_calls_and_recursion() {
 }
 
 #[test]
+fn deep_free_function_recursion_uses_vm_frames() {
+    assert_eq!(
+        run("def countdown(n: Int) -> Int:\n    if n == 0:\n        return 0\n    return countdown(n - 1)\n\ndef main():\n    print(countdown(10000))\n")
+            .unwrap(),
+        "0\n"
+    );
+}
+
+#[test]
 fn nested_calls_evaluate_in_order() {
     let src = "def add(a: Int, b: Int) -> Int:\n    return a + b\n\ndef sq(n: Int) -> Int:\n    return n * n\n\ndef main():\n    print(sq(add(1, 2)))\n";
     assert_eq!(parity(src), "9\n");

@@ -187,6 +187,6 @@ fn approximate_source_type(ty: &SourceType) -> Ty {
         ),
         SourceType::SelfType | SourceType::SelfParam(_) | SourceType::Assoc { .. } => Ty::None,
         SourceType::Func { .. } => Ty::None,
-        SourceType::Ref(inner) => approximate_source_type(inner),
+        SourceType::Ref { referent, .. } => approximate_source_type(referent),
     }
 }

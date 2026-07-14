@@ -1920,18 +1920,80 @@ fn owned_self_and_owned_params_are_accepted() {
 }
 
 #[test]
-fn out_and_ref_self_conventions_still_rejected() {
-    // `mut`/`ref` params are now modeled (write-back); `out` params and `out self`/
-    // `ref self` receivers still need init/reference semantics we don't model.
+fn out_is_rejected_and_ref_self_is_accepted() {
+    // Ordinary `out` remains unsupported; `ref self` is a writable,
+    // caller-place-backed receiver with checked reference semantics.
     assert!(matches!(
         check_source("def f(out a: Int):\n    pass\n"),
         Err(TypeError::Unsupported(_))
     ));
+    assert!(
+        check_source(
+            "@fieldwise_init\nstruct R:\n    var x: Int\n    def m(ref self):\n        self.x = 2\n"
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn validates_named_origins_and_parametric_mutability() {
+    assert!(
+        check_source(
+            "def observe[is_mutable: Bool, //, origin: Origin[mut=is_mutable]](ref[origin] value: Int):\n    print(value)\n"
+        )
+        .is_ok()
+    );
+    assert!(matches!(
+        check_source("def bad(ref[missing] value: Int):\n    pass\n"),
+        Err(TypeError::UndefinedVariable(name)) if name == "missing"
+    ));
+    assert!(
+        check_source(
+            "def pair[origin: Origin[mut=False]](ref[origin] left: Int, ref[origin] right: Int):\n    print(left + right)\n"
+        )
+        .is_ok()
+    );
     assert!(matches!(
         check_source(
-            "@fieldwise_init\nstruct R:\n    var x: Int\n    def m(ref self):\n        pass\n"
+            "def bad[origin: Origin[mut=False]](ref[origin] value: Int):\n    value = 2\n"
         ),
-        Err(TypeError::Unsupported(_))
+        Err(TypeError::ImmutableBinding(name)) if name == "value"
+    ));
+}
+
+#[test]
+fn checks_reference_returns_substitution_and_escapes() {
+    assert!(check_source(
+        "def borrow[origin: Origin[mut=False]](ref[origin] value: Int) -> ref[origin] Int:\n    return value\n"
+    )
+    .is_ok());
+    assert!(check_source(
+        "def choose(ref left: Int, ref right: Int, flag: Bool) -> ref[left, right] Int:\n    if flag:\n        return left\n    else:\n        return right\n"
+    )
+    .is_ok());
+    assert!(matches!(
+        check_source(
+            "def bad(ref source: Int) -> ref[source] Int:\n    var local = 1\n    return local\n"
+        ),
+        Err(TypeError::ReturnsReferenceToLocal)
+    ));
+    assert!(check_source(
+        "def pair[origin: Origin[mut=False]](ref[origin] left: Int, ref[origin] right: Int):\n    print(left + right)\n\ndef main():\n    var value = 1\n    pair(value, value)\n"
+    )
+    .is_ok());
+}
+
+#[test]
+fn checks_ref_self_return_origin() {
+    assert!(check_source(
+        "@fieldwise_init\nstruct Box:\n    var value: Int\n    def get(ref self) -> ref[self] Int:\n        return self.value\n"
+    )
+    .is_ok());
+    assert!(matches!(
+        check_source(
+            "@fieldwise_init\nstruct PairBox:\n    var left: Int\n    var right: Int\n    def bad(ref self) -> ref[origin_of(self.left)] Int:\n        return self.right\n"
+        ),
+        Err(TypeError::ReturnsReferenceToLocal)
     ));
 }
 

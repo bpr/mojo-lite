@@ -53,11 +53,25 @@ pub enum Value {
     /// (`Option B`: the arena is a `Vec<Value>`). Copying a pointer copies the
     /// offset, so two copies **alias** the same storage (the point of a pointer).
     Pointer(usize),
+    /// A verified reference to a variable slot in a live VM frame. Projection
+    /// indexes are captured when the handle is created, so later evaluation
+    /// cannot silently retarget the reference.
+    Ref {
+        frame: u64,
+        slot: usize,
+        projection: Vec<RefProjection>,
+    },
     /// A **tombstone** left when a value is moved out of a variable slot (`b = a^`)
     /// in the VM backend: the source slot holds `Moved` afterward, so a
     /// use-after-move surfaces as a loud runtime error (a defensive check — the
     /// ownership analysis already rejects it statically), and a no-op to drop.
     Moved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefProjection {
+    Field(String),
+    Index(usize),
 }
 
 /// The lanes of a SIMD value, one representation per element-type kind. Integer
@@ -128,6 +142,18 @@ impl PartialEq for Value {
             (Value::Error(a), Value::Error(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Tuple(a), Value::Tuple(b)) => a == b,
+            (
+                Value::Ref {
+                    frame: af,
+                    slot: as_,
+                    projection: ap,
+                },
+                Value::Ref {
+                    frame: bf,
+                    slot: bs,
+                    projection: bp,
+                },
+            ) => af == bf && as_ == bs && ap == bp,
             _ => false,
         }
     }
@@ -184,6 +210,7 @@ impl fmt::Display for Value {
             }
             Value::Error(msg) => write!(f, "Error({:?})", msg),
             Value::Pointer(base) => write!(f, "UnsafePointer(0x{:x})", base),
+            Value::Ref { frame, slot, .. } => write!(f, "<ref {frame}:{slot}>"),
             Value::Moved => write!(f, "<moved>"),
             Value::List(items) => {
                 write!(f, "[")?;
@@ -220,6 +247,7 @@ impl fmt::Display for Value {
 pub(crate) fn classify_param_decls(type_params: &[crate::ast::TypeParam]) -> Vec<(String, bool)> {
     type_params
         .iter()
+        .filter(|tp| tp.bounds.as_slice() != ["Origin"])
         .map(|tp| {
             let is_value = matches!(
                 tp.bounds.as_slice(),
@@ -250,6 +278,7 @@ pub(crate) fn type_name(value: &Value) -> String {
         }
         Value::Error(_) => "Error".to_string(),
         Value::Pointer(_) => "UnsafePointer".to_string(),
+        Value::Ref { .. } => "ref".to_string(),
         Value::Moved => "<moved>".to_string(),
         Value::List(_) => "List".to_string(),
         Value::Tuple(items) => {

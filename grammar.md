@@ -223,9 +223,9 @@ A `convention` word is only a convention when a parameter name follows it, so `r
 Int)`). Ordering is parsed leniently. The **`ref` convention** (parametric-mutability
 reference) may carry an **origin specifier** — `ref[origin] x` — whose contents (an
 arbitrary expression treated as `origin_of(...)`, a named origin, or `_` for an unbound
-origin) are **parsed and discarded** (origins are not modeled; `origin_of(...)` itself
-is just an ordinary call expression). Named `Origin[mut=...]` parameters and the
-`//` infer-only marker are parsed but their origin-specific meaning is discarded.
+origin) are retained in the AST for checked resolution. Named `Origin[mut=...]`
+parameters and the `//` infer-only marker are likewise retained; signature-level
+origin inference and substitution remain deferred.
 An optional `params_decl` list (see **Parameterization** below) makes the
 function generic: its type/value parameters are in scope as bare `NAME`s in the
 signature and body (e.g. `def first[T: Copyable & Movable](p: Pair[T]) -> T`, or
@@ -552,7 +552,7 @@ type:
     | 'Self' '.' NAME              # a struct's own type parameter, inside its body
     | 'Self'                       # the enclosing struct/trait type
     | function_type               # a function/closure type — parsed, deferred
-    | 'ref' [origin_spec] type    # a reference type `ref[origin] T` — parsed, deferred (origin discarded)
+    | 'ref' [origin_spec] type    # a reference type `ref[origin] T` — retained, signature semantics deferred
     | NAME [param_args]            # struct type, optionally with type/value arguments
 function_type: 'def' '(' [','.type+] ')' fn_effect* '->' type
 fn_effect: 'thin' | 'raises' | 'abi' '(' ... ')'    # `abi(...)` is parsed and discarded
@@ -574,7 +574,7 @@ into `Type::Func`, but the checker flags function-typed bindings as unsupported
 (semantics deferred). Capture lists `{…}` on a closure are **not** parsed yet
 (their current-Mojo grammar is unsettled — the old `unified` keyword was removed).
 A **reference type** `ref[origin] T` (used in a `ref` return, `def f(…) -> ref[o] T:`)
-likewise **parses** into `Type::Ref` (origin discarded) but the checker flags it as
+likewise **parses** into `Type::Ref` with its origin retained, but the checker flags it as
 unsupported. `ref` is contextual here — only the reference form when a type-starting
 token follows.
 
@@ -583,11 +583,12 @@ fixed-width **scalar aliases** (`Int8` / `Int16` / `Int32` / `Int64`, `UInt8` / 
 / `UInt32` / `UInt64`, `Float32`) — see **SIMD** — or a **`List[T]`** (see
 **Collections**). These are recognized by the checker, not reserved words.
 
-`ref NAME = expression` parses as a distinct reference binding and is rejected by
-the checker until origin-carrying reference values are modeled. Origin unions in
-arguments and returns, `Origin[mut=...]` parameters, and the `//` infer-only
-parameter marker are also accepted by the parser. Origin clauses are currently
-discarded after parsing, so this is syntax support rather than lifetime semantics.
+`ref NAME = place` is an executable local reference binding. It aliases variable,
+field, or indexed storage without copying; indexed operands are evaluated once at
+the binding. Persistent MIR loan analysis extends the owner through the reference's
+last use and rejects overlapping mutation across branches, joins, loops, moves, and
+calls. Origin unions in signatures, origin parameters, and reference returns are
+retained syntax but do not yet have interprocedural semantics.
 
 `comptime NAME = expression` declares a **compile-time constant** (`comptime N = 8`).
 The right-hand side must be a comptime `Int` expression (literals, other `comptime`

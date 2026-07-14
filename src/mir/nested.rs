@@ -304,6 +304,7 @@ pub(super) struct FunctionLowering<'a> {
     pub(super) parameter_annotations: Vec<SourceType>,
     pub(super) owned_parameters: Vec<bool>,
     pub(super) reference_parameters: Vec<bool>,
+    pub(super) returns_reference: bool,
     pub(super) body: &'a [Stmt],
     pub(super) overloads: &'a crate::symbol::OverloadSets,
     pub(super) overload_targets: &'a HashMap<SourceSpan, String>,
@@ -316,6 +317,7 @@ pub(super) fn lower_fn_nested(request: FunctionLowering<'_>, out: &mut Vec<(Stri
         parameter_annotations: param_annotations,
         owned_parameters: owned_params,
         reference_parameters: ref_params,
+        returns_reference,
         body,
         overloads,
         overload_targets,
@@ -363,10 +365,17 @@ pub(super) fn lower_fn_nested(request: FunctionLowering<'_>, out: &mut Vec<(Stri
     }
 
     let cfg = Cfg::build_fn(param_names, body);
-    let mut f = lower_cfg_nested(&cfg, &registry, overloads, overload_targets);
+    let mut f = lower_cfg_nested(
+        &cfg,
+        &registry,
+        overloads,
+        overload_targets,
+        returns_reference,
+    );
     f.param_annotations = param_annotations;
     f.owned_params = owned_params;
     f.ref_params = ref_params;
+    f.returns_reference = returns_reference;
     out.push((name.to_string(), f));
 
     let cap_ty = SourceType::Named("$capture".to_string(), Vec::new());
@@ -400,7 +409,7 @@ pub(super) fn lower_fn_nested(request: FunctionLowering<'_>, out: &mut Vec<(Stri
                 .cloned()
                 .collect();
             let ncfg = Cfg::build_fn_with_captures(&names, immutable_captures, dbody);
-            let mut nf = lower_cfg_nested(&ncfg, &registry, overloads, overload_targets);
+            let mut nf = lower_cfg_nested(&ncfg, &registry, overloads, overload_targets, false);
             nf.param_annotations = ptys;
             nf.owned_params = owned2;
             nf.ref_params = refp2;

@@ -132,6 +132,10 @@ expressions.
 
 | Mnemonic | MIR operation | Purpose |
 |---|---|---|
+| `loan.begin` | `BeginLoan` | Static local-reference loan marker; a VM no-op after ownership checking |
+| `ref.make` | `MakeRef` | Materialize or extend a verified frame/slot reference handle |
+| `ref.read` | `ReadRef` | Read through a runtime reference handle |
+| `ref.write` | `WriteRef` | Write through a runtime reference handle |
 | `drop.var` | `DropVar` | Destroy the value in a variable slot |
 | `drop.reg` | `Drop` | Reserved register-drop operation |
 
@@ -211,8 +215,9 @@ var.borrow_mut %dest, $source
 ```
 
 Reads `$source` under the MIR `BorrowMut` use mode. Static analysis enforces
-exclusive access. Runtime mutation through `mut` and `ref` parameters is
-implemented by caller-place write-back at the call boundary.
+exclusive access. Runtime mutation through reference-bearing `mut` and `ref`
+parameters uses frame/slot handles. Ordinary non-reference mutable parameters
+may still use caller-place write-back as a value-ABI implementation detail.
 
 ### `var.store` — Define Variable
 
@@ -621,7 +626,7 @@ Each function records:
 - variable-slot count and diagnostic names
 - number and types of leading parameter slots
 - which parameters are owned
-- which parameters are `mut` or `ref` write-back parameters
+- which parameters are owned or reference-bearing and how arguments are passed
 - source spans associated with generated registers
 
 Program declaration metadata records:

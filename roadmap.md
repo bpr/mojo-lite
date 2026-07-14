@@ -34,7 +34,10 @@ that unlocks a real library pattern, with positive and negative tests.
   diagnostics are in place.
 - [x] **Origin surface syntax** — `ref[origin]` arguments and returns, origin
   unions, named `Origin[mut=...]` parameters, infer-only `//`, and `ref` bindings
-  parse; origin clauses are not yet given semantic meaning.
+  parse and retain their clauses for semantic resolution.
+- [x] **Checked origin foundation and local references** — stable owner IDs,
+  canonical origins/unions, executable local `ref` aliases, bind-time index
+  evaluation, and persistent field-sensitive CFG loans are in place.
 - [x] **Overload rejection hardening** — duplicate, ambiguity, no-match,
   generic-ranking, bound-symbol, nested-def, and namespace regressions are pinned
   by the required overload rejection suite.
@@ -55,24 +58,37 @@ or user program needs them.
 
 Mojo origins symbolically identify the storage governing a reference and whether
 that reference permits mutation. They extend owner lifetimes, constrain mutable
-aliasing, and disappear before runtime code generation. Mojito currently has
-call-scoped, place-sensitive exclusivity and ASAP drop analysis, but it does not
-have origin-carrying reference values. This is a multi-stage compiler and VM
-project, not a checker-only feature. See the detailed assessment in
+aliasing, and disappear before runtime code generation. Mojito implements the
+safe caller-owned subset with persistent CFG loans, cross-call substitution,
+reference returns, and frame/slot runtime handles. Unsafe, static, and untracked
+origin forms remain demand-driven extensions. See the implementation notes in
 `docs/todo.md` and the [Mojo lifetime manual](https://mojolang.org/docs/manual/values/lifetimes/).
 
-- [ ] **Origin representation** — preserve origin clauses and infer-only origin
-  parameters in the AST and checked types instead of discarding them.
-- [ ] **Reference type and binding semantics** — model `ref T` values and
-  `ref name = place` without copying the referent.
-- [ ] **Origin inference and substitution** — infer argument origins, derive
-  field origins, normalize unions, and substitute callee origins at call sites.
-- [ ] **Lifetime extension analysis** — keep every owner in a reference's origin
-  live through the reference's last use and reject escaping local origins.
-- [ ] **Reference-capable VM ABI** — represent aliases to caller storage across
-  calls and ref returns; replace write-back emulation where true reference
-  identity is required.
-- [ ] **Origin conformance suite** — cover immutable/mutable inference, unions,
+- [x] **Origin representation foundation** — origin clauses and infer-only
+  parameters are retained; checked origins use stable owner/parameter IDs,
+  normalized unions, projection paths, and explicit mutability.
+- [x] **Local reference binding semantics** — `ref name = place` aliases variable,
+  field, and indexed storage without copying; MIR loans enforce exclusivity and
+  owner lifetime through the reference's CFG last use.
+- [x] **Origin-checked parameters and receivers** — validate named and
+  place-derived parameter origins, keep `Origin` parameters semantic-only,
+  check fixed/parametric mutability in generic bodies, and execute `ref self`.
+- [x] **Origin-bearing return reference types** — checked `ref T` returns require
+  origins; return sites are checked for declared-origin subsumption and local
+  escapes, including receiver fields and unions.
+- [x] **Origin inference and substitution** — argument/receiver places become
+  projected origins, unions normalize, callee contracts substitute at calls,
+  and solved immutable references permit shared aliases.
+- [x] **Interprocedural lifetime and escape analysis** — substituted and union
+  owners extend through a returned reference's last use; overlap, moves, calls,
+  and escaping local return origins are rejected.
+- [x] **Explicit VM frame stack** — function calls use monotonic frame IDs,
+  heap-owned register/variable frames, return continuations, and iterative
+  dispatch; deep source recursion no longer consumes the Rust call stack.
+- [x] **Reference-capable VM ABI** — runtime references are shallow frame/slot
+  handles with captured field/index projections; reference-producing calls,
+  `ref self`, union returns, and writes through returned aliases execute.
+- [x] **Origin conformance suite** — covers immutable/mutable inference, unions,
   disjoint fields, ref returns, premature destruction, and invalid escapes.
 
 ### 3. Expand Protocol Semantics When Libraries Need Them

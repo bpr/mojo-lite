@@ -58,8 +58,16 @@ pub enum Type {
     /// reference — used in a `ref[origin]` return type). The origin specifier is
     /// parsed but **discarded** (origins are not modeled); `ty` is the referent
     /// type. Parsed; the checker flags a `ref` annotation as unsupported.
-    Ref(Box<Type>),
+    Ref {
+        referent: Box<Type>,
+        origin: Option<OriginSpec>,
+    },
 }
+
+/// Source syntax inside a `ref[...]` clause. Expressions are deliberately
+/// retained verbatim: `origin_of` arguments are never evaluated, and semantic
+/// resolution belongs to the checker where bindings have stable identities.
+pub type OriginSpec = Vec<Expr>;
 
 /// Explicit name for [`Type`] when code handles parsed source annotations rather
 /// than the checked semantic lattice in [`crate::types::Ty`]. `Type` remains as a
@@ -77,6 +85,10 @@ pub struct TypeParam {
     pub name: String,
     /// The trait bound(s), or (for a value parameter) the single value type name.
     pub bounds: Vec<String>,
+    /// `Some(expr)` for `Origin[mut=expr]`; `None` for type/value parameters.
+    pub origin_mutability: Option<Expr>,
+    /// Whether this parameter follows the `//` infer-only marker.
+    pub infer_only: bool,
 }
 
 /// A parameter **argument** supplied in a `[...]` list at a use site, i.e. a
@@ -207,6 +219,8 @@ pub struct FnParam {
     pub kind: ParamKind,
     /// An argument convention (`read`/`mut`/`owned`/`out`); `None` = default.
     pub convention: Option<ArgConvention>,
+    /// Retained source origin clause for a `ref[...]` convention.
+    pub origin: Option<OriginSpec>,
 }
 
 /// Whether a `FnParam` is a plain parameter or a variadic (`*args`/`**kwargs`).
@@ -272,6 +286,7 @@ pub struct Method {
     /// constructor convention, `deinit self` the destructor convention, and
     /// owned/read receivers participate in lifecycle and call checking.
     pub self_convention: Option<ArgConvention>,
+    pub self_origin: Option<OriginSpec>,
     /// Decorators preceding the method (`@staticmethod`, …). Parsed, not modeled.
     pub decorators: Vec<Decorator>,
     pub params: Vec<FnParam>,
@@ -297,6 +312,7 @@ pub struct TraitMethod {
     /// `ref self`, ...). Like `Method`, `self` is implicit and not stored in
     /// `params`.
     pub self_convention: Option<ArgConvention>,
+    pub self_origin: Option<OriginSpec>,
     pub params: Vec<FnParam>,
     pub positional_only: Option<usize>,
     pub keyword_only: Option<usize>,
@@ -403,9 +419,8 @@ pub enum StmtKind {
         ty: Option<Type>,
         value: Expr,
     },
-    /// `ref name = value` — a reference binding. Parsed so current Mojo source
-    /// reaches a deliberate checker error; origin-carrying reference values are
-    /// not modeled yet.
+    /// `ref name = place` — a local reference binding. It aliases the source
+    /// place without copying and participates in persistent loan analysis.
     RefDecl { name: String, value: Expr },
     /// `name = value` — re-assigns an already-declared variable (every `var` is
     /// mutable). Distinct from `VarDecl`; the value must keep the declared type.
@@ -931,7 +946,15 @@ fn stamp_param_args(args: &mut [ParamArg], source: &str) {
 fn stamp_type(ty: &mut Type, source: &str) {
     match ty {
         Type::Named(_, args) => stamp_param_args(args, source),
-        Type::Assoc { base, .. } | Type::Ref(base) => stamp_type(base, source),
+        Type::Assoc { base, .. } => stamp_type(base, source),
+        Type::Ref { referent, origin } => {
+            stamp_type(referent, source);
+            if let Some(origins) = origin {
+                for expression in origins {
+                    stamp_expr(expression, source);
+                }
+            }
+        }
         Type::Func { params, ret, .. } => {
             for param in params {
                 stamp_type(param, source);

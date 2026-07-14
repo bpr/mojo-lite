@@ -909,6 +909,27 @@ This is why control-flow lowering happens before ownership analysis. A move
 inside an `if` or loop only has the right meaning once joins and back-edges are
 explicit.
 
+### Persistent local loans
+
+Local `ref name = place` bindings are checked references, not copied referent
+values. MIR emits `BeginLoan`; statically resolvable aliases use the frozen owner
+`MirPlace`, while cross-call aliases use explicit reference operations.
+`MirPlace::through` records which reference authorized an access. The VM ignores
+loan metadata after checking.
+
+Reference variables participate in backward CFG liveness. A loan is active from
+its binding through its last use, including joins and loop back-edges. While it
+is active, direct or differently-authorized overlapping mutation, replacement,
+move, drop, or mutating call is rejected. Projection overlap is field-sensitive
+and index-conservative. Because alias uses also use the owner root, ordinary drop
+elaboration expands a live reference to every possible owner root, keeping union
+and substituted owners alive through the reference's last use.
+
+Cross-call aliases lower to explicit `MakeRef`, `ReadRef`, and `WriteRef`
+operations. Runtime handles contain a monotonic frame identity, variable slot,
+and captured field/index projection. Returning a reference forwards the caller's
+handle, so a union return preserves whichever argument was selected dynamically.
+
 ### Loops
 
 Loops matter because a move in one iteration can affect the next iteration.
@@ -1026,11 +1047,17 @@ byte-addressable:
 - field and index operations work through high-level value navigation
 - calls allocate a new VM frame
 
-The frame shape is:
+Frames are owned by an explicit VM stack and have monotonic identities. Direct
+user-function calls push a frame plus a return/write-back continuation; returns
+pop and resume the caller in the iterative dispatcher. This makes ordinary deep
+source recursion independent of the Rust call stack. The frame shape is:
 
 ```text
-regs: Vec<Value>
-vars: Vec<Value>
+id: FrameId
+function/block/instruction cursor
+registers: Vec<Value>
+variables: Vec<Value>
+return continuation
 ```
 
 `regs` are temporaries. `vars` are source variables, parameters, and compiler

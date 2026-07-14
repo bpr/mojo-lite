@@ -85,6 +85,86 @@ fn inner_scope_shadows_outer() {
 }
 
 #[test]
+fn local_reference_reads_and_writes_owner_storage() {
+    assert_eq!(
+        output(
+            "def main():\n    var value: Int = 1\n    ref alias = value\n    alias = 4\n    print(value)\n"
+        ),
+        "4\n"
+    );
+}
+
+#[test]
+fn local_reference_index_is_evaluated_once() {
+    assert_eq!(
+        output(
+            "@fieldwise_init\nstruct Cursor:\n    var count: Int\n    def next(mut self) -> Int:\n        var old = self.count\n        self.count += 1\n        return old\n\ndef main():\n    var values = List(10, 20)\n    var cursor = Cursor(0)\n    ref alias = values[cursor.next()]\n    print(alias)\n    print(alias)\n    print(cursor.count)\n"
+        ),
+        "10\n10\n1\n"
+    );
+}
+
+#[test]
+fn ref_self_mutation_persists() {
+    assert_eq!(
+        output(
+            "@fieldwise_init\nstruct Counter:\n    var value: Int\n    def bump(ref self):\n        self.value += 1\n\ndef main():\n    var counter = Counter(1)\n    counter.bump()\n    print(counter.value)\n"
+        ),
+        "2\n"
+    );
+}
+
+#[test]
+fn parametric_mutability_ref_parameter_executes() {
+    assert_eq!(
+        output(
+            "def set[origin: Origin[mut=True]](ref[origin] value: Int):\n    value = 9\n\ndef main():\n    var value = 1\n    set(value)\n    print(value)\n"
+        ),
+        "9\n"
+    );
+}
+
+#[test]
+fn returned_reference_aliases_caller_storage() {
+    assert_eq!(
+        output(
+            "def borrow[origin: Origin[mut=True]](ref[origin] value: Int) -> ref[origin] Int:\n    return value\n\ndef main():\n    var value = 1\n    ref alias = borrow(value)\n    alias = 7\n    print(alias)\n    print(value)\n"
+        ),
+        "7\n7\n"
+    );
+}
+
+#[test]
+fn returned_reference_preserves_receiver_projection() {
+    assert_eq!(
+        output(
+            "@fieldwise_init\nstruct Box:\n    var value: Int\n    def get(ref self) -> ref[origin_of(self.value)] Int:\n        return self.value\n\ndef main():\n    var box = Box(2)\n    ref alias = box.get()\n    alias = 8\n    print(box.value)\n"
+        ),
+        "8\n"
+    );
+}
+
+#[test]
+fn union_reference_return_keeps_dynamic_identity() {
+    assert_eq!(
+        output(
+            "def choose(ref left: Int, ref right: Int, first: Bool) -> ref[left, right] Int:\n    if first:\n        return left\n    return right\n\ndef main():\n    var left = 1\n    var right = 2\n    ref alias = choose(left, right, False)\n    alias = 9\n    print(left, right)\n"
+        ),
+        "1 9\n"
+    );
+}
+
+#[test]
+fn returned_index_reference_captures_the_selected_element() {
+    assert_eq!(
+        output(
+            "def element(ref values: List[Int], index: Int) -> ref[origin_of(values[index])] Int:\n    return values[index]\n\ndef main():\n    var values = List(3, 4)\n    ref alias = element(values, 1)\n    alias = 12\n    print(values[1])\n"
+        ),
+        "12\n"
+    );
+}
+
+#[test]
 fn closure_captures_enclosing_local_downward() {
     let e = run(
         "def adder(n: Int) -> Int:\n    def add_n(x: Int) -> Int:\n        return x + n\n    return add_n(100)\n\nvar c: Int = adder(42)\n",

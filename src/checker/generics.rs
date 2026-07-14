@@ -70,6 +70,8 @@ pub(super) fn substitute(ty: &Ty, subst: &HashMap<String, Ty>) -> Ty {
             positional_only,
             keyword_only,
             conventions,
+            ref_params,
+            ref_return,
         } => Ty::Func {
             params: params.iter().map(|p| substitute(p, subst)).collect(),
             names: names.clone(),
@@ -79,6 +81,8 @@ pub(super) fn substitute(ty: &Ty, subst: &HashMap<String, Ty>) -> Ty {
             positional_only: *positional_only,
             keyword_only: *keyword_only,
             conventions: conventions.clone(),
+            ref_params: ref_params.clone(),
+            ref_return: ref_return.clone(),
         },
         Ty::Overload(candidates) => Ty::Overload(
             candidates
@@ -120,6 +124,8 @@ pub(super) fn substitute_self(ty: &Ty, replacement: &Ty) -> Ty {
             positional_only,
             keyword_only,
             conventions,
+            ref_params,
+            ref_return,
         } => Ty::Func {
             params: params
                 .iter()
@@ -134,6 +140,8 @@ pub(super) fn substitute_self(ty: &Ty, replacement: &Ty) -> Ty {
             positional_only: *positional_only,
             keyword_only: *keyword_only,
             conventions: conventions.clone(),
+            ref_params: ref_params.clone(),
+            ref_return: ref_return.clone(),
         },
         Ty::Overload(candidates) => Ty::Overload(
             candidates

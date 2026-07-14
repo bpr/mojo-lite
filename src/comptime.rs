@@ -268,9 +268,10 @@ fn stmt_has_comptime(s: &Stmt) -> bool {
 
 fn classify_ct_params(tps: &[TypeParam]) -> Vec<ParamDecl> {
     tps.iter()
+        .filter(|tp| tp.bounds.as_slice() != ["Origin"])
         .map(|tp| {
             if let [only] = tp.bounds.as_slice()
-                && only == "Int"
+                && matches!(only.as_str(), "Int" | "Bool")
             {
                 return ParamDecl::Value {
                     name: tp.name.clone(),
@@ -1200,7 +1201,7 @@ impl<'a> Elab<'a> {
                 ParamArg::Value(expr) => {
                     let value = self.eval(expr, scope)?;
                     match value {
-                        CtValue::Int(_) => Ok(value),
+                        CtValue::Int(_) | CtValue::Bool(_) => Ok(value),
                         _ => Err(ComptimeError::NotInt(format!("value parameter '{name}'"))),
                     }
                 }
@@ -1295,9 +1296,9 @@ impl<'a> Elab<'a> {
                     ))),
                 }
             }
-            Type::SelfType | Type::Func { .. } | Type::Ref(_) => Err(ComptimeError::NotComptime(
-                "unsupported compile-time type argument".to_string(),
-            )),
+            Type::SelfType | Type::Func { .. } | Type::Ref { .. } => Err(
+                ComptimeError::NotComptime("unsupported compile-time type argument".to_string()),
+            ),
         }
     }
 

@@ -39,6 +39,8 @@ pub enum Ty {
         keyword_only: Option<usize>,
         /// The argument convention of each regular parameter.
         conventions: Vec<Option<ArgConvention>>,
+        ref_params: Box<Vec<Option<crate::origin::RefSig>>>,
+        ref_return: Option<Box<crate::origin::RefSig>>,
     },
     /// A generic function synthesized from a `def` with a `[params]` list.
     GenericFunc {
@@ -51,6 +53,8 @@ pub enum Ty {
         positional_only: Option<usize>,
         keyword_only: Option<usize>,
         conventions: Vec<Option<ArgConvention>>,
+        ref_params: Box<Vec<Option<crate::origin::RefSig>>>,
+        ref_return: Option<Box<crate::origin::RefSig>>,
     },
     /// A source name that denotes multiple callable signatures. The checker
     /// resolves an overload set at each call site. The first implementation
@@ -88,6 +92,9 @@ pub enum Ty {
     Tuple(Vec<Ty>),
     /// The built-in `UnsafePointer[T]`.
     Pointer(Box<Ty>),
+    /// A reference value. Origins and permissions are checked statically; its
+    /// runtime representation is introduced only after loan checking exists.
+    Ref(crate::origin::RefTy),
 }
 
 /// A declared compile-time parameter of a generic `struct`/`def`, classified
@@ -163,6 +170,7 @@ impl fmt::Display for Ty {
             Ty::Simd { dtype, width } => write!(f, "SIMD[DType.{}, {}]", dtype.name(), width),
             Ty::Error => write!(f, "Error"),
             Ty::Pointer(elem) => write!(f, "UnsafePointer[{}]", elem),
+            Ty::Ref(reference) => write!(f, "ref {}", reference.referent),
             Ty::List(elem) => write!(f, "List[{}]", elem),
             Ty::Tuple(elems) => {
                 write!(f, "Tuple[")?;

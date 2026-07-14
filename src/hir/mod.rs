@@ -563,6 +563,16 @@ impl Lower {
                     source_annotation: ty.clone(),
                 });
             }
+            StmtKind::RefDecl { name, value } => {
+                let value = self.expr(value);
+                let runtime = self.declare_var(name);
+                let mut statement = s.clone();
+                statement.kind = StmtKind::RefDecl {
+                    name: self.vars[runtime as usize].clone(),
+                    value,
+                };
+                self.push(HirInstr::Stmt(statement));
+            }
             StmtKind::Assign { name, value } => {
                 let value = self.expr(value);
                 let captured = self.captures.remove(name);

@@ -53,6 +53,52 @@ fn no_transfer_never_errors() {
 }
 
 #[test]
+fn local_reference_loan_ends_at_last_use() {
+    let src = "def main():\n    var value: Int = 1\n    ref alias = value\n    print(alias)\n    value = 2\n    print(value)\n";
+    assert!(own(src).is_ok());
+}
+
+#[test]
+fn local_reference_blocks_owner_access_while_live() {
+    let src = "def main():\n    var value: Int = 1\n    ref alias = value\n    value = 2\n    print(alias)\n";
+    assert!(matches!(
+        own(src),
+        Err(OwnershipError::LoanConflict { place, loan, .. })
+            if place == "value" && loan == "alias"
+    ));
+}
+
+#[test]
+fn local_reference_loans_are_field_sensitive() {
+    let src = "@fieldwise_init\nstruct Pair:\n    var left: Int\n    var right: Int\n\ndef main():\n    var pair = Pair(1, 2)\n    ref alias = pair.left\n    pair.right = 3\n    print(alias)\n";
+    assert!(own(src).is_ok());
+}
+
+#[test]
+fn local_reference_loan_flows_through_cfg_join() {
+    let src = "def main():\n    var value: Int = 1\n    var flag: Bool = True\n    ref alias = value\n    if flag:\n        print(0)\n    value = 2\n    print(alias)\n";
+    assert!(matches!(own(src), Err(OwnershipError::LoanConflict { .. })));
+}
+
+#[test]
+fn local_reference_blocks_mutating_calls_between_uses() {
+    let src = "def replace(mut value: Int):\n    value = 2\n\ndef main():\n    var value: Int = 1\n    ref alias = value\n    replace(value)\n    print(alias)\n";
+    assert!(matches!(own(src), Err(OwnershipError::LoanConflict { .. })));
+}
+
+#[test]
+fn returned_reference_establishes_a_persistent_caller_loan() {
+    let source = "def borrow(ref value: Int) -> ref[value] Int:\n    return value\n\ndef main():\n    var value = 1\n    ref alias = borrow(value)\n    value = 2\n    print(alias)\n";
+    assert!(matches!(
+        own(source),
+        Err(OwnershipError::LoanConflict { .. })
+    ));
+
+    let after_last_use = "def borrow(ref value: Int) -> ref[value] Int:\n    return value\n\ndef main():\n    var value = 1\n    ref alias = borrow(value)\n    print(alias)\n    value = 2\n    print(value)\n";
+    assert!(own(after_last_use).is_ok());
+}
+
+#[test]
 fn use_after_move_is_rejected() {
     let src = format!(
         "{THING}def main():\n    var a: Thing = Thing(1)\n    var b: Thing = a^\n    print(a.x)\n"

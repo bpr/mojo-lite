@@ -408,7 +408,8 @@ The parser recognizes:
 - `Self`
 - `Self.T`
 - function types such as `def(Int) -> Int`
-- reference type syntax, which is parsed but later rejected as unsupported
+- local and cross-call references, with persistent loans, origin-bearing
+  parameter/return types, projected and union origins, and escape checking
 
 Mojo-style parameter lists use square brackets for both type and value
 arguments:

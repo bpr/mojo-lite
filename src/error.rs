@@ -98,6 +98,8 @@ pub enum TypeError {
     /// function parameter. Mojo function arguments are immutable unless their
     /// convention makes them writable (`mut`, `ref`, `out`).
     ImmutableBinding(String),
+    /// A reference return is rooted in storage not named by its declared origin.
+    ReturnsReferenceToLocal,
     /// A function value tried to escape by being returned (downward funargs
     /// only). The static counterpart of `RuntimeError::ClosureEscape`.
     ClosureEscape,
@@ -362,6 +364,12 @@ impl fmt::Display for TypeError {
             TypeError::ImmutableBinding(name) => {
                 write!(f, "expression must be mutable in assignment ('{name}')")
             }
+            TypeError::ReturnsReferenceToLocal => {
+                write!(
+                    f,
+                    "returned reference escapes storage outside its declared origin"
+                )
+            }
             TypeError::ClosureEscape => {
                 write!(
                     f,
@@ -605,6 +613,13 @@ pub enum OwnershipError {
         var: String,
         span: crate::token::SourceSpan,
     },
+    /// An owner place was accessed incompatibly while a local reference loan to
+    /// overlapping storage remained live.
+    LoanConflict {
+        place: String,
+        loan: String,
+        span: crate::token::SourceSpan,
+    },
 }
 
 impl fmt::Display for OwnershipError {
@@ -623,6 +638,10 @@ impl fmt::Display for OwnershipError {
                 f,
                 "'{var}' is used here but may have been transferred (moved) on some paths"
             ),
+            OwnershipError::LoanConflict { place, loan, .. } => write!(
+                f,
+                "access to '{place}' conflicts with live reference '{loan}'"
+            ),
         }
     }
 }
@@ -633,7 +652,8 @@ impl OwnershipError {
         match self {
             OwnershipError::InvalidInput(_) => crate::token::DUMMY_SPAN,
             OwnershipError::UseAfterMove { span, .. }
-            | OwnershipError::ConditionallyMoved { span, .. } => span.span,
+            | OwnershipError::ConditionallyMoved { span, .. }
+            | OwnershipError::LoanConflict { span, .. } => span.span,
         }
     }
 
@@ -641,7 +661,8 @@ impl OwnershipError {
         match self {
             OwnershipError::InvalidInput(_) => None,
             OwnershipError::UseAfterMove { span, .. }
-            | OwnershipError::ConditionallyMoved { span, .. } => span.source.as_deref(),
+            | OwnershipError::ConditionallyMoved { span, .. }
+            | OwnershipError::LoanConflict { span, .. } => span.source.as_deref(),
         }
     }
 }

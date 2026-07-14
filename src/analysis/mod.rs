@@ -42,6 +42,7 @@ pub fn check_ownership_checked(
 fn check_ownership_mir(prog: &MirProgram) -> Result<(), OwnershipError> {
     for (_name, f) in &prog.functions {
         analyze_moves(f)?;
+        analyze_loans(f)?;
     }
     Ok(())
 }
@@ -80,10 +81,12 @@ pub fn elaborate_drops_program(prog: MirProgram) -> MirProgram {
 /// is caught too), and the `for` iterator variable.
 fn var_uses(i: &MirInstr) -> Vec<(VarId, Reg)> {
     match i {
+        MirInstr::BeginLoan { place, marker, .. } => vec![(place.root, *marker)],
+        MirInstr::MakeRef { dest, place } => place_loan_uses(place, *dest),
         MirInstr::UseVar { dest, var, .. } => vec![(*var, *dest)],
-        MirInstr::MovePlace { dest, place } => vec![(place.root, *dest)],
-        MirInstr::Store { place, src } => vec![(place.root, *src)],
-        MirInstr::LoadPlace { dest, place } => vec![(place.root, *dest)],
+        MirInstr::MovePlace { dest, place } => place_loan_uses(place, *dest),
+        MirInstr::Store { place, src } => place_loan_uses(place, *src),
+        MirInstr::LoadPlace { dest, place } => place_loan_uses(place, *dest),
         MirInstr::MethodCall {
             dest,
             recv_place: Some(p),
@@ -124,6 +127,14 @@ fn var_uses(i: &MirInstr) -> Vec<(VarId, Reg)> {
     }
 }
 
+fn place_loan_uses(place: &MirPlace, reg: Reg) -> Vec<(VarId, Reg)> {
+    let mut uses = vec![(place.root, reg)];
+    if let Some(reference) = place.through {
+        uses.push((reference, reg));
+    }
+    uses
+}
+
 /// The variables **defined** within a `try` region's blocks (a `DefVar` at any
 /// nesting), excluding those moved out with `^` — the body-local values to destroy
 /// when the body is left (the exceptional-edge / scope-exit cleanup).
@@ -151,6 +162,15 @@ fn var_def(i: &MirInstr) -> Option<VarId> {
     match i {
         MirInstr::DefVar { var, .. } => Some(*var),
         _ => None,
+    }
+}
+
+/// `BeginLoan` starts the reference's analytical live range, but it does not
+/// overwrite the runtime handle already stored by `DefVar`.
+fn loan_liveness_def(i: &MirInstr) -> Option<VarId> {
+    match i {
+        MirInstr::BeginLoan { reference, .. } => Some(*reference),
+        _ => var_def(i),
     }
 }
 
@@ -190,6 +210,7 @@ fn is_droppable_root(f: &MirFunction, v: VarId) -> bool {
 
 fn elaborate_drops(f: &MirFunction) -> MirFunction {
     let nb = f.blocks.len();
+    let loan_roots = loan_root_dependencies(f);
 
     // Backward liveness: live_in[b] = uses(b) ∪ (live_out[b] − defs(b)); live_out[b]
     // = ⋃ live_in[succ]. Fixpoint.
@@ -199,7 +220,7 @@ fn elaborate_drops(f: &MirFunction) -> MirFunction {
         changed = false;
         for b in (0..nb).rev() {
             let live_out = block_live_out(f, b, &live_in);
-            let new_in = transfer_liveness(&f.blocks[b].instrs, live_out);
+            let new_in = transfer_drop_liveness(&f.blocks[b].instrs, live_out, &loan_roots);
             if new_in != live_in[b] {
                 live_in[b] = new_in;
                 changed = true;
@@ -214,6 +235,7 @@ fn elaborate_drops(f: &MirFunction) -> MirFunction {
         let live_out = block_live_out(f, b, &live_in);
         let instrs = &f.blocks[b].instrs;
         let mut live = live_out.clone();
+        extend_with_loan_roots(&mut live, &loan_roots);
         let mut live_after = vec![HashSet::new(); instrs.len()];
         for i in (0..instrs.len()).rev() {
             live_after[i] = live.clone();
@@ -223,6 +245,7 @@ fn elaborate_drops(f: &MirFunction) -> MirFunction {
             for (u, _) in var_uses(&instrs[i]) {
                 live.insert(u);
             }
+            extend_with_loan_roots(&mut live, &loan_roots);
         }
 
         let mut new_instrs = Vec::with_capacity(instrs.len());
@@ -339,8 +362,62 @@ fn elaborate_drops(f: &MirFunction) -> MirFunction {
         param_annotations: f.param_annotations.clone(),
         owned_params: f.owned_params.clone(),
         ref_params: f.ref_params.clone(),
+        returns_reference: f.returns_reference,
         spans: SpanTable(f.spans.0.clone()),
     }
+}
+
+/// A live reference keeps every possible owner root behind it alive. Dynamic
+/// reference returns may conservatively name several roots, so retain all of
+/// them; the runtime handle selects the actual one.
+fn loan_root_dependencies(f: &MirFunction) -> BTreeMap<VarId, Vec<VarId>> {
+    let mut dependencies: BTreeMap<VarId, Vec<VarId>> = BTreeMap::new();
+    for instr in f.blocks.iter().flat_map(|block| &block.instrs) {
+        if let MirInstr::BeginLoan {
+            reference, place, ..
+        } = instr
+        {
+            let roots = dependencies.entry(*reference).or_default();
+            if !roots.contains(&place.root) {
+                roots.push(place.root);
+            }
+        }
+    }
+    dependencies
+}
+
+fn extend_with_loan_roots(live: &mut HashSet<VarId>, dependencies: &BTreeMap<VarId, Vec<VarId>>) {
+    loop {
+        let roots: Vec<VarId> = live
+            .iter()
+            .filter_map(|reference| dependencies.get(reference))
+            .flatten()
+            .copied()
+            .filter(|root| !live.contains(root))
+            .collect();
+        if roots.is_empty() {
+            break;
+        }
+        live.extend(roots);
+    }
+}
+
+fn transfer_drop_liveness(
+    instrs: &[MirInstr],
+    mut live: HashSet<VarId>,
+    dependencies: &BTreeMap<VarId, Vec<VarId>>,
+) -> HashSet<VarId> {
+    extend_with_loan_roots(&mut live, dependencies);
+    for instr in instrs.iter().rev() {
+        if let Some(d) = var_def(instr) {
+            live.remove(&d);
+        }
+        for (u, _) in var_uses(instr) {
+            live.insert(u);
+        }
+        extend_with_loan_roots(&mut live, dependencies);
+    }
+    live
 }
 
 /// The variables *used* anywhere in a region's blocks (recursively, through nested
@@ -534,7 +611,7 @@ fn rewire_target(term: &mut MirTerm, old: usize, new: usize) {
 /// Backward transfer over a block for liveness.
 fn transfer_liveness(instrs: &[MirInstr], mut live: HashSet<VarId>) -> HashSet<VarId> {
     for instr in instrs.iter().rev() {
-        if let Some(d) = var_def(instr) {
+        if let Some(d) = loan_liveness_def(instr) {
             live.remove(&d);
         }
         for (u, _) in var_uses(instr) {
@@ -542,6 +619,226 @@ fn transfer_liveness(instrs: &[MirInstr], mut live: HashSet<VarId>) -> HashSet<V
         }
     }
     live
+}
+
+#[derive(Clone)]
+struct Loan {
+    place: MirPlace,
+    mutable: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LoanAccess {
+    Read,
+    Write,
+}
+
+/// Persistent local-loan checking. Reference variables participate in ordinary
+/// backward liveness through `MirPlace::through`, so a loan is active precisely
+/// from `BeginLoan` through the reference's last use, including CFG joins/loops.
+fn analyze_loans(f: &MirFunction) -> Result<(), OwnershipError> {
+    let mut loans: BTreeMap<VarId, Vec<Loan>> = BTreeMap::new();
+    for instr in f.blocks.iter().flat_map(|block| &block.instrs) {
+        if let MirInstr::BeginLoan {
+            reference,
+            place,
+            mutable,
+            ..
+        } = instr
+        {
+            loans.entry(*reference).or_default().push(Loan {
+                place: place.clone(),
+                mutable: *mutable,
+            });
+        }
+    }
+    if loans.is_empty() {
+        return Ok(());
+    }
+
+    let nb = f.blocks.len();
+    let mut live_in = vec![HashSet::new(); nb];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in (0..nb).rev() {
+            let live_out = block_live_out(f, block, &live_in);
+            let incoming = transfer_liveness(&f.blocks[block].instrs, live_out);
+            if incoming != live_in[block] {
+                live_in[block] = incoming;
+                changed = true;
+            }
+        }
+    }
+
+    for block in 0..nb {
+        let instrs = &f.blocks[block].instrs;
+        let mut live = block_live_out(f, block, &live_in);
+        let mut live_before = vec![HashSet::new(); instrs.len()];
+        for index in (0..instrs.len()).rev() {
+            if let Some(def) = loan_liveness_def(&instrs[index]) {
+                live.remove(&def);
+            }
+            for (used, _) in var_uses(&instrs[index]) {
+                live.insert(used);
+            }
+            live_before[index] = live.clone();
+        }
+
+        for (index, instr) in instrs.iter().enumerate() {
+            let active = &live_before[index];
+            if let MirInstr::BeginLoan {
+                reference,
+                place,
+                mutable,
+                marker,
+            } = instr
+            {
+                for other in active.iter().filter(|id| **id != *reference) {
+                    if loans
+                        .get(other)
+                        .and_then(|loans| {
+                            loans.iter().find(|existing| {
+                                (*mutable || existing.mutable)
+                                    && mir_places_overlap(place, &existing.place)
+                            })
+                        })
+                        .is_some()
+                    {
+                        let span = f
+                            .spans
+                            .0
+                            .get(&marker.0)
+                            .map(|(span, _)| span.clone())
+                            .unwrap_or_else(|| {
+                                crate::token::SourceSpan::new(None, crate::token::DUMMY_SPAN)
+                            });
+                        return Err(loan_error(f, place, *other, span));
+                    }
+                }
+                continue;
+            }
+            for (place, access, span) in loan_accesses(f, instr) {
+                for reference in active {
+                    let Some(reference_loans) = loans.get(reference) else {
+                        continue;
+                    };
+                    if place.through == Some(*reference) {
+                        if access == LoanAccess::Write
+                            && reference_loans.iter().any(|loan| !loan.mutable)
+                        {
+                            return Err(loan_error(f, &place, *reference, span));
+                        }
+                        continue;
+                    }
+                    if reference_loans.iter().any(|loan| {
+                        mir_places_overlap(&place, &loan.place)
+                            && (access == LoanAccess::Write || loan.mutable)
+                    }) {
+                        return Err(loan_error(f, &place, *reference, span));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn mir_places_overlap(left: &MirPlace, right: &MirPlace) -> bool {
+    left.root == right.root
+        && left.proj.iter().zip(&right.proj).all(|(a, b)| {
+            matches!((a, b), (Proj::Field(x), Proj::Field(y)) if x == y)
+                || matches!((a, b), (Proj::Index(_), Proj::Index(_)))
+        })
+}
+
+fn loan_accesses(
+    f: &MirFunction,
+    instr: &MirInstr,
+) -> Vec<(MirPlace, LoanAccess, crate::token::SourceSpan)> {
+    let fallback = crate::token::SourceSpan::new(None, crate::token::DUMMY_SPAN);
+    let span_for = |reg: Reg| {
+        f.spans
+            .0
+            .get(&reg.0)
+            .map(|(span, _)| span.clone())
+            .unwrap_or_else(|| fallback.clone())
+    };
+    match instr {
+        MirInstr::UseVar { var, dest, mode } => vec![(
+            MirPlace {
+                root: *var,
+                proj: Vec::new(),
+                through: None,
+            },
+            if matches!(mode, UseMode::Move) {
+                LoanAccess::Write
+            } else {
+                LoanAccess::Read
+            },
+            span_for(*dest),
+        )],
+        MirInstr::DefVar { var, src, .. } => vec![(
+            MirPlace {
+                root: *var,
+                proj: Vec::new(),
+                through: None,
+            },
+            LoanAccess::Write,
+            span_for(*src),
+        )],
+        MirInstr::LoadPlace { dest, place } => {
+            vec![(place.clone(), LoanAccess::Read, span_for(*dest))]
+        }
+        MirInstr::Store { place, src } => {
+            vec![(place.clone(), LoanAccess::Write, span_for(*src))]
+        }
+        MirInstr::MovePlace { dest, place } => {
+            vec![(place.clone(), LoanAccess::Write, span_for(*dest))]
+        }
+        MirInstr::Call {
+            dest, arg_places, ..
+        } => arg_places
+            .iter()
+            .flatten()
+            .cloned()
+            .map(|place| (place, LoanAccess::Write, span_for(*dest)))
+            .collect(),
+        MirInstr::MethodCall {
+            dest,
+            recv_place,
+            arg_places,
+            ..
+        } => recv_place
+            .iter()
+            .chain(arg_places.iter().flatten())
+            .cloned()
+            .map(|place| (place, LoanAccess::Write, span_for(*dest)))
+            .collect(),
+        MirInstr::DropVar { var } => vec![(
+            MirPlace {
+                root: *var,
+                proj: Vec::new(),
+                through: None,
+            },
+            LoanAccess::Write,
+            fallback,
+        )],
+        _ => Vec::new(),
+    }
+}
+
+fn loan_error(
+    f: &MirFunction,
+    place: &MirPlace,
+    reference: VarId,
+    span: crate::token::SourceSpan,
+) -> OwnershipError {
+    OwnershipError::LoanConflict {
+        place: place_display(&f.var_names[place.root as usize], &place_path(place)),
+        loan: f.var_names[reference as usize].clone(),
+        span,
+    }
 }
 
 /// A place's move/init state. A three-point lattice ordered by how "moved" a
@@ -786,6 +1083,9 @@ enum Touch {
 /// definitions are applied separately by [`apply_effects`].
 fn place_uses(i: &MirInstr) -> Vec<(VarId, Vec<Key>, Touch, Reg)> {
     match i {
+        MirInstr::BeginLoan { place, marker, .. } => {
+            vec![(place.root, place_path(place), Touch::Read, *marker)]
+        }
         // A whole-variable read/borrow (a bare `x`) or move (`x^`): reads the
         // whole variable first.
         MirInstr::UseVar { dest, var, .. } => vec![(*var, Vec::new(), Touch::Read, *dest)],

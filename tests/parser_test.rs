@@ -27,6 +27,7 @@ fn fnparam(name: &str, ty: Type) -> FnParam {
         default: None,
         kind: ParamKind::Regular,
         convention: None,
+        origin: None,
     }
 }
 
@@ -174,6 +175,7 @@ fn parses_struct_with_field_and_method() {
                 name: "get".into(),
                 has_self: true,
                 self_convention: None,
+                self_origin: None,
                 decorators: vec![],
                 params: vec![],
                 positional_only: None,
@@ -453,6 +455,8 @@ fn parses_generic_struct_header_and_self_param_field() {
             type_params: vec![TypeParam {
                 name: "T".into(),
                 bounds: vec!["Copyable".into(), "Movable".into()],
+                origin_mutability: None,
+                infer_only: false,
             }],
             conforms: vec![],
             fields: vec![
@@ -482,7 +486,9 @@ fn parses_generic_def_with_type_param_signature() {
             decorators: vec![],
             type_params: vec![TypeParam {
                 name: "T".into(),
-                bounds: vec!["AnyType".into()]
+                bounds: vec!["AnyType".into()],
+                origin_mutability: None,
+                infer_only: false,
             }],
             params: vec![fnparam("x", Type::Named("T".into(), vec![]))],
             positional_only: None,
@@ -534,6 +540,7 @@ fn parses_trait_with_method_requirements() {
                 TraitMethod {
                     name: "quack".into(),
                     self_convention: None,
+                    self_origin: None,
                     params: vec![],
                     positional_only: None,
                     keyword_only: None,
@@ -543,6 +550,7 @@ fn parses_trait_with_method_requirements() {
                 TraitMethod {
                     name: "volume".into(),
                     self_convention: None,
+                    self_origin: None,
                     params: vec![fnparam("loud", Type::Bool)],
                     positional_only: None,
                     keyword_only: None,
@@ -813,7 +821,9 @@ fn parses_value_parameter_header() {
                 type_params,
                 &vec![TypeParam {
                     name: "size".into(),
-                    bounds: vec!["Int".into()]
+                    bounds: vec!["Int".into()],
+                    origin_mutability: None,
+                    infer_only: false,
                 }]
             );
         }
@@ -1486,12 +1496,16 @@ fn convention_word_stays_usable_as_a_param_name() {
 #[test]
 fn parses_ref_convention_with_optional_origin() {
     // `ref x` and `ref[origin] x` both give the Ref convention; the origin
-    // specifier (an expression, or `_`) is parsed and discarded.
+    // specifier (an expression, or `_`) is retained.
     let (p, _, _) = def_params("def f(ref a: Int, ref[b] c: Int, ref[_] d: Int):\n    pass\n");
     assert_eq!(p[0].convention, Some(ArgConvention::Ref));
     assert_eq!(p[0].name, "a");
     assert_eq!(p[1].convention, Some(ArgConvention::Ref));
     assert_eq!(p[1].name, "c");
+    assert!(matches!(
+        p[1].origin.as_deref(),
+        Some([Expr { kind: ExprKind::Identifier(name), .. }]) if name == "b"
+    ));
     assert_eq!(p[2].convention, Some(ArgConvention::Ref));
     assert_eq!(p[2].name, "d");
 }
@@ -1513,9 +1527,15 @@ fn parses_origin_unions_parameters_and_reference_bindings() {
     assert_eq!(type_params[0].name, "is_mutable");
     assert_eq!(type_params[1].name, "origin");
     assert_eq!(type_params[1].bounds, vec!["Origin"]);
+    assert!(type_params[1].infer_only);
+    assert!(type_params[1].origin_mutability.is_some());
     assert_eq!(params[0].convention, Some(ArgConvention::Ref));
     assert_eq!(params[1].convention, Some(ArgConvention::Ref));
-    assert_eq!(ret, &Some(Type::Ref(Box::new(Type::String))));
+    assert!(matches!(
+        ret,
+        Some(Type::Ref { referent, origin: Some(origins) })
+            if **referent == Type::String && origins.len() == 2
+    ));
     assert!(matches!(
         &body[0].kind,
         StmtKind::RefDecl { name, .. } if name == "selected"
@@ -1533,6 +1553,7 @@ fn parses_ref_self_receiver() {
             assert_eq!(methods[0].self_convention, Some(ArgConvention::Ref));
             assert!(methods[0].has_self);
             assert_eq!(methods[1].self_convention, Some(ArgConvention::Ref));
+            assert_eq!(methods[1].self_origin.as_ref().map(Vec::len), Some(1));
         }
         other => panic!("expected a struct, got {:?}", other),
     }
@@ -1540,11 +1561,15 @@ fn parses_ref_self_receiver() {
 
 #[test]
 fn parses_ref_return_type() {
-    // `-> ref[origin] T` parses into a `Type::Ref` (origin discarded).
+    // `-> ref[origin] T` retains both the referent and origin expression.
     let stmts = parse("def f(x: Int) -> ref[origin_of(x)] Int:\n    return x\n");
     match &stmts[0].kind {
         StmtKind::Def { ret, .. } => {
-            assert_eq!(ret, &Some(Type::Ref(Box::new(Type::Int))));
+            assert!(matches!(
+                ret,
+                Some(Type::Ref { referent, origin: Some(origins) })
+                    if **referent == Type::Int && origins.len() == 1
+            ));
         }
         other => panic!("expected a def, got {:?}", other),
     }
