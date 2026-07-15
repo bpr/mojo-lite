@@ -1175,9 +1175,6 @@ impl Checker {
                 Ok(())
             }
 
-            // Tuple unpacking `a, b = t` is parsed and grammar-documented, but its
-            // semantics (splitting a tuple across targets) are deferred — flagged
-            // here, consistent with the other syntax-first parse-only constructs.
             // Tuple unpacking `a, b = t`: `t` must be a tuple of matching arity; each
             // target (a NAME or a place) receives the corresponding element type. A
             // NAME follows the assignment rules (re-assign if in scope, else a
@@ -3555,7 +3552,7 @@ impl Checker {
                 })),
             // `x.__hash__()` on a concrete built-in hashable type (`Int`, `String`,
             // …) is an intrinsic returning `UInt` — lets a key struct combine
-            // `self.field.__hash__()` values (Phase 6).
+            // `self.field.__hash__()` values (roadmap milestone 6).
             _ if method == "__hash__" && args.is_empty() && builtin_hashable_ty(&obj_ty) => {
                 Ok(Some(MethodCallResolution {
                     conversion_score: 0,
@@ -4059,13 +4056,13 @@ impl Checker {
         argc: usize,
     ) -> Option<MethodSig> {
         // The built-in `Hashable` trait contributes `__hash__(self) -> UInt`
-        // (Phase 6). A user trait cannot shadow a built-in name, so this is
+        // (roadmap milestone 6). A user trait cannot shadow a built-in name, so this is
         // unambiguous.
         if method == "__hash__" && argc == 0 && bounds.iter().any(|b| b == "Hashable") {
             return Some(MethodSig::intrinsic(vec![], Ty::UInt));
         }
         // The built-in numeric-rounding traits contribute a `-> Self` dunder
-        // (Phase 7), used by the self-hosted `math` module: `Floorable`/
+        // (roadmap milestone 7), used by the self-hosted `math` module: `Floorable`/
         // `Ceilable`/`Truncable` a nullary `__floor__`/`__ceil__`/`__trunc__`,
         // and `CeilDivable`/`CeilDivableRaising` a unary `__ceildiv__(Self)`.
         let accepts = math_dunder_bound(method, argc);
@@ -4371,7 +4368,8 @@ impl Checker {
                 "List" => return self.infer_list_construction(param_args, args),
                 "Error" => return self.infer_error_construction(args),
                 _ if Dtype::from_scalar_alias(name).is_some() => {
-                    let dtype = Dtype::from_scalar_alias(name).unwrap();
+                    let dtype = Dtype::from_scalar_alias(name)
+                        .expect("match guard established a scalar alias");
                     return self.infer_simd_alias_construction(dtype, param_args, args);
                 }
                 _ => return Err(TypeError::UndefinedVariable(name.to_string())),

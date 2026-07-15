@@ -2,6 +2,32 @@
 name = "mojito"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.96.1"
+description = "A compact compiler and register VM for a CPU-focused subset of Mojo"
+license = "MIT"
+repository = "https://github.com/bpr/mojito"
+readme = "README.md"
+keywords = ["mojo", "compiler", "interpreter", "language", "vm"]
+categories = ["command-line-utilities", "compilers", "development-tools"]
+include = [
+    "/src/**",
+    "/stdlib/**",
+    "/tests/**",
+    "/assets/**",
+    "/scripts/**",
+    "/docs/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/rust-toolchain.toml",
+    "/rustfmt.toml",
+    "/.gitignore",
+    "/CLAUDE.md",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+    "/grammar.md",
+    "/roadmap.md",
+]
 
 [dependencies]
 petgraph = "0.8.3"

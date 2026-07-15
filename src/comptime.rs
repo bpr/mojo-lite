@@ -1,4 +1,4 @@
-//! Compile-time elaboration (Phase 4 — comptime semantics).
+//! Stage 2: compile-time elaboration.
 //!
 //! A pass between parsing and type-checking that **resolves compile-time
 //! constructs before runtime lowering**, per `docs/notes/comptime.md`:
@@ -20,7 +20,7 @@
 //!   budget. This keeps function-body execution on the same path as runtime code.
 //! - **Materialization** — module-level `comptime` constants are inlined as literals
 //!   into runtime code, so a top-level comptime value is usable inside functions.
-//! - **Delayed generic elaboration (Phase 6)** — a generic `def` whose (value)
+//! - **Delayed generic elaboration (roadmap milestone 6)** — a generic `def` whose (value)
 //!   parameters feed a `comptime if`/`comptime for` cannot be elaborated early (the
 //!   parameter value is only known per call). Such a def is kept as a *template*;
 //!   a monomorphization pass then specializes it per distinct value argument,
@@ -127,7 +127,8 @@ struct CtStruct<'a> {
 
 /// The compile-time elaboration engine: the CTFE-callable functions and a shared
 /// fuel budget. `top_consts` captures module-level constants for materialization;
-/// `specializable` holds the comptime-dependent generic `def` templates (Phase 6).
+/// `specializable` holds the comptime-dependent generic `def` templates
+/// (roadmap milestone 6).
 struct Elab<'a> {
     program: &'a [Stmt],
     fns: HashMap<String, CtFn<'a>>,
@@ -210,7 +211,8 @@ fn collect_structs(program: &[Stmt]) -> HashMap<String, CtStruct<'_>> {
     structs
 }
 
-/// Collect the top-level generic `def`s that must be monomorphized (Phase 6/7): a
+/// Collect the top-level generic `def`s that must be monomorphized (roadmap
+/// milestones 6/7): a
 /// generic `def` (type and/or value parameters) whose body contains a
 /// `comptime if`/`comptime for`. Such a construct may depend on the parameters
 /// (e.g. `comptime if is_same_type[T, Int]()`), so it can only be resolved per call
@@ -568,7 +570,7 @@ impl<'a> Elab<'a> {
                 }
                 Ok(CtValue::Bool(true))
             }
-            // A built-in compile-time **type predicate** (Phase 7): `is_same_type[T,
+            // A built-in compile-time **type predicate** (roadmap milestone 7): `is_same_type[T,
             // U]()` is `Bool` type equality, usable in a `comptime if`.
             ExprKind::Call {
                 name,
@@ -827,6 +829,8 @@ impl<'a> Elab<'a> {
         stmt: &mut Stmt,
         scope: &HashMap<String, CtValue>,
     ) -> Result<(), ComptimeError> {
+        // Rewrite only type/comptime facts that the VM cannot evaluate from
+        // runtime values; preserve ordinary executable structure.
         match &mut stmt.kind {
             StmtKind::Def { body, .. } => self.rewrite_vm_ctfe_block(body, scope),
             StmtKind::VarDecl { value, .. }
@@ -1041,6 +1045,8 @@ impl<'a> Elab<'a> {
         visiting: &mut HashSet<String>,
         needed: &mut HashSet<String>,
     ) -> bool {
+        // This parallel walk is a purity/effect classifier: it discovers the
+        // transitive helper set but never mutates or specializes the AST.
         match &stmt.kind {
             StmtKind::VarDecl { value, .. }
             | StmtKind::RefDecl { value, .. }
@@ -1222,7 +1228,7 @@ impl<'a> Elab<'a> {
             .map(|ty| CtValue::Type(Box::new(ty)))
     }
 
-    /// The built-in type predicate `is_same_type[T, U]()` (Phase 7): resolve both
+    /// The built-in type predicate `is_same_type[T, U]()` (roadmap milestone 7): resolve both
     /// type parameters and compare them for equality, yielding a compile-time
     /// `Bool`. Takes exactly two type parameters and no value arguments.
     fn eval_is_same_type(
@@ -1379,7 +1385,7 @@ impl<'a> Elab<'a> {
         self.eval(&assoc.value, &env)
     }
 
-    // --- Monomorphization of comptime-dependent generics (Phase 6) -----------
+    // --- Monomorphization of comptime-dependent generics (roadmap milestone 6)
 
     /// Specialize every comptime-dependent generic template against the value
     /// arguments at its call sites, replacing each template with its concrete
@@ -1517,6 +1523,8 @@ impl<'a> Elab<'a> {
         consts: &HashMap<String, CtValue>,
         mono: &mut Mono,
     ) -> Result<(), ComptimeError> {
+        // Monomorphization substitutes one concrete parameter environment and
+        // rewrites nested calls to their specialized symbols.
         match &mut s.kind {
             StmtKind::VarDecl { value, .. }
             | StmtKind::RefDecl { value, .. }

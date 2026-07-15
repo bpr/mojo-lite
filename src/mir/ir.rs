@@ -1,3 +1,5 @@
+//! Flattened MIR data model shared by lowering, analysis, and execution.
+
 use super::*;
 
 /// Whether an argument convention transfers ownership to the callee (`owned`, or
@@ -154,7 +156,7 @@ pub enum MirInstr {
         place: MirPlace,
     },
     /// `var := <register>` — (re)define a variable slot from a register (lowered
-    /// from a HIR `Bind`). The write paired with `UseVar`; Phase 4 reads it as a
+    /// from a HIR `Bind`). The write paired with `UseVar`; Stage 6 reads it as a
     /// dataflow *def* (transitions the var to `Owned`). `source_annotation` is a
     /// parsed declaration annotation (`var x: T = …`) so a backend can materialize a numeric literal
     /// to `T` through checked coercion; `None` = inferred `var`/reassignment,
@@ -290,7 +292,7 @@ pub enum MirInstr {
     Drop {
         reg: Reg,
     },
-    /// Drop the value in a variable slot — spliced in by the Phase 4 liveness pass
+    /// Drop the value in a variable slot — spliced in by the Stage 7 liveness pass
     /// at a variable's last use (ASAP destruction). Runs the value's `__del__` (and
     /// its fields', in reverse order) and leaves the slot empty. A no-op for values
     /// without a destructor, so it never changes observable behaviour except when a

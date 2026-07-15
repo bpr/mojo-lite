@@ -1,3 +1,10 @@
+//! Hand-written parser for Mojito's indentation-sensitive Mojo subset.
+//!
+//! Statement, declaration, type, and suite parsing use recursive descent;
+//! expressions use precedence climbing with postfix call/member/index tails.
+//! [`parse`](crate::parse) is fail-fast, while the diagnostic entry point
+//! recovers at statement boundaries so it can report multiple syntax errors.
+
 use std::iter::Peekable;
 
 use crate::ast::{

@@ -164,9 +164,10 @@ impl fmt::Display for Ty {
             Ty::Param { name, .. } => write!(f, "{}", name),
             Ty::Assoc { base, name } => write!(f, "{}.{}", base, name),
             Ty::SelfType => write!(f, "Self"),
-            Ty::Simd { dtype, width: 1 } if dtype.scalar_alias().is_some() => {
-                write!(f, "{}", dtype.scalar_alias().unwrap())
-            }
+            Ty::Simd { dtype, width: 1 } => match dtype.scalar_alias() {
+                Some(alias) => write!(f, "{}", alias),
+                None => write!(f, "SIMD[DType.{}, 1]", dtype.name()),
+            },
             Ty::Simd { dtype, width } => write!(f, "SIMD[DType.{}, {}]", dtype.name(), width),
             Ty::Error => write!(f, "Error"),
             Ty::Pointer(elem) => write!(f, "UnsafePointer[{}]", elem),

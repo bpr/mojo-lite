@@ -49,7 +49,10 @@ Status meanings:
 | Destruction | ASAP `__del__`, edge/try cleanup, reverse field order | Run | Liveness rewrites MIR with explicit drops. |
 | Standard library | Self-hosted collections, algorithms, math, hashing | Run | Proof subset under `stdlib/`, not Mojo's full standard library. |
 | Backend | Register VM | Run | Sole backend and runtime; direct calls use an explicit continuation-driven frame stack with monotonic frame identities. |
-| Backend | Native, MLIR, GPU, Python interop | No | Outside the current implementation. |
+| Tooling | Textual MIR/VM assembly, parser, verifier, disassembler | No | Planned as a versioned Mojito-owned serialization and debugging format. |
+| Backend | Cranelift, then LLVM | No | Planned native backends after the textual MIR contract and VM semantics stabilize. |
+| Stretch backend | eBPF and MLIR | No | Explicit stretch goals, not first-pass parity requirements. |
+| Out of scope | GPU, concurrency/parallelism, distributed execution, Python interop | No | Intentionally excluded from the first Mojito parity target. |
 
 For planned semantic work, see [`roadmap.md`](../roadmap.md). For exact VM
 operations, see [`vm-instruction-set.md`](vm-instruction-set.md).

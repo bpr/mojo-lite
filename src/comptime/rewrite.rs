@@ -1,3 +1,5 @@
+//! AST rewriting helpers used by compile-time elaboration and specialization.
+
 use super::*;
 
 // --- Substitution / materialization -----------------------------------------

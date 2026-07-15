@@ -43,10 +43,11 @@ let program = compiler.compile_path(path)?;
 let execution = compiler.execute(&program)?;
 ```
 
-`CompiledProgram` can only be constructed after linking, comptime elaboration,
-semantic checking, and ownership analysis succeed. `CompilerError` identifies
-the failing stage. Individual stage functions remain public for compiler tests,
-diagnostic tools, and experimentation.
+`CompiledProgram` is a private-field wrapper around `CheckedProgram` produced by
+the driver only after linking, comptime elaboration, semantic checking, and
+ownership analysis succeed. The wrapper records pipeline provenance rather than
+adding a second semantic representation. `CompilerError` identifies the failing
+stage. Individual stage functions remain public for tests and diagnostic tools.
 
 The design is an hourglass:
 
@@ -92,9 +93,12 @@ The architecture prioritizes:
 - a small compiler that is still recognizable as a systems-language
   implementation
 
-mojito is not trying to be Mojo's production architecture. It has no MLIR
-backend, no GPU pipeline, and no optimizer stack. The register VM is the concrete
-execution model and the executable specification for the supported subset.
+mojito is not trying to reproduce Mojo's production architecture. First-pass
+parity targets single-threaded CPU language semantics and excludes GPU,
+concurrency/parallelism, distributed execution, Python interoperability, and
+MLIR. The register VM is the executable specification. A versioned textual
+MIR/VM assembly form is the next representation boundary; Cranelift and then
+LLVM are the planned native backends. eBPF and MLIR remain stretch goals.
 
 ### Source Module Boundaries
 
@@ -131,9 +135,11 @@ src/module.rs
 Entry points:
 
 ```rust
-module::link(entry_path: &Path) -> Result<Vec<Stmt>, ModuleError>
-module::link_source(source: &str, entry_path: &Path) -> Result<Vec<Stmt>, ModuleError>
+module::link_with_options(entry_path, options) -> Result<Vec<Stmt>, ModuleError>
+module::link_source_with_options(source, entry_path, options) -> Result<Vec<Stmt>, ModuleError>
 ```
+
+`link` and `link_source` are convenience wrappers using default options.
 
 The module linker is deliberately small. It consumes parsed source plus an entry
 path and returns one flat `Vec<Stmt>` for the rest of the compiler.
@@ -876,13 +882,15 @@ Module:
 src/analysis/mod.rs
 ```
 
-Entry point:
+Production entry point:
 
 ```rust
-check_ownership(program: &[Stmt]) -> Result<(), OwnershipError>
+check_ownership_checked(program: &CheckedProgram) -> Result<(), OwnershipError>
 ```
 
-This stage lowers the program to MIR and runs move/init analysis on each
+`check_ownership(&[Stmt])` is a compatibility wrapper for unchecked callers; it
+rechecks through compatibility lowering. Production compilation lowers the
+existing `CheckedProgram` and runs move/init and persistent-loan analysis on each
 function.
 
 The core state is:
@@ -1289,6 +1297,23 @@ management, calls, jumps, drops, and exception flow.
 
 This separation makes it possible to add another backend later without
 reimplementing every scalar/list/string/SIMD rule from scratch.
+
+### Textual MIR/VM assembly boundary
+
+The compiler should expose a human-readable, flattened, versioned serialization
+of verified MIR and the metadata needed to execute it. The format must support:
+
+- deterministic printing suitable for review and golden tests
+- parsing with source-located diagnostics
+- structural and semantic verification before execution
+- lossless print/parse/print round trips
+- disassembly of in-memory programs
+- execution by the register VM without reconstructing source AST semantics
+- consumption by future Cranelift and LLVM backends
+
+This is a Mojito format, not a generic interchange standard. The in-memory MIR
+remains authoritative; textual assembly is its stable inspection and artifact
+boundary. A compact binary encoding may later share the same schema.
 
 ## Current And Future Pressure Points
 

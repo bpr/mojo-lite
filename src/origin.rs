@@ -15,19 +15,23 @@ pub struct OwnerId(pub u32);
 pub struct OriginParamId(pub u32);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// One projection step within an origin-tracked place.
 pub enum OriginSeg {
+    /// A named struct field.
     Field(String),
     /// An index whose value is not part of the static origin identity.
     AnyIndex,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// Stable owner plus its statically known projection path.
 pub struct OriginPlace {
     pub root: OwnerId,
     pub path: Vec<OriginSeg>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Canonical checked description of storage a reference may designate.
 pub enum Origin {
     Param(OriginParamId),
     Place(OriginPlace),
@@ -37,6 +41,7 @@ pub enum Origin {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Permission available through a checked reference.
 pub enum Mutability {
     Immutable,
     Mutable,
@@ -44,6 +49,7 @@ pub enum Mutability {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Checked reference type: referent, storage origin, and access permission.
 pub struct RefTy {
     pub referent: Box<crate::types::Ty>,
     pub origin: Origin,
@@ -63,6 +69,7 @@ pub enum SigOrigin {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Mutability component of a callable reference contract.
 pub enum SigMutability {
     Immutable,
     Mutable,
@@ -71,6 +78,7 @@ pub enum SigMutability {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Reference result or parameter contract retained in a callable signature.
 pub struct RefSig {
     pub origin: SigOrigin,
     pub mutability: SigMutability,
@@ -111,6 +119,7 @@ impl Origin {
     }
 }
 
+/// Whether two projected owner places may designate overlapping storage.
 pub fn places_overlap(left: &OriginPlace, right: &OriginPlace) -> bool {
     if left.root != right.root {
         return false;

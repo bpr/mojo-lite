@@ -1,3 +1,10 @@
+//! Error taxonomy for each compiler boundary.
+//!
+//! Lexing, parsing, module linking, compile-time elaboration, semantic checking,
+//! ownership analysis, and execution retain distinct error types so the driver
+//! can report the stage that rejected a program without flattening diagnostics
+//! into unstructured strings.
+
 use crate::token::Token;
 use std::fmt;
 

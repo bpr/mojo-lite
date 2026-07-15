@@ -1,20 +1,25 @@
 # mojito
 
-mojito is a small Rust implementation of a subset of [Mojo](https://www.modular.com/mojo). It is not Mojo, and it is not trying to
+mojito is a small Rust implementation of an evolving subset of [Mojo](https://www.modular.com/mojo). It is not Mojo, and it is not trying to
 compete with Mojo's production compiler. It is a compact compiler playground for
-studying the shape of a modern systems programming language compiler. Mojo was chosen because it is a rich language, with value semantics, ownership/borrowing, ASAP destruction, generics, overloading, and compile time execution. It has interesting features associated with C++, Rust, and Zig. It has a Pythonic syntax which is still undergoing development, so I can test the idea that "parser generators are invaluable when a language's syntax is rapidly evolving", which I think is wrong, even more so in the era of AI code generators.
+studying the shape of a modern systems programming language compiler. Mojo was chosen because it is a rich language, with value semantics, ownership/borrowing, ASAP destruction, generics, overloading, and compile time execution. It has interesting features associated with C++, Rust, and Zig. 
 
 ## Why not mojito?
 - mojito does not generate optimized code yet
-- mojito is not currently targeting GPUs or MLIR
+- the first parity target explicitly excludes GPUs, concurrency, parallel and
+  distributed execution, Python interoperability, and MLIR
 - This list could grow very long, but really, 
   this is the kind of thing you like, then you'll like this kind of thing.
 
 ## Project goals
 - Parse all of current Mojo and report syntax
   errors
-- Support a subset of Mojo semantics. All mojito 
-  programs should be runnable by Mojo, though many Mojo programs will exceed what mojito can do
+- Approach semantic parity with a single-threaded, CPU-only subset of current
+  Mojo. All mojito programs should be runnable by Mojo, though platform-specific
+  Mojo programs will remain outside the target.
+- Keep the register VM as the executable semantic oracle while adding a stable,
+  human-readable MIR/VM assembly format and, later, native Cranelift and LLVM
+  backends.
 
 ## Status
 
@@ -83,14 +88,12 @@ Language deficiencies:
 - no complete support for every Mojo expression form; some advanced forms still
   parse before they are fully checked or executed
 
-Infrastructure and backend deficiencies:
+Infrastructure and backend boundaries:
 
-- no deep MLIR integration
-- no real GPU backend, GPU programming model, kernels, device memory model, or
-  accelerator codegen
+- GPU, concurrency/parallelism, distributed execution, Python interoperability,
+  and MLIR are intentionally outside first-pass parity
 - no production optimizer
-- no general MLIR dialect lowering, ABI integration, or native object generation
-- no Python interop
+- no Cranelift or LLVM native code generation yet
 - no real SIMD lowering to machine vector instructions; SIMD values are modeled
   at the VM value level
 - no performance claim beyond "useful as a reference implementation"
@@ -384,16 +387,17 @@ Near-term work:
 
 Longer-term possible directions:
 
-- an assembler/disassembler for the register VM
-- bytecode serialization
-- a second backend once MIR semantics are solid
+- a versioned assembler/disassembler for flattened MIR/VM programs, including
+  textual serialization, parsing, verification, round-tripping, and execution
+- optional compact bytecode serialization derived from the same schema
+- Cranelift as the first native backend, followed by LLVM
 - richer borrow checking and lifetime diagnostics
 - better specialization of value-parameterized code
 - deeper comptime specialization and generated declarations
 - an explicitly documented unsafe/unsupported boundary
 
-MLIR and GPU support remain north-star topics, not current implementation
-features.
+eBPF and MLIR are stretch backends. GPU, Python interoperability, and
+parallel/distributed execution are not goals for the first parity pass.
 
 ## Library API
 

@@ -1,7 +1,7 @@
-//! Phase 1 of the compiler frontend: lower the AST into a **control-flow graph**
+//! Stage 4: lower the checked AST into a **control-flow graph**
 //! (CFG) of basic blocks, built on `petgraph`. Expressions stay *nested* here (as
-//! embedded AST); Phase 2 flattens them to A-Normal Form. Ownership/liveness
-//! analysis (Phase 4) runs over the flattened form, not this one.
+//! embedded AST); Stage 5 flattens them to A-Normal Form. Ownership and liveness
+//! analysis (Stages 6–7) run over the flattened form, not this one.
 //!
 //! A [`Cfg`] is built per function body (or the top-level statement list) via
 //! [`Cfg::build`]. Every block ends in exactly one [`Terminator`]; control flow
@@ -113,10 +113,10 @@ pub enum HirInstr {
     /// A bare expression evaluated for its effect/value (`f(x)`).
     Eval(Expr),
     /// Any other straight-line statement (assignment, member-write, declaration,
-    /// …), kept whole for Phase 1 and refined when Phase 2 flattens to MIR.
+    /// …), kept whole for Stage 4 and refined when Stage 5 flattens to MIR.
     Stmt(Stmt),
-    /// An ASAP destructor, spliced in by the Phase 4 liveness pass (never by the
-    /// Phase 1 lowerer — present so later phases share the type).
+    /// An ASAP destructor, spliced in by Stage 7 liveness (never by the Stage 4
+    /// lowerer — present so later stages share the type).
     Drop(VarId),
     /// Iterator protocol: normalize the iterable in `iter` to an *iterator* — for a
     /// user struct, `iter = iter.__iter__()`; a built-in `range`/`List` iterates in
@@ -129,7 +129,7 @@ pub enum HirInstr {
     /// Iterator protocol: `dest = iter.next()` — bind the current element and
     /// advance `iter` in place (a mutating read of the iterator).
     Next { iter: VarId, dest: VarId },
-    /// A `try` statement whose sub-regions are lowered (in Phase 2) as mini-CFGs.
+    /// A `try` statement whose sub-regions are lowered in Stage 5 as mini-CFGs.
     /// `loop_targets` snapshots the enclosing **function-level** loop stack
     /// (`(continue → header, break → exit)`, innermost-last) at this point, so a
     /// `break`/`continue` inside the `try` that targets an outer loop can be
@@ -176,7 +176,7 @@ pub struct Cfg {
     pub g: StableGraph<BasicBlock, ()>,
     pub entry: BlockId,
     /// The variable interner table: `vars[id as usize]` is the name that `id` was
-    /// assigned. Exposed so the Phase 2 MIR flattener can seed its own interner and
+    /// assigned. Exposed so the Stage 5 MIR flattener can seed its own interner and
     /// keep `VarId`s consistent across the two IRs.
     pub vars: Vec<String>,
     /// The number of leading `vars` that are the function's **parameters**, in
@@ -603,7 +603,7 @@ impl Lower {
             // enclosing loop is function-level (escapable to the function driver): a
             // function's own loops always are; a region's own loops are region-local
             // and can't be an escape target, so such a `try` falls back to the opaque
-            // `Stmt` path (Phase 2 then refuses a crossing `break`/`continue`).
+            // `Stmt` path (Stage 5 then refuses a crossing `break`/`continue`).
             StmtKind::Try { .. } => {
                 let escapable = self.is_function || self.loops.iter().all(|f| f.escape);
                 if escapable {
@@ -618,7 +618,7 @@ impl Lower {
             }
 
             // Everything else (member-write, aug-assign, declarations, imports, …)
-            // is kept whole for Phase 1; Phase 2 refines it.
+            // is kept whole for Stage 4; Stage 5 refines it.
             _ => self.push(HirInstr::Stmt(s.clone())),
         }
     }

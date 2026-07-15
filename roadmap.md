@@ -1,8 +1,9 @@
 # Mojito Roadmap
 
-This roadmap records the project's direction and a mostly dependency-ordered
-task list. Checked entries are complete and intentionally brief. Unchecked
-entries are pending or demand-driven.
+This is the project's single task tracker. It records the project's direction,
+current capabilities, and a mostly dependency-ordered list of unfinished work.
+The ordered list contains only pending or demand-driven tasks; completed tasks
+do not remain there as checked boxes.
 
 The north star is self-hosting: useful standard-library code should expose the
 next missing compiler capability. Prefer the smallest honest language change
@@ -32,12 +33,10 @@ that unlocks a real library pattern, with positive and negative tests.
 - [x] **Stabilization checkpoint** — strict local checks, named compiler records,
   canonical overload symbols, MIR declaration metadata, and actionable trait
   diagnostics are in place.
-- [x] **Origin surface syntax** — `ref[origin]` arguments and returns, origin
-  unions, named `Origin[mut=...]` parameters, infer-only `//`, and `ref` bindings
-  parse and retain their clauses for semantic resolution.
-- [x] **Checked origin foundation and local references** — stable owner IDs,
-  canonical origins/unions, executable local `ref` aliases, bind-time index
-  evaluation, and persistent field-sensitive CFG loans are in place.
+- [x] **Origin and reference semantics** — origin-bearing parameters, receivers,
+  returns and unions use stable checked identities, persistent field-sensitive
+  CFG loans, interprocedural substitution and escape checking, and executable
+  frame/slot reference handles with captured projections.
 - [x] **Overload rejection hardening** — duplicate, ambiguity, no-match,
   generic-ranking, bound-symbol, nested-def, and namespace regressions are pinned
   by the required overload rejection suite.
@@ -48,91 +47,127 @@ The order below expresses dependencies, not a promise that every item must be
 implemented. Demand-driven items should be promoted only when a concrete stdlib
 or user program needs them.
 
-### 1. Finish Self-Hosted Collection Growth
+### 1. Define And Measure CPU-Language Parity
 
-- [ ] **HashSet growth and rehashing** — port `HashDict`'s explicit bucket growth
-  to the self-hosted `HashSet`, preserving collision behavior and deep-copy
-  semantics while rebuilding nested-list buckets.
+- [ ] **Versioned parity manifest** — pin the target Mojo release and classify
+  every manual feature as implemented, partial, excluded, or stretch. First-pass
+  exclusions are GPU, concurrency/parallelism, distributed execution, Python
+  interoperability, and MLIR.
+- [ ] **Differential conformance harness** — run focused programs under Mojo and
+  Mojito, recording matching results, matching rejection, and documented
+  intentional divergence.
 
-### 2. Add Origin and Reference Semantics
+### 2. Complete Modules And Packages
 
-Mojo origins symbolically identify the storage governing a reference and whether
-that reference permits mutation. They extend owner lifetimes, constrain mutable
-aliasing, and disappear before runtime code generation. Mojito implements the
-safe caller-owned subset with persistent CFG loans, cross-call substitution,
-reference returns, and frame/slot runtime handles. Unsafe, static, and untracked
-origin forms remain demand-driven extensions. See the implementation notes in
-`docs/todo.md` and the [Mojo lifetime manual](https://mojolang.org/docs/manual/values/lifetimes/).
+- [ ] **Module namespaces** — implement qualified `import module`, aliases,
+  package boundaries, visibility/re-exports, and imported initialization while
+  preserving overload and declaration identity across modules.
 
-- [x] **Origin representation foundation** — origin clauses and infer-only
-  parameters are retained; checked origins use stable owner/parameter IDs,
-  normalized unions, projection paths, and explicit mutability.
-- [x] **Local reference binding semantics** — `ref name = place` aliases variable,
-  field, and indexed storage without copying; MIR loans enforce exclusivity and
-  owner lifetime through the reference's CFG last use.
-- [x] **Origin-checked parameters and receivers** — validate named and
-  place-derived parameter origins, keep `Origin` parameters semantic-only,
-  check fixed/parametric mutability in generic bodies, and execute `ref self`.
-- [x] **Origin-bearing return reference types** — checked `ref T` returns require
-  origins; return sites are checked for declared-origin subsumption and local
-  escapes, including receiver fields and unions.
-- [x] **Origin inference and substitution** — argument/receiver places become
-  projected origins, unions normalize, callee contracts substitute at calls,
-  and solved immutable references permit shared aliases.
-- [x] **Interprocedural lifetime and escape analysis** — substituted and union
-  owners extend through a returned reference's last use; overlap, moves, calls,
-  and escaping local return origins are rejected.
-- [x] **Explicit VM frame stack** — function calls use monotonic frame IDs,
-  heap-owned register/variable frames, return continuations, and iterative
-  dispatch; deep source recursion no longer consumes the Rust call stack.
-- [x] **Reference-capable VM ABI** — runtime references are shallow frame/slot
-  handles with captured field/index projections; reference-producing calls,
-  `ref self`, union returns, and writes through returned aliases execute.
-- [x] **Origin conformance suite** — covers immutable/mutable inference, unions,
-  disjoint fields, ref returns, premature destruction, and invalid escapes.
+### 3. Complete Functions, Calls, And Effects
 
-### 3. Expand Protocol Semantics When Libraries Need Them
+- [ ] **Full call model** — named `out` results, ordinary `out`, static methods,
+  heterogeneous variadics and parameter packs, callable expressions, and parity
+  across free, method, constructor, and generic calls.
+- [ ] **Mojo overload ordering** — implicit constructors/conversions,
+  convention-aware filtering, variadic preference, parameter-signature ranking,
+  and generic-versus-non-generic ordering with ambiguity retained as an error.
+- [ ] **Raising effects and typed errors** — enforce `raises`, propagation and
+  handling; add typed/parametric errors, `Never`, and their function-type and
+  overload interactions.
 
-- [ ] **Opaque indexing protocol** — define the index and result associated facts
-  needed for `T: Indexer`, then type generic subscripting without container
-  special cases.
-- [ ] **Trait default methods** — type-check and lower inherited default bodies,
-  including ambiguity rules, only when a real protocol needs shared behavior.
-- [ ] **Incremental Hasher protocol** — add `Hasher` only when streaming or
-  composite hashing needs more than the current `__hash__() -> UInt` contract.
-- [ ] **Writer and representation research** — verify current Mojo semantics for
-  `Representable`, `Writable`, and `Writer`, then implement the smallest protocol
-  needed by a self-hosted formatting use case.
-- [ ] **Backend layout markers** — define `RegisterPassable` and
-  `TrivialRegisterPassable` only when a backend or ABI can observe the
-  distinction.
+### 4. Complete Lifecycle And Traits
 
-### 4. Deepen Compile-Time Specialization on Demand
+- [ ] **Lifecycle closure** — named-result initialization, non-movable return
+  construction, raising lifecycle methods, explicitly destroyed types, and
+  definite initialization across branches and exceptional flow.
+- [ ] **Trait model** — refinement, default bodies, override/ambiguity rules,
+  associated types/constants, compositions, conditional conformance, and
+  compile-time capability refinement.
+- [ ] **Core protocols** — opaque `Indexer` dispatch; demand-driven incremental
+  `Hasher`; `Writer`, `Writable`, and `Representable` semantics demonstrated by
+  a formatter; and layout markers tied to observable native ABI rules.
 
-- [ ] **Nested generic CTFE specialization** — specialize transitive helper calls
-  by compile-time argument tuple when stdlib code needs `outer[T]()` to call an
-  `inner[T]()` that reads type facts.
-- [ ] **Richer compile-time values** — extend `CtValue` and materialization only
-  for concrete associated-value, declaration-generation, or specialization use
-  cases.
+### 5. Generalize Parameterization And Compile-Time Execution
 
-### 5. Grow Overloading Only With Evidence
+- [ ] **General parameters and packs** — arbitrary compile-time parameter types,
+  variadic type/value packs, dependent parameter expressions, constraints, and
+  full parameter binding rules.
+- [ ] **Specialization engine** — nested generic CTFE helper specialization,
+  caching, shared fuel and recursion diagnostics, richer compile-time values with
+  explicit materialization rules, reflection, and declaration generation where
+  conformance cases require them.
 
-- [ ] **Richer overload ranking** — extend the current exact-versus-coercion model
-  only after negative coverage is strong and real APIs require more ranking
-  rules.
-- [ ] **Generic overload ordering** — define ordering between generic and
-  non-generic candidates, constraints, and value-parameter specializations as a
-  separate design task rather than an accidental extension of coercion scoring.
+### 6. Complete Closures And Remaining Language Surface
 
-### 6. Optional Interchange and Backend Experiments
+- [ ] **Callable values and closure environments** — escaping and non-escaping
+  closures, inferred/explicit captures with ownership conventions, indirect MIR
+  invocation, nested/sibling/recursive/generic local functions, and captured
+  reference lifetime checking.
+- [ ] **Control and expression closure** — context managers, t-strings, walrus,
+  complete slicing, chained comparisons, destructuring patterns, reference loop
+  bindings, and remaining CPU-relevant operators.
+- [ ] **Advanced reference/pointer boundary** — static/untracked/unsafe origins,
+  reborrows, reference aggregates where valid, pointer provenance, allocation,
+  deallocation, alignment, and typed address arithmetic.
 
-- [ ] **NIF exporter spike** — prototype an export-only `mojito-mir-v0` subset for
-  representative MIR programs and evaluate readability, fidelity, and tooling
-  value before considering import or cache support; see `docs/nif.md`.
-- [ ] **Alternative backend boundary** — add another backend only after checked
-  declarations and MIR contain enough semantics that it does not need to
-  reconstruct language rules from the AST.
+### 7. Stabilize A Textual MIR/VM Assembly Format
+
+- [ ] **Assembler/disassembler** — define a deterministic, human-readable,
+  flattened and versioned Mojito MIR/VM format with parser, printer, verifier,
+  source diagnostics, lossless round trips, and VM execution.
+- [ ] **Artifact and test integration** — use the text form for MIR snapshots,
+  compiler dumps, conformance artifacts, and native-backend differential tests;
+  consider compact bytecode only after the textual schema stabilizes.
+
+### 8. Reduce Builtins And Grow The CPU Standard Library
+
+- [ ] **Protocol-driven builtins** — route scalar, string, collection, range,
+  tuple, SIMD, conversion, formatting, hashing, indexing, and iteration behavior
+  through the same checked protocol model as user types.
+- [ ] **CPU stdlib growth** — port representative core, collection, string,
+  formatting, algorithms, math, filesystem/I/O, time, random, and testing slices.
+- [ ] **HashSet growth and rehashing** — preserve the existing concrete
+  self-hosted acceptance case within this broader standard-library phase.
+- [ ] **SIMD semantic completion** — complete CPU-relevant SIMD typing and
+  behavior in the VM; native vector lowering is a backend goal, not a condition
+  for VM semantic parity.
+
+### 9. Native Backends
+
+- [ ] **Backend-ready MIR** — remove remaining source-AST reconstruction and make
+  checked declarations, verified MIR, and textual assembly sufficient inputs.
+- [ ] **Cranelift backend** — first native CPU backend, validated differentially
+  against the VM and textual assembly corpus.
+- [ ] **LLVM backend** — second native CPU backend, sharing the same verified MIR
+  contract and adding stronger optimization/vectorization opportunities.
+- [ ] **Stretch backends** — investigate eBPF and MLIR only after Cranelift and
+  LLVM are stable. They are not first-pass parity requirements.
+
+### Explicit Non-Goals For First-Pass Parity
+
+- GPU programming and accelerator memory/execution models
+- concurrency, parallelism, atomics, tasks, and distributed execution
+- Python interoperability
+- MLIR as a required compiler layer or backend
+
+## Task Lifecycle Policy
+
+`roadmap.md` is the only task list. Do not create a parallel todo file.
+
+- Unfinished work belongs in **Ordered Work** as an unchecked, outcome-oriented
+  task. Add detailed design notes elsewhere only when they are needed to make a
+  decision or preserve an architectural argument.
+- A task is complete only when its implementation, focused positive and negative
+  coverage, relevant documentation, and `scripts/check` all agree.
+- In the same change that completes a task, remove it from **Ordered Work**. Add
+  or update one brief capability entry in **Current State** only when it changes
+  the useful high-level picture.
+- Record user-visible release history in `CHANGELOG.md`; record lasting design
+  invariants in `docs/architecture.md` or the relevant focused document. Delete
+  obsolete implementation plans instead of retaining them as completed todos.
+- Split or rewrite partially completed tasks so **Ordered Work** states only the
+  remaining outcome. Never mark a broad task complete while leaving hidden
+  follow-up work inside its description.
 
 ## Working Rule
 
@@ -144,7 +179,4 @@ For each promoted task:
 4. Add positive and negative coverage at the owning compiler phase.
 5. Run `scripts/check` before marking the task complete.
 
-Deferred work stays unchecked. When a task is completed, reduce it to one brief
-checked entry in the **Current State** section or its relevant roadmap section;
-remove its detailed implementation notes from this file and remove the task
-entirely from `docs/todo.md`.
+Deferred work stays unchecked. Completion follows the lifecycle policy above.

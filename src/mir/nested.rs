@@ -1,3 +1,5 @@
+//! Downward-only nested-function capture discovery and MIR lifting.
+
 use super::*;
 
 // --- Nested `def` (closure) lifting -----------------------------------------

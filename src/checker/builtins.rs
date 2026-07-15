@@ -1,3 +1,5 @@
+//! Typing and capability rules for compiler-known builtin types and operations.
+
 use super::*;
 
 pub(super) fn default_literal(ty: &Ty) -> Ty {
@@ -19,7 +21,7 @@ pub(super) fn is_scalar(ty: &Ty) -> bool {
 /// Whether an opaque type parameter carries a bound that promises equality.
 /// Built-in bounds are intentionally shallow today, but `T: Equatable` should at
 /// least let generic library code type-check `T == T`. `Comparable` refines
-/// equality (Phase 4), so it counts too; `Hashable` deliberately does **not**
+/// equality (roadmap milestone 4), so it counts too; `Hashable` deliberately does **not**
 /// (a hash-backed key bounds `K: Hashable & Equatable` when it needs both).
 pub(super) fn has_equality_bound(ty: &Ty) -> bool {
     match ty {
@@ -69,7 +71,7 @@ pub(super) fn has_len_bound(ty: &Ty) -> bool {
 }
 
 /// Whether `ty` is an opaque type parameter carrying the named trait `bound`.
-/// The numeric-operation traits (Phase 7 — `Absable`/`Roundable`/`Powable`/
+/// The numeric-operation traits (roadmap milestone 7 — `Absable`/`Roundable`/`Powable`/
 /// `Intable`/`Floatable`/`Boolable`/`DivModable`) gate a corresponding built-in
 /// or operator on an opaque `T` this way: the concrete type's implementation
 /// runs after type erasure.
@@ -92,7 +94,7 @@ pub(super) fn builtin_trait_operation(trait_name: &str) -> Option<&'static str> 
 }
 
 /// The trait bounds that supply a numeric-rounding dunder (`method`/`argc`),
-/// used by the self-hosted `math` module (Phase 7). `__floor__`/`__ceil__`/
+/// used by the self-hosted `math` module (roadmap milestone 7). `__floor__`/`__ceil__`/
 /// `__trunc__` are nullary (`Floorable`/`Ceilable`/`Truncable`); `__ceildiv__`
 /// is unary and granted by `CeilDivable` or its raising sibling
 /// `CeilDivableRaising` (mojito's deferred effect model does not distinguish

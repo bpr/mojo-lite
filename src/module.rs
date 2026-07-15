@@ -1,4 +1,4 @@
-//! A minimal module system (Phase 3). `from module import name, …` loads a
+//! Stage 1 module linking. `from module import name, …` loads a
 //! referenced `.mojo` file and **hoists its top-level declarations** (`def` /
 //! `struct` / `trait` / `comptime`) into a single flat program, with the import
 //! statement removed. Because the result is an ordinary `Vec<Stmt>`, the rest of

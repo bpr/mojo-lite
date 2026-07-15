@@ -16,9 +16,8 @@ pub struct CheckedProgram {
 }
 
 /// The declaration-owned location of a source annotation. Unlike `SourceType`
-/// syntax itself,
-/// this identity preserves the scope in which syntax such as a bare `T` was
-/// resolved.
+/// syntax itself, this identity preserves the scope in which syntax such as a
+/// bare `T` was resolved.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum AnnotationSite {
     FunctionParam {
@@ -40,6 +39,7 @@ pub(crate) enum AnnotationSite {
 }
 
 #[derive(Debug, Clone)]
+/// Literal value retained after semantic checking for declaration metadata.
 pub enum CheckedConst {
     Int(i64),
     Float(f64),
@@ -49,6 +49,7 @@ pub enum CheckedConst {
 }
 
 impl CheckedConst {
+    /// Convert an expression that is already a literal constant.
     pub fn from_expr(expr: &Expr) -> Option<Self> {
         match &expr.kind {
             ExprKind::Int(value) => Some(Self::Int(*value)),
@@ -79,10 +80,12 @@ impl CheckedProgram {
         }
     }
 
+    /// Elaborated statements accepted by semantic checking.
     pub fn statements(&self) -> &[Stmt] {
         &self.statements
     }
 
+    /// Checker-selected lowered callable name at each resolved call site.
     pub fn overload_targets(&self) -> &HashMap<SourceSpan, String> {
         &self.overload_targets
     }
@@ -91,6 +94,7 @@ impl CheckedProgram {
         self.checked_types.get(site)
     }
 
+    /// Module identity attached to a declaration or expression location.
     pub fn declaration_module<'a>(&self, location: &'a SourceSpan) -> Option<&'a str> {
         location.source.as_deref()
     }

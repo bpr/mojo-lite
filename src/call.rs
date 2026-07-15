@@ -7,6 +7,7 @@
 use crate::ast::{FnParam, ParamKind};
 
 #[derive(Clone, Copy)]
+/// Source argument selected for one regular parameter slot.
 pub(crate) enum ArgSlot {
     Positional(usize),
     Keyword(usize),
@@ -14,6 +15,7 @@ pub(crate) enum ArgSlot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Structural reason an argument list cannot bind to a declaration.
 pub(crate) enum MatchError {
     TooManyPositional { expected: usize, got: usize },
     UnknownKeyword(String),
@@ -23,11 +25,13 @@ pub(crate) enum MatchError {
 }
 
 #[derive(Clone, Copy)]
+/// Whether positional and keyword overflow collectors are present.
 pub(crate) struct CallVariadics {
     pub positional: bool,
     pub keyword: bool,
 }
 
+/// Fully matched regular slots plus variadic overflow source indexes.
 pub(crate) struct CallSlots {
     pub slots: Vec<ArgSlot>,
     pub positional_overflow: Vec<usize>,
@@ -107,6 +111,7 @@ pub(crate) fn regular_marker_index(params: &[FnParam], marker: Option<usize>) ->
     })
 }
 
+/// Effective keyword-only boundary after combining `*` and `*args` markers.
 pub(crate) fn effective_keyword_only_index(
     params: &[FnParam],
     keyword_only: Option<usize>,

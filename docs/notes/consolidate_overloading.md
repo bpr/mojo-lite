@@ -1,8 +1,8 @@
 # Change description: consolidate overload signature / lowered-name logic
 
 Reviewer notes for the Phase 5b cleanup task ("Consolidate signature identity
-and lowered-name construction behind one canonical symbol API", roadmap.md
-Phase 5b; detailed scope in `docs/todo.md` under **Overloading**).
+and lowered-name construction behind one canonical symbol API", formerly
+roadmap Phase 5b).
 
 > **Scope caveat:** the working tree contains earlier uncommitted work in other
 > files (`src/error.rs`, `src/hir/mod.rs`, parts of `tests/checker_test.rs`,
@@ -22,7 +22,7 @@ Phase 5b; detailed scope in `docs/todo.md` under **Overloading**).
 | `src/backend/vm.rs` | routed registries/dispatch through `symbol`; deleted duplicated helpers |
 | `tests/symbol_test.rs` | **new** — 8 focused symbol tests incl. a source-tree scan |
 | `assets/ok/overloading_struct_params.mojo` | **new** — end-to-end fixture for the fixed drift |
-| `docs/todo.md`, `roadmap.md`, `docs/architecture.md` | status/doc updates |
+| `roadmap.md`, `docs/architecture.md` | status/doc updates |
 
 ## 1. Background: the state before this change
 
@@ -305,12 +305,10 @@ an overloaded method whose second overload takes a struct parameter. Output:
 
 ## 7. Documentation updates
 
-- `docs/todo.md` — the summary item and the detailed **Overloading** cleanup
-  item flipped to *implemented*, with a record of what the module owns, the
-  drift that was fixed, the retained fallback and its documented callers, and
-  comptime value-argument folding and stropped-name collision coverage.
-- `roadmap.md` — Phase 5b "pending cleanup" item and the two
-  recommendation-list mentions flipped to *implemented* with pointers.
+- The former todo entry recorded what the module owns, the drift that was fixed,
+  the retained fallback and its documented callers, and comptime value-argument
+  folding and stropped-name collision coverage. Under the current roadmap
+  lifecycle policy, that completed task no longer remains in the task tracker.
 - `docs/architecture.md` — "Overloaded Names In MIR" section now names
   `src/symbol.rs` as the owner of the scheme and describes the typed
   `SignatureKey` and the test guard.

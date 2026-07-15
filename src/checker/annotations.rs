@@ -1,3 +1,5 @@
+//! Source-annotation conversion into resolved checked types and origins.
+
 use super::*;
 
 pub(super) fn dtype_from_arg(arg: &crate::ast::ParamArg) -> Result<Dtype, TypeError> {

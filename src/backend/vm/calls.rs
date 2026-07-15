@@ -1,3 +1,5 @@
+//! VM call-slot materialization, defaults, variadics, and frame construction.
+
 use super::*;
 
 fn runtime_match_error(error: crate::call::MatchError, function: &str) -> RuntimeError {

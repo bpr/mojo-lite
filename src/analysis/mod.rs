@@ -1,4 +1,4 @@
-//! Phase 4 — ownership analysis over the MIR (the compiler's *raison d'être*).
+//! Stage 6: ownership and persistent-loan analysis over MIR.
 //!
 //! Mojo's move semantics: transferring a value with `^` (`y = x^`, `take(x^)`)
 //! leaves the source **uninitialized**, so using it again is an error. This pass

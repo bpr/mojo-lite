@@ -1,3 +1,5 @@
+//! Declaration collection, signature construction, and body-checking support.
+
 use super::*;
 
 pub(super) fn definitely_returns(body: &[Stmt]) -> bool {

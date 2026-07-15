@@ -306,7 +306,7 @@ pub(crate) fn values_equal(a: &Value, b: &Value) -> Result<bool, RuntimeError> {
     }
 }
 
-/// Intrinsic `__hash__` for a built-in hashable value (Phase 6) — a
+/// Intrinsic `__hash__` for a built-in hashable value (roadmap milestone 6) — a
 /// **deterministic**, no-seed FNV-1a over the value's bytes, returning `UInt`
 /// (mojito's native u64). Determinism across runs is a deliberate design
 /// decision: no per-process salt. A user struct provides its own `__hash__`
@@ -1031,7 +1031,7 @@ pub(crate) fn builtin_convert(name: &str, v: Value) -> Result<Value, RuntimeErro
 }
 
 /// The intrinsic behind `math.floor`/`ceil`/`trunc` — i.e. the `Floorable`/
-/// `Ceilable`/`Truncable` dunders on a built-in numeric value (Phase 7). An
+/// `Ceilable`/`Truncable` dunders on a built-in numeric value (roadmap milestone 7). An
 /// integer is already whole, so it is returned unchanged; a `Float64` rounds
 /// toward the requested direction, preserving its type (`__floor__(self) -> Self`).
 pub(crate) fn builtin_round_dir(method: &str, v: &Value) -> Result<Value, RuntimeError> {
@@ -1051,7 +1051,7 @@ pub(crate) fn builtin_round_dir(method: &str, v: &Value) -> Result<Value, Runtim
 }
 
 /// The intrinsic behind `math.ceildiv` — the `CeilDivable` dunder
-/// (`__ceildiv__(self, denominator) -> Self`, Phase 7): ceiling division,
+/// (`__ceildiv__(self, denominator) -> Self`, roadmap milestone 7): ceiling division,
 /// preserving the operand type. Integer ceildiv rounds toward +∞
 /// (`ceildiv(-7, 2) == -3`); float ceildiv is `ceil(a / b)`.
 pub(crate) fn builtin_ceildiv(a: &Value, b: &Value) -> Result<Value, RuntimeError> {

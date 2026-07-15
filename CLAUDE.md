@@ -13,7 +13,7 @@ Read these documents before changing behavior:
 - `docs/symbol-map.md` — symbol-level ownership and navigation map.
 - `docs/architecture.md` — pipeline invariants and phase design.
 - `grammar.md` and `docs/frontend.md` — accepted syntax and parser design.
-- `roadmap.md` and `docs/todo.md` — current direction and pending work.
+- `roadmap.md` — current direction, pending work, and task lifecycle policy.
 
 Do not copy the feature inventory into this file. Update `docs/features.md` when
 support changes and update `docs/symbol-map.md` when ownership or entry points

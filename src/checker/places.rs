@@ -1,3 +1,5 @@
+//! Place construction, overlap, mutability, and origin derivation for checking.
+
 use super::*;
 
 pub(super) fn parameter_is_writable(convention: Option<ArgConvention>) -> bool {

@@ -1,3 +1,9 @@
+//! Execution-backend contract below the verified-MIR waist.
+//!
+//! The register VM is the executable semantic oracle. Future Cranelift and LLVM
+//! implementations should consume the same checked program/MIR facts instead of
+//! reconstructing language semantics from source declarations.
+
 use crate::checked::CheckedProgram;
 use crate::error::RuntimeError;
 use crate::runtime::Value;

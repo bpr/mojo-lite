@@ -1,3 +1,5 @@
+//! Generic parameter classification, solving, substitution, and bound checks.
+
 use super::*;
 
 pub(super) fn unify(

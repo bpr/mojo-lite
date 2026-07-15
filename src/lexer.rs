@@ -1,3 +1,10 @@
+//! Layout-sensitive lexer for the supported Mojo surface.
+//!
+//! The lexer emits explicit newline/indent/dedent tokens, suppresses layout
+//! inside delimiters, decodes literals and escapes, and attaches byte spans to
+//! every token. A small pending queue handles one input event producing several
+//! layout tokens.
+
 use crate::error::LexError;
 use crate::token::{Span, TStringChunk, Token};
 use std::collections::VecDeque;

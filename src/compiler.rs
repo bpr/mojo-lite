@@ -19,14 +19,19 @@ pub struct CompiledProgram {
 }
 
 impl CompiledProgram {
+    /// The semantically checked program carried by this ownership-verified
+    /// pipeline result.
     pub fn checked(&self) -> &CheckedProgram {
         &self.checked
     }
 }
 
 #[derive(Debug, Clone)]
+/// Observable result of executing a compiled program.
 pub struct Execution {
+    /// Captured standard output.
     pub output: String,
+    /// Final named module-scope values exposed by the backend for inspection.
     pub bindings: Vec<(String, Value)>,
 }
 
@@ -64,6 +69,7 @@ pub struct Compiler {
 }
 
 impl Compiler {
+    /// Construct a compiler with explicit module-link and backend policy.
     pub fn new(link_options: LinkOptions, backend: BackendKind) -> Self {
         Self {
             link_options,
@@ -71,12 +77,15 @@ impl Compiler {
         }
     }
 
+    /// Link and compile a source entry path through ownership verification.
     pub fn compile_path(&self, entry: &Path) -> Result<CompiledProgram, CompilerError> {
         let linked =
             link_with_options(entry, self.link_options.clone()).map_err(CompilerError::Module)?;
         self.compile_linked(linked)
     }
 
+    /// Link in-memory source as `entry` and compile it through ownership
+    /// verification.
     pub fn compile_source(
         &self,
         source: &str,
@@ -93,6 +102,7 @@ impl Compiler {
         self.compile_linked(parsed)
     }
 
+    /// Elaborate, check, and ownership-verify an already linked statement set.
     pub fn compile_linked(&self, linked: Vec<Stmt>) -> Result<CompiledProgram, CompilerError> {
         let elaborated = elaborate(linked).map_err(CompilerError::Comptime)?;
         let checked = check_program(&elaborated).map_err(CompilerError::Type)?;
@@ -100,6 +110,7 @@ impl Compiler {
         Ok(CompiledProgram { checked })
     }
 
+    /// Execute an ownership-verified program using the configured backend.
     pub fn execute(&self, program: &CompiledProgram) -> Result<Execution, CompilerError> {
         let mut backend = self.backend.make();
         backend
@@ -111,6 +122,7 @@ impl Compiler {
         })
     }
 
+    /// Compile and execute an entry path.
     pub fn run_path(&self, entry: &Path) -> Result<Execution, CompilerError> {
         let program = self.compile_path(entry)?;
         self.execute(&program)

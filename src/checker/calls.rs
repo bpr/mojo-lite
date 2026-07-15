@@ -1,3 +1,5 @@
+//! Checker adaptation of the phase-neutral call-slot matcher.
+
 use super::*;
 
 impl MatchError {

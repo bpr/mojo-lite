@@ -1,3 +1,5 @@
+//! Navigation and mutation of projected VM storage and reference handles.
+
 use super::*;
 
 /// Navigate one projection step from a container slot to an inner mutable slot.

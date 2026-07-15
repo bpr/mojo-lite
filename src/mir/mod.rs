@@ -1,7 +1,7 @@
-//! Phase 2 of the compiler frontend: flatten the HIR's nested expressions into
+//! Stage 5: flatten the HIR's nested expressions into
 //! **A-Normal Form** (three-address code) — every subexpression becomes a
 //! `MirInstr` writing a fresh [`Reg`], so `foo(bar(x))` becomes
-//! `t0 = bar(x); t1 = foo(t0)`. The flattened form is what Phase 4's dataflow
+//! `t0 = bar(x); t1 = foo(t0)`. The flattened form is what Stages 6–7 dataflow
 //! analysis (liveness / move / borrow) runs over, and what the backends consume.
 //!
 //! One current limitation, intentional at this stage:
@@ -191,7 +191,7 @@ impl Flatten<'_> {
     /// evaluated when needed (Python/Mojo short-circuit semantics). The result is
     /// carried in a synthetic variable across the branch and read back in the
     /// merge block. (Preserving the short-circuit — vs an eager `BinOp` — matters
-    /// both for observable side effects and for Phase 4 ownership, where a moved
+    /// both for observable side effects and for Stage 6 ownership, where a moved
     /// operand on the not-taken side must not count as moved.)
     fn short_circuit(&mut self, op: InfixOp, a: &Expr, b: &Expr, span: SourceSpan) -> Reg {
         let ra = self.expr(a);
@@ -335,7 +335,7 @@ impl Flatten<'_> {
 
             // --- Variable reads ------------------------------------------------
             // A bare read defaults to `Copy`; a call site refines it to
-            // `Borrow*`/`Move` per the callee's convention (Phase 4).
+            // `Borrow*`/`Move` per the callee's convention (Stage 6).
             ExprKind::Identifier(name) => {
                 let var = self.var(name);
                 let d = self.fresh(span(e), Some(var));
@@ -353,7 +353,7 @@ impl Flatten<'_> {
             }
             // `x^`: a move out of a variable. `p.a^` (a pure field chain) is a
             // **partial move** of that field; a move through an indexed place is
-            // identity for now (conservative — Phase 4 does not model it).
+            // identity for now (conservative — Stage 6 does not model it).
             ExprKind::Transfer(inner) => {
                 if let ExprKind::Identifier(name) = &inner.kind {
                     let var = self.var(name);

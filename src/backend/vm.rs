@@ -1597,7 +1597,7 @@ impl VmBackend {
                     }
                 }
             }
-            // ASAP destruction (Phase 4): drop the value at the variable's last
+            // ASAP destruction (Stage 7): drop the value at the variable's last
             // use, running its `__del__` if it has one.
             MirInstr::DropVar { var } => {
                 let v = std::mem::replace(&mut vars[*var as usize], Value::None);
@@ -1818,7 +1818,8 @@ impl VmBackend {
             match (method, args.len()) {
                 // `Hashable` — `x.__hash__()`.
                 ("__hash__", 0) => return crate::runtime::builtin_hash(&recv).map(Value::UInt),
-                // `Floorable`/`Ceilable`/`Truncable` — `x.__floor__()` etc. (Phase 7).
+                // `Floorable`/`Ceilable`/`Truncable` — `x.__floor__()` etc.
+                // (roadmap milestone 7).
                 ("__floor__" | "__ceil__" | "__trunc__", 0) => {
                     return crate::runtime::builtin_round_dir(method, &recv);
                 }
@@ -2159,7 +2160,7 @@ fn build_prog_checked(checked: &crate::checked::CheckedProgram) -> Result<Prog, 
     let sigs = build_sigs(&mir.declarations);
     Ok(Prog {
         // Elaborate ASAP drops: splice a `DropVar` after each variable's last
-        // use, so a struct's `__del__` runs there (Phase 4). A no-op for values
+        // use, so a struct's `__del__` runs there (Stage 7). A no-op for values
         // without a destructor.
         mir,
         structs,
@@ -2330,7 +2331,7 @@ fn arg1(name: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
             got: args.len(),
         });
     }
-    Ok(args.pop().unwrap())
+    Ok(args.pop().expect("arity checked above"))
 }
 
 /// Take the two arguments of a two-arg built-in (`min`/`max`).
@@ -2343,7 +2344,10 @@ fn arg2(name: &str, args: Vec<Value>) -> Result<(Value, Value), RuntimeError> {
         });
     }
     let mut it = args.into_iter();
-    Ok((it.next().unwrap(), it.next().unwrap()))
+    Ok((
+        it.next().expect("arity checked above"),
+        it.next().expect("arity checked above"),
+    ))
 }
 
 fn build_range(args: &[Value]) -> Result<Value, RuntimeError> {
