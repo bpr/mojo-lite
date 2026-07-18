@@ -189,8 +189,7 @@ impl Prog {
         argc: usize,
     ) -> String {
         if let Some(selected) = resolved {
-            if let Some(retargeted) =
-                crate::symbol::retarget_method_symbol(selected, receiver_type)
+            if let Some(retargeted) = crate::symbol::retarget_method_symbol(selected, receiver_type)
                 && self.index_of(&retargeted).is_some()
             {
                 return retargeted;
@@ -621,12 +620,8 @@ impl VmBackend {
         } = instruction
             && let Value::Struct { name, .. } = &caller.registers[recv.0 as usize]
         {
-            let function_name = prog.runtime_method_name(
-                name,
-                method,
-                resolved.as_deref(),
-                args.len(),
-            );
+            let function_name =
+                prog.runtime_method_name(name, method, resolved.as_deref(), args.len());
             let Some(index) = prog.index_of(&function_name) else {
                 return Ok(None);
             };
@@ -1285,10 +1280,7 @@ impl VmBackend {
             Value::Dict(entries) => {
                 let mut out = Vec::with_capacity(entries.len());
                 for (key, value) in entries {
-                    out.push((
-                        self.clone_value(prog, key)?,
-                        self.clone_value(prog, value)?,
-                    ));
+                    out.push((self.clone_value(prog, key)?, self.clone_value(prog, value)?));
                 }
                 Ok(Value::Dict(out))
             }
@@ -2098,8 +2090,10 @@ impl VmBackend {
                 elems,
                 element_type,
             } => {
-                let mut raw: Vec<Value> =
-                    elems.iter().map(|register| regs[register.0 as usize].clone()).collect();
+                let mut raw: Vec<Value> = elems
+                    .iter()
+                    .map(|register| regs[register.0 as usize].clone())
+                    .collect();
                 if let Some(element_type) = element_type {
                     raw = raw
                         .into_iter()
@@ -2110,10 +2104,9 @@ impl VmBackend {
                 }
                 let mut items = Vec::with_capacity(raw.len());
                 for item in raw {
-                    if items
-                        .iter()
-                        .any(|candidate| values_equal(candidate, &item).unwrap_or(false))
-                    {
+                    if items.iter().any(|candidate| {
+                        values_equal(candidate, &item).unwrap_or_else(|_| candidate == &item)
+                    }) {
                         self.drop_value(prog, item)?;
                     } else {
                         items.push(item);
@@ -2154,7 +2147,7 @@ impl VmBackend {
                 let mut result = Vec::with_capacity(entries.len());
                 for (key, value) in keys.into_iter().zip(values) {
                     if let Some(position) = result.iter().position(|(candidate, _)| {
-                        values_equal(candidate, &key).unwrap_or(false)
+                        values_equal(candidate, &key).unwrap_or_else(|_| candidate == &key)
                     }) {
                         let old = std::mem::replace(&mut result[position].1, value);
                         self.drop_value(prog, old)?;
@@ -2174,10 +2167,9 @@ impl VmBackend {
                 match (&mut vars[*collection as usize], key) {
                     (Value::List(items), None) => items.push(value),
                     (Value::Set(items), None) => {
-                        if items
-                            .iter()
-                            .any(|candidate| values_equal(candidate, &value).unwrap_or(false))
-                        {
+                        if items.iter().any(|candidate| {
+                            values_equal(candidate, &value).unwrap_or_else(|_| candidate == &value)
+                        }) {
                             self.drop_value(prog, value)?;
                         } else {
                             items.push(value);
@@ -2186,7 +2178,7 @@ impl VmBackend {
                     (Value::Dict(entries), Some(key)) => {
                         let key = regs[key.0 as usize].clone();
                         if let Some(position) = entries.iter().position(|(candidate, _)| {
-                            values_equal(candidate, &key).unwrap_or(false)
+                            values_equal(candidate, &key).unwrap_or_else(|_| candidate == &key)
                         }) {
                             let old = std::mem::replace(&mut entries[position].1, value);
                             self.drop_value(prog, old)?;
@@ -2473,33 +2465,91 @@ impl VmBackend {
             }
             // Iterator protocol (`for`). Range: counter with step direction. List:
             // consume the (copied) list from the front, preserving order.
-            MirInstr::GetIter { iter } => {
-                // Normalize a user struct iterable to its iterator (`c.__iter__()`);
-                // a built-in `range`/`List` iterates in place (no-op).
+            MirInstr::GetIter {
+                iter,
+                mode: _,
+                prepare,
+            } => {
+                // Execute the exact normalization chain chosen by the checker.
+                // Builtin ranges/collections carry an empty chain.
                 let slot = *iter as usize;
-                for _ in 0..8 {
+                let dynamic_prepare = prepare
+                    .iter()
+                    .find(|symbol| symbol.starts_with("__trait_dispatch."))
+                    .cloned();
+                for selected in prepare {
                     let Value::Struct { name, .. } = &vars[slot] else {
-                        break;
+                        return Err(RuntimeError::TypeError(format!(
+                            "vm: checked iterator preparation applied to {}",
+                            crate::runtime::type_name(&vars[slot])
+                        )));
                     };
                     let sname = name.clone();
-                    if prog
-                        .index_of(&prog.overload_name(&format!("{sname}.__next__"), 0))
-                        .is_some()
-                    {
-                        break;
+                    let target =
+                        prog.runtime_method_name(&sname, "__iter__", Some(selected.as_str()), 0);
+                    let fidx = prog.index_of(&target).ok_or_else(|| {
+                        RuntimeError::Unsupported(format!(
+                            "vm: checked iterator method '{target}' is missing from MIR"
+                        ))
+                    })?;
+                    let (value, _) = self.call_frame(prog, fidx, vec![vars[slot].clone()], &[])?;
+                    vars[slot] = value;
+                }
+                // A bounded `Iterable` may expose another iterable as its
+                // associated `Iter` (the self-hosted Set yields a List). Its
+                // concrete normalization depth is known only after generic
+                // specialization, so repeat the checked trait operation until
+                // the runtime type is an iterator. Concrete source types carry
+                // their complete static `prepare` chain and skip this path.
+                if let Some(selected) = dynamic_prepare {
+                    for _ in 0..8 {
+                        let Value::Struct { name, .. } = &vars[slot] else {
+                            break;
+                        };
+                        let sname = name.clone();
+                        let next = prog.runtime_method_name(&sname, "__next__", None, 0);
+                        if prog.index_of(&next).is_some() {
+                            break;
+                        }
+                        let target = prog.runtime_method_name(
+                            &sname,
+                            "__iter__",
+                            Some(selected.as_str()),
+                            0,
+                        );
+                        let fidx = prog.index_of(&target).ok_or_else(|| {
+                            RuntimeError::Unsupported(format!(
+                                "vm: checked iterator method '{target}' is missing from MIR"
+                            ))
+                        })?;
+                        vars[slot] =
+                            self.call_function(prog, fidx, vec![vars[slot].clone()], &[])?;
                     }
-                    let it = vars[slot].clone();
-                    vars[slot] = self.call_dunder(prog, &sname, "__iter__", vec![it])?;
                 }
             }
-            MirInstr::HasNext { dest, iter } => {
+            MirInstr::HasNext { dest, iter, method } => {
                 let slot = *iter as usize;
                 // A struct iterator reports remaining length via `__len__` (bounded
                 // iteration): more elements iff `len(it) > 0`.
-                let has = if let Value::Struct { name, .. } = &vars[slot] {
+                let has = if let Some(selected) = method {
+                    let Value::Struct { name, .. } = &vars[slot] else {
+                        return Err(RuntimeError::TypeError(format!(
+                            "vm: checked iterator length applied to {}",
+                            crate::runtime::type_name(&vars[slot])
+                        )));
+                    };
                     let sname = name.clone();
-                    let it = vars[slot].clone();
-                    match self.call_dunder(prog, &sname, "__len__", vec![it])? {
+                    let target =
+                        prog.runtime_method_name(&sname, "__len__", Some(selected.as_str()), 0);
+                    let fidx = prog.index_of(&target).ok_or_else(|| {
+                        RuntimeError::Unsupported(format!(
+                            "vm: checked iterator method '{target}' is missing from MIR"
+                        ))
+                    })?;
+                    match self
+                        .call_frame(prog, fidx, vec![vars[slot].clone()], &[])?
+                        .0
+                    {
                         Value::Int(n) => n > 0,
                         other => {
                             return Err(RuntimeError::TypeError(format!(
@@ -2526,22 +2576,28 @@ impl VmBackend {
                 };
                 regs[dest.0 as usize] = Value::Bool(has);
             }
-            MirInstr::Next { dest, iter } => {
+            MirInstr::Next { dest, iter, method } => {
                 let slot = *iter as usize;
                 // A struct iterator advances via `__next__(mut self)`: the element is
                 // the return value, and the advanced iterator (frame slot 0) is
                 // written back into the iterator variable.
-                if let Value::Struct { name, .. } = &vars[slot] {
+                if let Some(selected) = method {
+                    let Value::Struct { name, .. } = &vars[slot] else {
+                        return Err(RuntimeError::TypeError(format!(
+                            "vm: checked iterator next applied to {}",
+                            crate::runtime::type_name(&vars[slot])
+                        )));
+                    };
                     let sname = name.clone();
-                    let it = vars[slot].clone();
-                    let fidx = prog
-                        .index_of(&prog.overload_name(&format!("{sname}.__next__"), 0))
-                        .ok_or_else(|| {
-                            RuntimeError::Unsupported(format!(
-                                "vm: struct '{sname}' has no '__next__'"
-                            ))
-                        })?;
-                    let (ret, frame_vars) = self.call_frame(prog, fidx, vec![it], &[])?;
+                    let target =
+                        prog.runtime_method_name(&sname, "__next__", Some(selected.as_str()), 0);
+                    let fidx = prog.index_of(&target).ok_or_else(|| {
+                        RuntimeError::Unsupported(format!(
+                            "vm: checked iterator method '{target}' is missing from MIR"
+                        ))
+                    })?;
+                    let (ret, frame_vars) =
+                        self.call_frame(prog, fidx, vec![vars[slot].clone()], &[])?;
                     vars[slot] = frame_vars.into_iter().next().unwrap_or(Value::None);
                     regs[dest.0 as usize] = ret;
                 } else {
@@ -2978,8 +3034,7 @@ impl VmBackend {
             Value::Struct { name, .. } => {
                 let method_argc = args.len();
                 let source_fname = format!("{name}.{method}");
-                let fname =
-                    prog.runtime_method_name(name, method, resolved, method_argc);
+                let fname = prog.runtime_method_name(name, method, resolved, method_argc);
                 let fidx = prog.index_of(&fname).ok_or_else(|| {
                     RuntimeError::Unsupported(format!("vm: unknown method '{fname}'"))
                 })?;

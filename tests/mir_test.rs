@@ -336,6 +336,30 @@ fn executable_mir_carries_checked_binding_and_parameter_types() {
 }
 
 #[test]
+fn comprehension_binders_receive_distinct_mir_slots_from_outer_locals() {
+    let program = parse(
+        "def main():\n    var x = 100\n    var result = [x for x in range(2) for x in range(x + 1)]\n    print(x, result)\n",
+    )
+    .expect("parse");
+    let checked = mojito::check_program(&program).expect("check");
+    let mir = mojito::mir::lower_checked_program(&checked);
+    let function = mir
+        .functions
+        .iter()
+        .find(|(name, _)| name == "main")
+        .expect("main function");
+    assert!(function.1.var_names.iter().any(|name| name == "x"));
+    let binders = function
+        .1
+        .var_names
+        .iter()
+        .filter(|name| name.starts_with("$compx$"))
+        .collect::<Vec<_>>();
+    assert_eq!(binders.len(), 2, "{:?}", function.1.var_names);
+    assert_ne!(binders[0], binders[1]);
+}
+
+#[test]
 fn bounded_trait_calls_carry_the_requirement_error_contract_into_mir() {
     let program = parse(
         "trait Fallible:\n    def run(self) raises -> Int: ...\n\ndef invoke[T: Fallible](value: T) raises -> Int:\n    return value.run()\n",
@@ -350,16 +374,20 @@ fn bounded_trait_calls_carry_the_requirement_error_contract_into_mir() {
         .expect("invoke function")
         .1;
 
-    assert!(invoke.blocks.iter().flat_map(|block| &block.instrs).any(
-        |instruction| matches!(
-            instruction,
-            MirInstr::MethodCall {
-                method,
-                raises: Some(mojito::Ty::Error),
-                ..
-            } if method == "run"
-        )
-    ));
+    assert!(
+        invoke
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instrs)
+            .any(|instruction| matches!(
+                instruction,
+                MirInstr::MethodCall {
+                    method,
+                    raises: Some(mojito::Ty::Error),
+                    ..
+                } if method == "run"
+            ))
+    );
 }
 
 #[test]

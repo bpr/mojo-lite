@@ -132,9 +132,7 @@ pub(super) fn substitute(ty: &Ty, subst: &HashMap<String, Ty>) -> Ty {
             ret: Box::new(substitute(ret, subst)),
             required: required.clone(),
             variadic: variadic.as_ref().map(|v| Box::new(substitute(v, subst))),
-            kw_variadic: kw_variadic
-                .as_ref()
-                .map(|v| Box::new(substitute(v, subst))),
+            kw_variadic: kw_variadic.as_ref().map(|v| Box::new(substitute(v, subst))),
             positional_only: *positional_only,
             keyword_only: *keyword_only,
             raises: *raises,

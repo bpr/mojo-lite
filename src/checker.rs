@@ -286,8 +286,7 @@ fn same_callable_signature(a: &Ty, b: &Ty) -> bool {
                 .chain(bkw.iter().map(Box::as_ref))
                 .cloned()
                 .collect();
-            canonical_generic_signature(ad, &aparams)
-                == canonical_generic_signature(bd, &bparams)
+            canonical_generic_signature(ad, &aparams) == canonical_generic_signature(bd, &bparams)
         }
         _ => false,
     }
@@ -766,9 +765,8 @@ pub struct Checker {
     expression_bindings: RefCell<HashMap<SourceSpan, crate::origin::OwnerId>>,
     /// Stable identities/types for the lexical binders introduced by each
     /// comprehension, retained for checked HIR and explicit-destroy analysis.
-    comprehension_bindings: RefCell<
-        HashMap<SourceSpan, Vec<crate::checked::CheckedComprehensionBinding>>,
-    >,
+    comprehension_bindings:
+        RefCell<HashMap<SourceSpan, Vec<crate::checked::CheckedComprehensionBinding>>>,
     expression_place_types: RefCell<HashMap<SourceSpan, Ty>>,
     binding_types: RefCell<HashMap<SourceSpan, Ty>>,
     /// Selected call effects keyed by the checked call expression. This records
@@ -777,8 +775,7 @@ pub struct Checker {
     expression_effects: RefCell<HashMap<SourceSpan, crate::checked::EffectFacts>>,
     /// Exact iterator protocol selected for each loop/comprehension iterable.
     /// Lowering consumes this fact instead of re-selecting `__iter__` by name.
-    iteration_protocols:
-        RefCell<HashMap<SourceSpan, crate::checked::IterationProtocol>>,
+    iteration_protocols: RefCell<HashMap<SourceSpan, crate::checked::IterationProtocol>>,
     explicit_destroy_calls: RefCell<std::collections::HashSet<SourceSpan>>,
     /// Expressions whose reference handle, rather than referent value, is
     /// required by an origin-bearing aggregate operation. The bool is writable.
@@ -2142,9 +2139,7 @@ impl Checker {
                 let declared = match ty {
                     // Annotated: the value must coerce to the annotation.
                     Some(anno) => {
-                        let expected = contextual
-                            .clone()
-                            .unwrap_or(self.ty_from_anno(anno)?);
+                        let expected = contextual.clone().unwrap_or(self.ty_from_anno(anno)?);
                         if !self.record_implicit_conversion(value, &found, &expected)? {
                             return Err(TypeError::TypeMismatch {
                                 expected: expected.to_string(),
@@ -3758,12 +3753,14 @@ impl Checker {
                         .iter()
                         .map(|(index, _)| all_types[*index].clone())
                         .collect(),
-                    names: regular.iter().map(|(_, param)| param.name.clone()).collect(),
+                    names: regular
+                        .iter()
+                        .map(|(_, param)| param.name.clone())
+                        .collect(),
                     required: vec![true; regular.len()],
                     variadic: None,
                     variadic_index: None,
-                    kw_variadic: kw_variadic_idx
-                        .map(|index| Box::new(all_types[index].clone())),
+                    kw_variadic: kw_variadic_idx.map(|index| Box::new(all_types[index].clone())),
                     kw_variadic_index: kw_variadic_idx,
                     positional_only: m.positional_only,
                     keyword_only: m.keyword_only,
@@ -3777,14 +3774,10 @@ impl Checker {
                     implicit: false,
                 };
                 let overloads = sigs.entry(m.name.clone()).or_default();
-                if overloads
-                    .iter()
-                    .any(|existing| {
-                        same_method_shape(existing, &sig)
-                            && (m.name != "__iter__"
-                                || existing.self_convention == sig.self_convention)
-                    })
-                {
+                if overloads.iter().any(|existing| {
+                    same_method_shape(existing, &sig)
+                        && (m.name != "__iter__" || existing.self_convention == sig.self_convention)
+                }) {
                     return Err(TypeError::Redeclaration(m.name.clone()));
                 }
                 overloads.push(sig);
@@ -3958,14 +3951,11 @@ impl Checker {
                 TypeError::InvariantViolation(format!("struct '{name}' was not registered"))
             })?;
             let overloads = info.methods.entry(method_name.to_string()).or_default();
-            if overloads
-                .iter()
-                .any(|existing| {
-                    same_method_shape(existing, &sig)
-                        && (method_name != "__iter__"
-                            || existing.self_convention == sig.self_convention)
-                })
-            {
+            if overloads.iter().any(|existing| {
+                same_method_shape(existing, &sig)
+                    && (method_name != "__iter__"
+                        || existing.self_convention == sig.self_convention)
+            }) {
                 return Err(TypeError::Redeclaration(method_name.to_string()));
             }
             overloads.push(sig);
@@ -4064,39 +4054,39 @@ impl Checker {
             // The requirement's `Self` becomes this struct's type. Receiver
             // conventions are part of the trait method contract.
             for req_sig in req_sigs {
-                let want = MethodSig {
-                    decls: req_sig.decls.clone(),
-                    availability: req_sig.availability.clone(),
-                    has_self: true,
-                    params: req_sig
-                        .params
-                        .iter()
-                        .map(|t| self.resolve_assoc_ty(&substitute_self(t, self_ty)))
-                        .collect(),
-                    names: req_sig.names.clone(),
-                    required: req_sig.required.clone(),
-                    variadic: req_sig
-                        .variadic
-                        .as_ref()
-                        .map(|ty| Box::new(self.resolve_assoc_ty(&substitute_self(ty, self_ty)))),
-                    variadic_index: req_sig.variadic_index,
-                    kw_variadic: req_sig.kw_variadic.as_ref().map(|ty| {
-                        Box::new(self.resolve_assoc_ty(&substitute_self(ty, self_ty)))
-                    }),
-                    kw_variadic_index: req_sig.kw_variadic_index,
-                    positional_only: req_sig.positional_only,
-                    keyword_only: req_sig.keyword_only,
-                    conventions: req_sig.conventions.clone(),
-                    ret: self.resolve_assoc_ty(&substitute_self(&req_sig.ret, self_ty)),
-                    raises: req_sig.raises,
-                    error: req_sig.error.as_ref().map(|error| {
-                        Box::new(self.resolve_assoc_ty(&substitute_self(error, self_ty)))
-                    }),
-                    self_convention: req_sig.self_convention,
-                    ref_params: req_sig.ref_params.clone(),
-                    ref_return: req_sig.ref_return.clone(),
-                    implicit: req_sig.implicit,
-                };
+                let want =
+                    MethodSig {
+                        decls: req_sig.decls.clone(),
+                        availability: req_sig.availability.clone(),
+                        has_self: true,
+                        params: req_sig
+                            .params
+                            .iter()
+                            .map(|t| self.resolve_assoc_ty(&substitute_self(t, self_ty)))
+                            .collect(),
+                        names: req_sig.names.clone(),
+                        required: req_sig.required.clone(),
+                        variadic: req_sig.variadic.as_ref().map(|ty| {
+                            Box::new(self.resolve_assoc_ty(&substitute_self(ty, self_ty)))
+                        }),
+                        variadic_index: req_sig.variadic_index,
+                        kw_variadic: req_sig.kw_variadic.as_ref().map(|ty| {
+                            Box::new(self.resolve_assoc_ty(&substitute_self(ty, self_ty)))
+                        }),
+                        kw_variadic_index: req_sig.kw_variadic_index,
+                        positional_only: req_sig.positional_only,
+                        keyword_only: req_sig.keyword_only,
+                        conventions: req_sig.conventions.clone(),
+                        ret: self.resolve_assoc_ty(&substitute_self(&req_sig.ret, self_ty)),
+                        raises: req_sig.raises,
+                        error: req_sig.error.as_ref().map(|error| {
+                            Box::new(self.resolve_assoc_ty(&substitute_self(error, self_ty)))
+                        }),
+                        self_convention: req_sig.self_convention,
+                        ref_params: req_sig.ref_params.clone(),
+                        ref_return: req_sig.ref_return.clone(),
+                        implicit: req_sig.implicit,
+                    };
                 if !got_sigs
                     .iter()
                     .any(|got| method_satisfies_requirement(got, &want))
@@ -4427,10 +4417,9 @@ impl Checker {
             let mut pty = self.ty_from_anno(&p.ty)?;
             pty = match p.kind {
                 crate::ast::ParamKind::Variadic => Ty::List(Box::new(pty)),
-                crate::ast::ParamKind::KwVariadic => self.kwargs_collector_ty(
-                    pty,
-                    &format!("keyword collector '{}'", p.name),
-                )?,
+                crate::ast::ParamKind::KwVariadic => {
+                    self.kwargs_collector_ty(pty, &format!("keyword collector '{}'", p.name))?
+                }
                 crate::ast::ParamKind::Regular => pty,
             };
             self.declare_with_mutability(
@@ -6030,8 +6019,9 @@ impl Checker {
                         if !*owned && !*reference && !self.is_copyable(&elem_ty) {
                             return Err(TypeError::NonCopyable {
                                 ty: elem_ty.to_string(),
-                                context: "immutable comprehension iteration; use `for var ... in ...^`"
-                                    .to_string(),
+                                context:
+                                    "immutable comprehension iteration; use `for var ... in ...^`"
+                                        .to_string(),
                             });
                         }
                         let binding_ty = elem_ty;
@@ -6571,12 +6561,18 @@ impl Checker {
                     ));
                 }
                 let dictionary = entries[0].1.is_some();
-                if entries.iter().any(|(_, value)| value.is_some() != dictionary) {
+                if entries
+                    .iter()
+                    .any(|(_, value)| value.is_some() != dictionary)
+                {
                     return Err(TypeError::Unsupported(
                         "set elements and dictionary key/value pairs cannot be mixed".to_string(),
                     ));
                 }
-                let keys = entries.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
+                let keys = entries
+                    .iter()
+                    .map(|(key, _)| key.clone())
+                    .collect::<Vec<_>>();
                 let key_ty = self.infer_list_elem(&keys)?;
                 for key in &keys {
                     self.check_consuming(key, &key_ty, "collection display element")?;
@@ -7020,10 +7016,7 @@ impl Checker {
         expected: &Ty,
         record: bool,
     ) -> Result<Ty, TypeError> {
-        let elements: Option<Vec<(&Expr, &Ty, &'static str)>> = match (
-            &expression.kind,
-            expected,
-        ) {
+        let elements: Option<Vec<(&Expr, &Ty, &'static str)>> = match (&expression.kind, expected) {
             (ExprKind::ListLit(values), Ty::List(element)) => Some(
                 values
                     .iter()
@@ -7036,9 +7029,7 @@ impl Checker {
                 Some(
                     entries
                         .iter()
-                        .map(|(value, _)| {
-                            (value, element.as_ref(), "collection display element")
-                        })
+                        .map(|(value, _)| (value, element.as_ref(), "collection display element"))
                         .collect(),
                 )
             }
@@ -8122,18 +8113,15 @@ impl Checker {
                 }
             }
             if !matches.is_empty() {
-                let selected = select_method_overload(method, matches).map_err(|kind| {
-                    TypeError::BadCall {
+                let selected =
+                    select_method_overload(method, matches).map_err(|kind| TypeError::BadCall {
                         func: format!("{sname}.{method}"),
                         reason: match kind {
-                            OverloadSelect::NoMatch => {
-                                "no overload matches the supplied arguments"
-                            }
+                            OverloadSelect::NoMatch => "no overload matches the supplied arguments",
                             OverloadSelect::Ambiguous => "ambiguous overloaded call",
                         }
                         .to_string(),
-                    }
-                })?;
+                    })?;
                 self.record_selected_method_conversions(method, &selected, args, kwargs)?;
                 if let Some(target) = selected.lowered_name {
                     self.overload_targets
@@ -8141,11 +8129,7 @@ impl Checker {
                         .insert(span.clone(), target);
                 }
                 if selected.raises {
-                    let error = selected
-                        .error
-                        .as_deref()
-                        .cloned()
-                        .unwrap_or(Ty::Error);
+                    let error = selected.error.as_deref().cloned().unwrap_or(Ty::Error);
                     self.record_call_effect(span.clone(), error.clone());
                     self.require_error(
                         format!("call to raising method '{sname}.{method}'"),
@@ -8279,10 +8263,8 @@ impl Checker {
                                 sig.params.iter().map(|t| substitute(t, &subst)).collect();
                             let receiver_variadic =
                                 sig.variadic.as_ref().map(|ty| substitute(ty, &subst));
-                            let receiver_kw_variadic = sig
-                                .kw_variadic
-                                .as_ref()
-                                .map(|ty| substitute(ty, &subst));
+                            let receiver_kw_variadic =
+                                sig.kw_variadic.as_ref().map(|ty| substitute(ty, &subst));
                             let Ok((
                                 params,
                                 variadic,
@@ -8290,14 +8272,14 @@ impl Checker {
                                 method_subst,
                                 mut method_arguments,
                             )) = self.instantiate_method_generics(
-                                    &format!("{sname}.{method}"),
-                                    sig,
-                                    &receiver_params,
-                                    receiver_variadic.as_ref(),
-                                    receiver_kw_variadic.as_ref(),
-                                    args,
-                                    kwargs,
-                                )
+                                &format!("{sname}.{method}"),
+                                sig,
+                                &receiver_params,
+                                receiver_variadic.as_ref(),
+                                receiver_kw_variadic.as_ref(),
+                                args,
+                                kwargs,
+                            )
                             else {
                                 continue;
                             };
@@ -8385,21 +8367,17 @@ impl Checker {
                         .kw_variadic
                         .as_deref()
                         .map(|ty| substitute_self(ty, &obj_ty));
-                    let Ok((
-                        params,
-                        variadic,
-                        kw_variadic,
-                        method_subst,
-                        method_arguments,
-                    )) = self.instantiate_method_generics(
-                        &format!("{obj_ty}.{method}"),
-                        &sig,
-                        &receiver_params,
-                        receiver_variadic.as_ref(),
-                        receiver_kw_variadic.as_ref(),
-                        args,
-                        kwargs,
-                    ) else {
+                    let Ok((params, variadic, kw_variadic, method_subst, method_arguments)) = self
+                        .instantiate_method_generics(
+                            &format!("{obj_ty}.{method}"),
+                            &sig,
+                            &receiver_params,
+                            receiver_variadic.as_ref(),
+                            receiver_kw_variadic.as_ref(),
+                            args,
+                            kwargs,
+                        )
+                    else {
                         continue;
                     };
                     if !self.method_constraints_apply(&sig, &method_arguments) {
@@ -8438,13 +8416,11 @@ impl Checker {
                         ),
                         consumes_receiver: matches!(
                             sig.self_convention,
-                            Some(crate::ast::ArgConvention::Var | crate::ast::ArgConvention::Deinit)
+                            Some(
+                                crate::ast::ArgConvention::Var | crate::ast::ArgConvention::Deinit
+                            )
                         ),
-                        lowered_name: Some(method_lowered_name(
-                            "__trait_dispatch",
-                            method,
-                            &sig,
-                        )),
+                        lowered_name: Some(method_lowered_name("__trait_dispatch", method, &sig)),
                         ref_params: sig.ref_params.clone(),
                         ref_return: sig.ref_return.clone(),
                         param_types: params,
@@ -8502,16 +8478,9 @@ impl Checker {
         };
         self.record_selected_method_conversions(method, &resolved, args, kwargs)?;
         if resolved.raises {
-            let error = resolved
-                .error
-                .as_deref()
-                .cloned()
-                .unwrap_or(Ty::Error);
+            let error = resolved.error.as_deref().cloned().unwrap_or(Ty::Error);
             self.record_call_effect(span.clone(), error.clone());
-            self.require_error(
-                format!("call to raising method '{method}'"),
-                error,
-            )?;
+            self.require_error(format!("call to raising method '{method}'"), error)?;
         }
         if let Some(target) = resolved.lowered_name {
             self.overload_targets
@@ -8587,14 +8556,16 @@ impl Checker {
                 let convention = effective_conventions.get(index).copied().flatten();
                 Ok(
                     !matches!(convention, Some(ArgConvention::Mut | ArgConvention::Ref))
-                        && self.is_copyable(&self.infer_with_expected(
-                            expression,
-                            resolved
-                                .param_types
-                                .get(index)
-                                .expect("selected method slot has a parameter type"),
-                            true,
-                        )?),
+                        && self.is_copyable(
+                            &self.infer_with_expected(
+                                expression,
+                                resolved
+                                    .param_types
+                                    .get(index)
+                                    .expect("selected method slot has a parameter type"),
+                                true,
+                            )?,
+                        ),
                 )
             })
             .collect::<Result<Vec<_>, TypeError>>()?;
@@ -8756,9 +8727,7 @@ impl Checker {
                 let expression = &kwargs[position].value;
                 let actual = self.infer(expression)?;
                 if !self.value_coerces(&actual, element)
-                    && self
-                        .implicit_conversion_target(&actual, element)?
-                        .is_none()
+                    && self.implicit_conversion_target(&actual, element)?.is_none()
                 {
                     return Err(TypeError::TypeMismatch {
                         expected: element.to_string(),
@@ -8784,12 +8753,7 @@ impl Checker {
             }
         }
         Ok(MethodCallScore {
-            rank: overload_rank(
-                score,
-                variadic.is_some() || kw_variadic.is_some(),
-                0,
-                false,
-            ),
+            rank: overload_rank(score, variadic.is_some() || kw_variadic.is_some(), 0, false),
             slots,
             keyword_overflow,
         })
@@ -9068,8 +9032,7 @@ impl Checker {
                         ty: ty.to_string(),
                         trait_name: "IterableOwned".to_string(),
                         reason: Some(
-                            "owned iteration requires an ownership-consuming iterator"
-                                .to_string(),
+                            "owned iteration requires an ownership-consuming iterator".to_string(),
                         ),
                     });
                 }
@@ -9139,16 +9102,14 @@ impl Checker {
                     ),
                 }
         });
-        let iter_sig = matching.next().ok_or_else(|| {
-            TypeError::TypeMismatch {
-                expected: match mode {
-                    IterationMode::Owned => "an '__iter__(var self)' method",
-                    IterationMode::Borrowed => "a borrowed '__iter__' method",
-                }
-                .to_string(),
-                found: format!("{}.__iter__", c_ty),
-                context: "for-loop iterator selection".to_string(),
+        let iter_sig = matching.next().ok_or_else(|| TypeError::TypeMismatch {
+            expected: match mode {
+                IterationMode::Owned => "an '__iter__(var self)' method",
+                IterationMode::Borrowed => "a borrowed '__iter__' method",
             }
+            .to_string(),
+            found: format!("{}.__iter__", c_ty),
+            context: "for-loop iterator selection".to_string(),
         })?;
         if matching.next().is_some() {
             return Err(TypeError::BadCall {
@@ -9242,24 +9203,28 @@ impl Checker {
             crate::checked::IterationProtocol {
                 mode,
                 prepare: vec![prepare_symbol],
-                has_next: Some(if iinfo
-                    .methods
-                    .get("__len__")
-                    .is_some_and(|methods| methods.len() > 1)
-                {
-                    method_lowered_name(iname, "__len__", len_sig)
-                } else {
-                    format!("{iname}.__len__")
-                }),
-                next: Some(if iinfo
-                    .methods
-                    .get("__next__")
-                    .is_some_and(|methods| methods.len() > 1)
-                {
-                    method_lowered_name(iname, "__next__", next_sig)
-                } else {
-                    format!("{iname}.__next__")
-                }),
+                has_next: Some(
+                    if iinfo
+                        .methods
+                        .get("__len__")
+                        .is_some_and(|methods| methods.len() > 1)
+                    {
+                        method_lowered_name(iname, "__len__", len_sig)
+                    } else {
+                        format!("{iname}.__len__")
+                    },
+                ),
+                next: Some(
+                    if iinfo
+                        .methods
+                        .get("__next__")
+                        .is_some_and(|methods| methods.len() > 1)
+                    {
+                        method_lowered_name(iname, "__next__", next_sig)
+                    } else {
+                        format!("{iname}.__next__")
+                    },
+                ),
             },
         ))
     }
@@ -9414,12 +9379,7 @@ impl Checker {
     /// full candidate set is important: bounded calls use the same named-argument
     /// binder, generic specialization, overload ranking, and effect selection as
     /// concrete method calls.
-    fn lookup_trait_methods(
-        &self,
-        bounds: &[String],
-        method: &str,
-        argc: usize,
-    ) -> Vec<MethodSig> {
+    fn lookup_trait_methods(&self, bounds: &[String], method: &str, argc: usize) -> Vec<MethodSig> {
         let mut methods = Vec::new();
         // The built-in `Hashable` trait contributes `__hash__(self) -> UInt`
         // (roadmap milestone 6). A user trait cannot shadow a built-in name, so this is
@@ -10226,12 +10186,7 @@ impl Checker {
             .unwrap_or(*ret);
         Ok((
             result,
-            overload_rank(
-                score,
-                variadic.is_some() || has_kw_collector,
-                0,
-                false,
-            ),
+            overload_rank(score, variadic.is_some() || has_kw_collector, 0, false),
             error.map(|error| *error),
         ))
     }
@@ -11166,17 +11121,18 @@ fn block_can_escape_owned_iteration(statements: &[Stmt], nested_loops: usize) ->
         StmtKind::Break => nested_loops == 0,
         StmtKind::Return(_) | StmtKind::Raise(_) => true,
         StmtKind::If { branches, orelse } | StmtKind::ComptimeIf { branches, orelse } => {
-            branches.iter().any(|(_, body)| {
-                block_can_escape_owned_iteration(body, nested_loops)
-            }) || orelse.as_ref().is_some_and(|body| {
-                block_can_escape_owned_iteration(body, nested_loops)
-            })
+            branches
+                .iter()
+                .any(|(_, body)| block_can_escape_owned_iteration(body, nested_loops))
+                || orelse
+                    .as_ref()
+                    .is_some_and(|body| block_can_escape_owned_iteration(body, nested_loops))
         }
         StmtKind::While { body, orelse, .. } | StmtKind::For { body, orelse, .. } => {
             block_can_escape_owned_iteration(body, nested_loops + 1)
-                || orelse.as_ref().is_some_and(|body| {
-                    block_can_escape_owned_iteration(body, nested_loops)
-                })
+                || orelse
+                    .as_ref()
+                    .is_some_and(|body| block_can_escape_owned_iteration(body, nested_loops))
         }
         StmtKind::Try {
             body,
@@ -11185,15 +11141,15 @@ fn block_can_escape_owned_iteration(statements: &[Stmt], nested_loops: usize) ->
             finalbody,
         } => {
             block_can_escape_owned_iteration(body, nested_loops)
-                || except.as_ref().is_some_and(|(_, body)| {
-                    block_can_escape_owned_iteration(body, nested_loops)
-                })
-                || orelse.as_ref().is_some_and(|body| {
-                    block_can_escape_owned_iteration(body, nested_loops)
-                })
-                || finalbody.as_ref().is_some_and(|body| {
-                    block_can_escape_owned_iteration(body, nested_loops)
-                })
+                || except
+                    .as_ref()
+                    .is_some_and(|(_, body)| block_can_escape_owned_iteration(body, nested_loops))
+                || orelse
+                    .as_ref()
+                    .is_some_and(|body| block_can_escape_owned_iteration(body, nested_loops))
+                || finalbody
+                    .as_ref()
+                    .is_some_and(|body| block_can_escape_owned_iteration(body, nested_loops))
         }
         StmtKind::With { body, .. } => block_can_escape_owned_iteration(body, nested_loops),
         // Nested declarations do not execute as part of the loop body.

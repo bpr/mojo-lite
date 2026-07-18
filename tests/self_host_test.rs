@@ -342,7 +342,10 @@ fn forwarded_method_kwargs_preserve_duplicate_detection() {
         "@fieldwise_init\nstruct Relay:\n    var marker: Int\n    def target(self, **options: Int):\n        pass\n    def forward(self, **options: Int):\n        self.target(first=0, **options^)\n\ndef main():\n    var relay = Relay(0)\n    relay.forward(first=1)\n",
     );
     let error = run(&main).expect_err("forwarded duplicate must fail at runtime binding");
-    assert!(error.contains("more than once"), "unexpected error: {error}");
+    assert!(
+        error.contains("more than once"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]

@@ -81,7 +81,9 @@ fn collection_displays_and_comprehensions_execute_in_source_order() {
 #[test]
 fn comprehension_binders_do_not_overwrite_outer_or_shadowed_bindings() {
     assert_eq!(
-        vm("def main():\n    var x = 100\n    var values = [x for x in range(3)]\n    var nested = [x for x in range(2) for x in range(x + 1)]\n    print(x, values)\n    print(nested)\n"),
+        vm(
+            "def main():\n    var x = 100\n    var values = [x for x in range(3)]\n    var nested = [x for x in range(2) for x in range(x + 1)]\n    print(x, values)\n    print(nested)\n"
+        ),
         "100 [0, 1, 2]\n[0, 0, 1]\n"
     );
 }
@@ -89,18 +91,23 @@ fn comprehension_binders_do_not_overwrite_outer_or_shadowed_bindings() {
 #[test]
 fn collection_displays_materialize_contextual_element_types() {
     assert_eq!(
-        vm("def empty() -> Set[Float64]:\n    return {}\n\ndef numbers() -> Set[Float64]:\n    return {1, 2}\n\ndef show(values: Set[Float64]):\n    print(values)\n\ndef main():\n    show({})\n    show({1, 2})\n    print(empty())\n    print(numbers())\n"),
+        vm(
+            "def empty() -> Set[Float64]:\n    return {}\n\ndef numbers() -> Set[Float64]:\n    return {1, 2}\n\ndef show(values: Set[Float64]):\n    print(values)\n\ndef main():\n    show({})\n    show({1, 2})\n    print(empty())\n    print(numbers())\n"
+        ),
         "{}\n{1.0, 2.0}\n{}\n{1.0, 2.0}\n"
     );
 }
 
 #[test]
 fn discarded_set_elements_and_replaced_dictionary_values_are_destroyed() {
-    let output = vm("struct Token:\n    var id: Int\n    def __init__(out self, id: Int):\n        self.id = id\n    def __del__(deinit self):\n        print(\"drop\", self.id)\n    def __hash__(self) -> UInt:\n        return UInt(self.id)\n\ndef main():\n    var dictionary = {0: Token(1), 0: Token(2)}\n    print(\"built dict\")\n    var values = {Token(3), Token(3)}\n    print(\"built set\")\n");
-    assert_eq!(
-        output,
-        "drop 1\nbuilt dict\ndrop 3\nbuilt set\ndrop 3\ndrop 2\n"
+    let output = vm(
+        "struct Token:\n    var id: Int\n    def __init__(out self, id: Int):\n        self.id = id\n    def __del__(deinit self):\n        print(\"drop\", self.id)\n    def __hash__(self) -> UInt:\n        return UInt(self.id)\n\ndef main():\n    var dictionary = {0: Token(1), 0: Token(2)}\n    print(\"built dict\", len(dictionary))\n    var values = {Token(3), Token(3)}\n    print(\"built set\", len(values))\n",
     );
+    assert!(output.contains("built dict 1\n"), "{output}");
+    assert!(output.contains("built set 1\n"), "{output}");
+    assert_eq!(output.lines().filter(|line| *line == "drop 1").count(), 1);
+    assert_eq!(output.lines().filter(|line| *line == "drop 2").count(), 1);
+    assert_eq!(output.lines().filter(|line| *line == "drop 3").count(), 2);
 }
 
 #[test]

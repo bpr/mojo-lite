@@ -336,9 +336,7 @@ fn var_less_introduction_type_checks_as_implicit_declaration() {
 
 #[test]
 fn nested_implicit_bindings_use_function_scope_with_definite_initialization() {
-    ok(
-        "def initialized() -> Int:\n    if True:\n        value = 7\n    return value\n",
-    );
+    ok("def initialized() -> Int:\n    if True:\n        value = 7\n    return value\n");
     ok(
         "def joined(condition: Bool) -> Int:\n    if condition:\n        value = 1\n    else:\n        value = 2\n    return value\n",
     );
@@ -424,7 +422,9 @@ fn checks_owned_iteration_and_collection_comprehensions() {
         TypeError::Unsupported(message) if message.contains("explicit `var`")
     ));
 
-    ok("def main():\n    var xs = [x * x for x in range(5) if x % 2 == 0]\n    var s = {x % 3 for x in range(8)}\n    var d = {x: x * x for x in range(4)}\n    print(len(xs), len(s), d[3])\n");
+    ok(
+        "def main():\n    var xs = [x * x for x in range(5) if x % 2 == 0]\n    var s = {x % 3 for x in range(8)}\n    var d = {x: x * x for x in range(4)}\n    print(len(xs), len(s), d[3])\n",
+    );
 
     let linear = "@explicit_destroy(\"close Item\")\nstruct Linear(ImplicitlyDeletable where False):\n    var value: Int\n    def __init__(out self, value: Int):\n        self.value = value\n    def close(deinit self):\n        pass\n\n";
     ok(&format!(
@@ -440,8 +440,12 @@ fn checks_owned_iteration_and_collection_comprehensions() {
 
 #[test]
 fn comprehension_binders_are_lexical_and_enforce_linear_cleanup() {
-    ok("def main():\n    var x = 100\n    var values = [x for x in range(3)]\n    print(x, values)\n");
-    ok("def main():\n    var values = [x for x in range(2) for x in range(x + 1)]\n    print(values)\n");
+    ok(
+        "def main():\n    var x = 100\n    var values = [x for x in range(3)]\n    print(x, values)\n",
+    );
+    ok(
+        "def main():\n    var values = [x for x in range(2) for x in range(x + 1)]\n    print(values)\n",
+    );
 
     let linear = "@explicit_destroy(\"close Item\")\nstruct Item(ImplicitlyDeletable where False):\n    var value: Int\n    def __init__(out self, value: Int):\n        self.value = value\n    def close(deinit self):\n        pass\n\n";
     assert!(matches!(
@@ -457,8 +461,12 @@ fn comprehension_binders_are_lexical_and_enforce_linear_cleanup() {
 
 #[test]
 fn collection_displays_use_parameter_and_return_context() {
-    ok("def consume(values: Set[Float64]):\n    pass\n\ndef empty() -> Set[Float64]:\n    return {}\n\ndef numbers() -> Set[Float64]:\n    return {1, 2}\n\ndef main():\n    consume({})\n    consume({1, 2})\n    print(empty(), numbers())\n");
-    ok("def consume(values: Dict[String, Float64]):\n    pass\n\ndef main():\n    consume({})\n    consume({\"one\": 1, \"two\": 2})\n");
+    ok(
+        "def consume(values: Set[Float64]):\n    pass\n\ndef empty() -> Set[Float64]:\n    return {}\n\ndef numbers() -> Set[Float64]:\n    return {1, 2}\n\ndef main():\n    consume({})\n    consume({1, 2})\n    print(empty(), numbers())\n",
+    );
+    ok(
+        "def consume(values: Dict[String, Float64]):\n    pass\n\ndef main():\n    consume({})\n    consume({\"one\": 1, \"two\": 2})\n",
+    );
 }
 
 #[test]
@@ -490,7 +498,7 @@ fn rejects_for_over_non_range() {
         } => {
             assert_eq!(
                 expected,
-                "range, List, a type with __iter__, or an Iterable-style bound"
+                "range, a builtin collection, or a type with borrowed __iter__"
             );
             assert_eq!(found, "Int");
         }

@@ -312,3 +312,38 @@ fn checked_hir_places_use_owner_identity_and_typed_projections() {
     assert_eq!(place.projections.len(), 1);
     assert_eq!(place.ty, mojito::Ty::Int);
 }
+
+#[test]
+fn checked_hir_retains_distinct_comprehension_binding_owners() {
+    let program = mojito::parse(
+        "def main():\n    var result = [x for x in range(2) for x in range(x + 1)]\n",
+    )
+    .expect("parse");
+    let checked = mojito::check_program(&program).expect("check");
+    let body = match &checked.statements()[0].kind {
+        mojito::ast::StmtKind::Def { body, .. } => body,
+        _ => panic!("expected function"),
+    };
+    let cfg = Cfg::build_checked_fn(&checked, &[], body);
+    let expression = cfg
+        .g
+        .node_weights()
+        .flat_map(|block| &block.instrs)
+        .find_map(|instruction| match instruction {
+            mojito::hir::HirInstr::Bind { expr, .. }
+                if matches!(
+                    expr.syntax.kind,
+                    mojito::ast::ExprKind::Comprehension { .. }
+                ) =>
+            {
+                Some(expr)
+            }
+            _ => None,
+        })
+        .expect("comprehension binding");
+    assert_eq!(expression.comprehension_bindings.len(), 2);
+    assert_ne!(
+        expression.comprehension_bindings[0].owner,
+        expression.comprehension_bindings[1].owner
+    );
+}

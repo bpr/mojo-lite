@@ -98,10 +98,7 @@ impl Env {
 pub(crate) fn check(
     statements: &[Stmt],
     binding_types: &HashMap<SourceSpan, Ty>,
-    comprehension_bindings: &HashMap<
-        SourceSpan,
-        Vec<crate::checked::CheckedComprehensionBinding>,
-    >,
+    comprehension_bindings: &HashMap<SourceSpan, Vec<crate::checked::CheckedComprehensionBinding>>,
     types: &HashMap<String, ExplicitDestroyInfo>,
 ) -> Result<(), TypeError> {
     if types.is_empty() {
@@ -148,10 +145,7 @@ fn check_function<'a>(
     params: impl Iterator<Item = (&'a String, &'a SourceType, Option<ArgConvention>)>,
     body: &[Stmt],
     binding_types: &HashMap<SourceSpan, Ty>,
-    comprehension_bindings: &HashMap<
-        SourceSpan,
-        Vec<crate::checked::CheckedComprehensionBinding>,
-    >,
+    comprehension_bindings: &HashMap<SourceSpan, Vec<crate::checked::CheckedComprehensionBinding>>,
     types: &HashMap<String, ExplicitDestroyInfo>,
 ) -> Result<(), TypeError> {
     let mut env = Env::default();
@@ -185,23 +179,15 @@ fn check_block(
     mut env: Env,
     scoped: bool,
     binding_types: &HashMap<SourceSpan, Ty>,
-    comprehension_bindings: &HashMap<
-        SourceSpan,
-        Vec<crate::checked::CheckedComprehensionBinding>,
-    >,
+    comprehension_bindings: &HashMap<SourceSpan, Vec<crate::checked::CheckedComprehensionBinding>>,
     types: &HashMap<String, ExplicitDestroyInfo>,
 ) -> Result<Option<Env>, TypeError> {
     if scoped {
         env.push();
     }
     for statement in body {
-        let Some(next) = check_stmt(
-            statement,
-            env,
-            binding_types,
-            comprehension_bindings,
-            types,
-        )? else {
+        let Some(next) = check_stmt(statement, env, binding_types, comprehension_bindings, types)?
+        else {
             return Ok(None);
         };
         env = next;
@@ -216,10 +202,7 @@ fn check_stmt(
     stmt: &Stmt,
     mut env: Env,
     binding_types: &HashMap<SourceSpan, Ty>,
-    comprehension_bindings: &HashMap<
-        SourceSpan,
-        Vec<crate::checked::CheckedComprehensionBinding>,
-    >,
+    comprehension_bindings: &HashMap<SourceSpan, Vec<crate::checked::CheckedComprehensionBinding>>,
     types: &HashMap<String, ExplicitDestroyInfo>,
 ) -> Result<Option<Env>, TypeError> {
     match &stmt.kind {
@@ -414,7 +397,8 @@ fn check_stmt(
                     binding_types,
                     comprehension_bindings,
                     types,
-                )? else {
+                )?
+                else {
                     return Ok(None);
                 };
                 env = out;
@@ -450,10 +434,7 @@ fn check_stmt(
 fn check_expr(
     expr: &Expr,
     env: &mut Env,
-    comprehension_bindings: &HashMap<
-        SourceSpan,
-        Vec<crate::checked::CheckedComprehensionBinding>,
-    >,
+    comprehension_bindings: &HashMap<SourceSpan, Vec<crate::checked::CheckedComprehensionBinding>>,
     types: &HashMap<String, ExplicitDestroyInfo>,
 ) -> Result<(), TypeError> {
     match &expr.kind {
@@ -511,9 +492,7 @@ fn check_expr(
             check_expr(left, env, comprehension_bindings, types)?;
             check_expr(right, env, comprehension_bindings, types)?;
         }
-        ExprKind::Member { object, .. } => {
-            check_expr(object, env, comprehension_bindings, types)?
-        }
+        ExprKind::Member { object, .. } => check_expr(object, env, comprehension_bindings, types)?,
         ExprKind::Index { object, index } => {
             check_expr(object, env, comprehension_bindings, types)?;
             check_expr(index, env, comprehension_bindings, types)?;
@@ -614,10 +593,7 @@ fn check_comprehension_expr(
     value: &Expr,
     clauses: &[crate::ast::ComprehensionClause],
     env: &mut Env,
-    comprehension_bindings: &HashMap<
-        SourceSpan,
-        Vec<crate::checked::CheckedComprehensionBinding>,
-    >,
+    comprehension_bindings: &HashMap<SourceSpan, Vec<crate::checked::CheckedComprehensionBinding>>,
     types: &HashMap<String, ExplicitDestroyInfo>,
 ) -> Result<(), TypeError> {
     let bindings = comprehension_bindings
@@ -646,12 +622,7 @@ fn check_comprehension_expr(
                         .and_then(|name| types.get(name))
                         .map(|info| info.message.clone());
                     env.push();
-                    env.declare(
-                        &binding.name,
-                        explicit.clone(),
-                        message,
-                        explicit.is_some(),
-                    );
+                    env.declare(&binding.name, explicit.clone(), message, explicit.is_some());
                 }
                 crate::ast::ComprehensionClause::If(condition) => {
                     check_expr(condition, env, comprehension_bindings, types)?;

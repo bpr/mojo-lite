@@ -41,7 +41,9 @@ fn nav_step<'a>(
                     .iter_mut()
                     .find(|(candidate, _)| candidate == key)
                     .map(|(_, value)| value)
-                    .ok_or_else(|| RuntimeError::TypeError("dictionary key not found".to_string()));
+                    .ok_or_else(|| {
+                        RuntimeError::TypeError("dictionary key not found".to_string())
+                    });
             }
             let idx = value_as_index(&regs[reg.0 as usize])?;
             match slot {
@@ -132,9 +134,8 @@ pub(super) fn store_place(
                 && let Value::Dict(entries) = slot
             {
                 let key = regs[ireg.0 as usize].clone();
-                if let Some((_, existing)) = entries
-                    .iter_mut()
-                    .find(|(candidate, _)| *candidate == key)
+                if let Some((_, existing)) =
+                    entries.iter_mut().find(|(candidate, _)| *candidate == key)
                 {
                     *existing = value;
                 } else {

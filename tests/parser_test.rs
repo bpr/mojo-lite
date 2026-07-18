@@ -441,17 +441,13 @@ fn parses_owned_iteration_and_collection_comprehensions() {
         } if var == "item"
     ));
 
-    let statement = parse(
-        "var result = {x: x * y for x in range(3) for y in range(2) if y == 1}\n",
-    );
+    let statement =
+        parse("var result = {x: x * y for x in range(3) for y in range(2) if y == 1}\n");
     let StmtKind::VarDecl { value, .. } = &statement[0].kind else {
         panic!("expected variable declaration");
     };
     let ExprKind::Comprehension {
-        kind,
-        key,
-        clauses,
-        ..
+        kind, key, clauses, ..
     } = &value.kind
     else {
         panic!("expected dictionary comprehension");
@@ -651,9 +647,7 @@ fn parses_single_line_trait_method_requirement() {
 
 #[test]
 fn parses_raises_effect_on_trait_requirements() {
-    let stmts = parse(
-        "trait Fallible:\n    def run(self) raises ValidationError -> Int: ...\n",
-    );
+    let stmts = parse("trait Fallible:\n    def run(self) raises ValidationError -> Int: ...\n");
     let StmtKind::Trait { methods, .. } = &stmts[0].kind else {
         panic!("expected a trait");
     };

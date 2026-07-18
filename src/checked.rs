@@ -471,9 +471,7 @@ fn build_checked_expressions(
                     for clause in clauses {
                         match clause {
                             crate::ast::ComprehensionClause::For { iter, .. } => add(self, iter),
-                            crate::ast::ComprehensionClause::If(condition) => {
-                                add(self, condition)
-                            }
+                            crate::ast::ComprehensionClause::If(condition) => add(self, condition),
                         }
                     }
                     if let Some(key) = key {

@@ -110,6 +110,20 @@ fn expression_children(expression: &Expr) -> Vec<&Expr> {
             .iter()
             .flat_map(|(key, value)| std::iter::once(key).chain(value.iter()))
             .collect(),
+        ExprKind::Comprehension {
+            key,
+            value,
+            clauses,
+            ..
+        } => clauses
+            .iter()
+            .map(|clause| match clause {
+                crate::ast::ComprehensionClause::For { iter, .. } => iter.as_ref(),
+                crate::ast::ComprehensionClause::If(condition) => condition.as_ref(),
+            })
+            .chain(key.iter().map(Box::as_ref))
+            .chain(std::iter::once(value.as_ref()))
+            .collect(),
         ExprKind::IfExpr {
             cond,
             then_branch,
@@ -676,14 +690,7 @@ impl Flatten<'_> {
                     else_b: continuation,
                 };
                 self.cur = body;
-                self.comprehension_clauses(
-                    clauses,
-                    bindings,
-                    index + 1,
-                    collection,
-                    key,
-                    value,
-                );
+                self.comprehension_clauses(clauses, bindings, index + 1, collection, key, value);
                 self.f.blocks[self.cur].term = MirTerm::Jump(continuation);
                 self.cur = continuation;
             }
@@ -751,9 +758,7 @@ impl Flatten<'_> {
                 });
                 let binding_index = clauses[..index]
                     .iter()
-                    .filter(|clause| {
-                        matches!(clause, crate::ast::ComprehensionClause::For { .. })
-                    })
+                    .filter(|clause| matches!(clause, crate::ast::ComprehensionClause::For { .. }))
                     .count();
                 let binding = bindings
                     .get(binding_index)
@@ -769,14 +774,7 @@ impl Flatten<'_> {
                     src: element_value,
                     binding_ty: element_ty,
                 });
-                self.comprehension_clauses(
-                    clauses,
-                    bindings,
-                    index + 1,
-                    collection,
-                    key,
-                    value,
-                );
+                self.comprehension_clauses(clauses, bindings, index + 1, collection, key, value);
                 self.f.blocks[self.cur].term = MirTerm::Jump(header);
                 self.cur = exit;
             }
@@ -3075,16 +3073,11 @@ pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
                                     method: method_index,
                                     param: index,
                                 },
-                                &format!(
-                                    "keyword variadic parameter of method '{source_mangled}'"
-                                ),
+                                &format!("keyword variadic parameter of method '{source_mangled}'"),
                                 &mut invariant_errors,
                             )
                         }),
-                        kw_variadic_index: runtime_parameter_index(
-                            &m.params,
-                            kw_variadic_idx,
-                        ),
+                        kw_variadic_index: runtime_parameter_index(&m.params, kw_variadic_idx),
                         positional_only: regular_marker_index(&m.params, m.positional_only),
                         keyword_only: effective_keyword_only_index(
                             &m.params,

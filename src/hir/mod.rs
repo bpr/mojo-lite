@@ -453,9 +453,7 @@ fn rename_expr(e: &mut Expr, resolve: &impl Fn(&str) -> String) {
             rename_expr(value, resolve);
             for clause in clauses {
                 match clause {
-                    crate::ast::ComprehensionClause::For { iter, .. } => {
-                        rename_expr(iter, resolve)
-                    }
+                    crate::ast::ComprehensionClause::For { iter, .. } => rename_expr(iter, resolve),
                     crate::ast::ComprehensionClause::If(condition) => {
                         rename_expr(condition, resolve)
                     }

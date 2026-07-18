@@ -290,11 +290,7 @@ pub fn iterator_method_symbol(
     convention: Option<ArgConvention>,
     sig: &SignatureKey,
 ) -> String {
-    method_symbol(
-        type_name,
-        "__iter__",
-        &sig.with_receiver(convention),
-    )
+    method_symbol(type_name, "__iter__", &sig.with_receiver(convention))
 }
 
 /// Retarget a checker-selected method symbol from an abstract receiver (for

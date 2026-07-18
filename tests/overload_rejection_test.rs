@@ -317,7 +317,9 @@ fn generic_overloads_differing_only_in_bounds_get_distinct_symbols() {
 #[test]
 fn int_literal_defaults_to_int_over_float64() {
     assert_eq!(
-        vm("def f(x: Int) -> Int:\n    return 0\n\ndef f(x: Float64) -> Int:\n    return 1\n\ndef main():\n    print(f(1))\n"),
+        vm(
+            "def f(x: Int) -> Int:\n    return 0\n\ndef f(x: Float64) -> Int:\n    return 1\n\ndef main():\n    print(f(1))\n"
+        ),
         "0\n"
     );
 }
@@ -325,7 +327,9 @@ fn int_literal_defaults_to_int_over_float64() {
 #[test]
 fn int_literal_defaults_to_int_over_uint() {
     assert_eq!(
-        vm("def f(x: Int) -> Int:\n    return 0\n\ndef f(x: UInt) -> Int:\n    return 1\n\ndef main():\n    print(f(1))\n"),
+        vm(
+            "def f(x: Int) -> Int:\n    return 0\n\ndef f(x: UInt) -> Int:\n    return 1\n\ndef main():\n    print(f(1))\n"
+        ),
         "0\n"
     );
 }
@@ -350,7 +354,9 @@ fn rejects_ambiguous_multi_argument_literal_tie() {
 #[test]
 fn defaulted_literal_breaks_a_partial_overload_tie() {
     assert_eq!(
-        vm("def f(a: Int, b: Int) -> Int:\n    return 0\n\ndef f(a: Int, b: Float64) -> Int:\n    return 1\n\ndef main():\n    var i: Int = 3\n    print(f(i, 2))\n"),
+        vm(
+            "def f(a: Int, b: Int) -> Int:\n    return 0\n\ndef f(a: Int, b: Float64) -> Int:\n    return 1\n\ndef main():\n    var i: Int = 3\n    print(f(i, 2))\n"
+        ),
         "0\n"
     );
 }
@@ -367,7 +373,9 @@ fn rejects_ambiguous_generic_overloads_when_both_bounds_hold() {
 #[test]
 fn keyword_literal_uses_its_default_type_for_overload_selection() {
     assert_eq!(
-        vm("def f(x: Int) -> Int:\n    return 0\n\ndef f(x: Float64) -> Int:\n    return 1\n\ndef main():\n    print(f(x=1))\n"),
+        vm(
+            "def f(x: Int) -> Int:\n    return 0\n\ndef f(x: Float64) -> Int:\n    return 1\n\ndef main():\n    print(f(x=1))\n"
+        ),
         "0\n"
     );
 }
@@ -375,7 +383,9 @@ fn keyword_literal_uses_its_default_type_for_overload_selection() {
 #[test]
 fn constructor_literal_uses_its_default_type() {
     assert_eq!(
-        vm("struct Box:\n    var n: Int\n    def __init__(out self, x: Int):\n        self.n = x\n    def __init__(out self, x: Float64):\n        self.n = 0\n\ndef main():\n    var b = Box(1)\n    print(b.n)\n"),
+        vm(
+            "struct Box:\n    var n: Int\n    def __init__(out self, x: Int):\n        self.n = x\n    def __init__(out self, x: Float64):\n        self.n = 0\n\ndef main():\n    var b = Box(1)\n    print(b.n)\n"
+        ),
         "1\n"
     );
 }
@@ -425,7 +435,9 @@ fn overload_set_fully_shadows_a_builtin_name() {
 #[test]
 fn method_literal_uses_its_default_type() {
     assert_eq!(
-        vm("@fieldwise_init\nstruct Box:\n    var n: Int\n    def m(self, x: Int) -> Int:\n        return x\n    def m(self, x: Float64) -> Int:\n        return 0\n\ndef main():\n    var b = Box(1)\n    print(b.m(1))\n"),
+        vm(
+            "@fieldwise_init\nstruct Box:\n    var n: Int\n    def m(self, x: Int) -> Int:\n        return x\n    def m(self, x: Float64) -> Int:\n        return 0\n\ndef main():\n    var b = Box(1)\n    print(b.m(1))\n"
+        ),
         "1\n"
     );
 }

@@ -2181,9 +2181,8 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
                     } else {
                         false
                     };
-                    let var = self.expect_identifier(
-                        "Expected a comprehension variable after 'for'",
-                    )?;
+                    let var =
+                        self.expect_identifier("Expected a comprehension variable after 'for'")?;
                     self.expect(Token::In, "Expected 'in' in comprehension")?;
                     let iter = self.parse_expression(Precedence::Conditional)?;
                     clauses.push(ComprehensionClause::For {
