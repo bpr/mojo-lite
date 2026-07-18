@@ -547,3 +547,41 @@ fn break_crossing_try_lowers_to_escape_jump() {
         "a function-level try escape must not be Unsupported"
     );
 }
+
+#[test]
+fn pointer_construction_lowers_to_a_handle_and_owner_loan() {
+    use mojito::check_program;
+    let src = "def main():\n    var x = 1\n    var p = UnsafePointer(to=x)\n    print(p[0])\n";
+    let program = parse(src).expect("parse");
+    let checked = check_program(&program).expect("check");
+    let mir = mojito::mir::lower_checked_program(&checked);
+    let (_, main) = mir
+        .functions
+        .iter()
+        .find(|(name, _)| name == "main")
+        .expect("main lowered");
+    let instrs: Vec<&MirInstr> = main
+        .blocks
+        .iter()
+        .flat_map(|block| block.instrs.iter())
+        .collect();
+    assert!(
+        instrs
+            .iter()
+            .any(|instr| matches!(instr, MirInstr::MakeRef { .. })),
+        "construction emits a frame/slot handle"
+    );
+    assert!(
+        instrs
+            .iter()
+            .any(|instr| matches!(instr, MirInstr::BeginLoan { mutable: true, .. })),
+        "the pointer binding carries a mutable owner loan"
+    );
+    assert!(
+        instrs.iter().any(|instr| matches!(
+            instr,
+            MirInstr::LoadPlace { place, .. } if place.through.is_some()
+        )),
+        "a stable pointer deref substitutes the owner place through the loan"
+    );
+}

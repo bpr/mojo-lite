@@ -156,7 +156,7 @@ default next task.
 
 ### 2. Complete References And Unsafe Pointers
 
-- [ ] **Executable origin-bearing pointer loans** — infer the concrete source
+- [x] **Executable origin-bearing pointer loans** — infer the concrete source
   origin for `UnsafePointer(to=place)`, attach owner loans to aggregates that
   store such pointers, and reject dangling escape or conflicting access. The VM
   may erase origins after verification, but checked HIR/MIR must not. This is the

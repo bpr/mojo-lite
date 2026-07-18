@@ -249,7 +249,109 @@ struct Flatten<'a> {
     /// The runtime value contains the handles; this map transfers their static
     /// loans when an aggregate is moved or forwarded into a new binding.
     aggregate_loans: HashMap<VarId, Vec<(MirPlace, bool)>>,
+    /// Names rebound more than once, or captured by a nested `def`. A pointer
+    /// variable outside this set keeps one statically known loan place for its
+    /// whole live range, so deref sites may substitute the owner place.
+    reassigned_names: std::collections::HashSet<String>,
     returns_reference: bool,
+}
+
+/// Names whose binding may change after the first assignment (or that a nested
+/// `def` captures). CFG-lowered rebindings appear as `HirInstr::Bind`; opaque
+/// statements — notably `try` regions, whose sub-CFGs lower separately — are
+/// scanned recursively.
+fn reassigned_names(
+    cfg: &Cfg,
+    nested: &HashMap<String, NestedInfo>,
+) -> std::collections::HashSet<String> {
+    fn bump(counts: &mut HashMap<String, usize>, name: &str) {
+        *counts.entry(name.to_string()).or_default() += 1;
+    }
+    fn scan(stmt: &Stmt, counts: &mut HashMap<String, usize>) {
+        match &stmt.kind {
+            StmtKind::VarDecl { name, .. }
+            | StmtKind::Assign { name, .. }
+            | StmtKind::RefDecl { name, .. }
+            | StmtKind::Comptime { name, .. } => bump(counts, name),
+            StmtKind::AugAssign { place, .. } | StmtKind::SetPlace { place, .. } => {
+                if let ExprKind::Identifier(name) = &place.kind {
+                    bump(counts, name);
+                }
+            }
+            StmtKind::Unpack { targets, .. } => {
+                for target in targets {
+                    if let ExprKind::Identifier(name) = &target.kind {
+                        bump(counts, name);
+                    }
+                }
+            }
+            StmtKind::If { branches, orelse } => {
+                for (_, body) in branches {
+                    for inner in body {
+                        scan(inner, counts);
+                    }
+                }
+                for inner in orelse.iter().flatten() {
+                    scan(inner, counts);
+                }
+            }
+            StmtKind::While { body, orelse, .. } => {
+                for inner in body.iter().chain(orelse.iter().flatten()) {
+                    scan(inner, counts);
+                }
+            }
+            StmtKind::For {
+                var, body, orelse, ..
+            } => {
+                bump(counts, var);
+                for inner in body.iter().chain(orelse.iter().flatten()) {
+                    scan(inner, counts);
+                }
+            }
+            StmtKind::Try {
+                body,
+                except,
+                orelse,
+                finalbody,
+            } => {
+                let handler = except.iter().flat_map(|(_, handler)| handler.iter());
+                for inner in body
+                    .iter()
+                    .chain(handler)
+                    .chain(orelse.iter().flatten())
+                    .chain(finalbody.iter().flatten())
+                {
+                    scan(inner, counts);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut counts = HashMap::new();
+    for hb in cfg.g.node_indices() {
+        for instr in &cfg.g[hb].instrs {
+            match instr {
+                HirInstr::Bind { dest, .. } => {
+                    if let Some(name) = cfg.vars.get(*dest as usize) {
+                        bump(&mut counts, name);
+                    }
+                }
+                HirInstr::Stmt(statement) => scan(&statement.syntax, &mut counts),
+                _ => {}
+            }
+        }
+    }
+    for info in nested.values() {
+        for capture in &info.captures {
+            bump(&mut counts, &capture.name);
+            bump(&mut counts, &capture.name);
+        }
+    }
+    counts
+        .into_iter()
+        .filter(|(_, occurrences)| *occurrences > 1)
+        .map(|(name, _)| name)
+        .collect()
 }
 
 impl Flatten<'_> {
@@ -324,11 +426,30 @@ impl Flatten<'_> {
             }
         }
         match &expression.kind {
-            ExprKind::Call { args, kwargs, .. } => args
-                .iter()
-                .chain(kwargs.iter().map(|argument| &argument.value))
-                .flat_map(|argument| self.aggregate_borrows(argument))
-                .collect(),
+            ExprKind::Call { args, kwargs, .. } => {
+                // A checked pointer construction loans exactly its source
+                // place, with the mutability the checker inferred from the
+                // owner binding.
+                if let Some(crate::SemanticAdjustment::PointerToPlace { mutable }) = self
+                    .checked_adjustments(expression)
+                    .into_iter()
+                    .find(|adjustment| {
+                        matches!(adjustment, crate::SemanticAdjustment::PointerToPlace { .. })
+                    })
+                {
+                    let place = self.place(
+                        &kwargs
+                            .first()
+                            .expect("checked pointer construction has a 'to=' argument")
+                            .value,
+                    );
+                    return vec![(place, mutable)];
+                }
+                args.iter()
+                    .chain(kwargs.iter().map(|argument| &argument.value))
+                    .flat_map(|argument| self.aggregate_borrows(argument))
+                    .collect()
+            }
             ExprKind::Transfer(inner) => self.aggregate_borrows(inner),
             ExprKind::ListLit(values) | ExprKind::TupleLit(values) => values
                 .iter()
@@ -342,6 +463,39 @@ impl Flatten<'_> {
         self.facts(expression)
             .map(|facts| facts.adjustments.clone())
             .unwrap_or_default()
+    }
+
+    /// Whether an expression's checked type is a pointer whose provenance
+    /// designates checked storage. Dereferencing such a pointer goes through
+    /// its frame/slot handle instead of allocation arithmetic.
+    fn is_origin_bearing_pointer(&self, expression: &Expr) -> bool {
+        matches!(
+            self.checked_ty(expression),
+            Some(Ty::Pointer { origin, .. }) if origin.as_origin().is_some()
+        )
+    }
+
+    /// The statically known storage place behind a stably bound origin-bearing
+    /// pointer variable. Substituting it at deref sites touches the owner at
+    /// each access — the liveness contract `ref` aliases have — so ASAP
+    /// destruction and loan conflicts stay exact. A reassigned or captured
+    /// pointer, or a handle loaded from a field, reads through its runtime
+    /// handle instead.
+    fn pointer_deref_place(&mut self, object: &Expr) -> Option<MirPlace> {
+        let ExprKind::Identifier(name) = &object.kind else {
+            return None;
+        };
+        if !self.is_origin_bearing_pointer(object) || self.reassigned_names.contains(name) {
+            return None;
+        }
+        let var = self.expression_var(name, object);
+        let loans = self.aggregate_loans.get(&var)?;
+        let [(place, _)] = loans.as_slice() else {
+            return None;
+        };
+        let mut place = place.clone();
+        place.through = Some(var);
+        Some(place)
     }
 
     fn resolved_callable(&self, expression: &Expr) -> Option<String> {
@@ -947,6 +1101,17 @@ impl Flatten<'_> {
                 }
                 let var = self.expression_var(name, e);
                 let d = self.fresh(span(e), Some(var));
+                if self.is_origin_bearing_pointer(e) {
+                    // Reading a pointer variable produces its handle value;
+                    // `UseVar` would read through the stored `Value::Ref` the
+                    // way a `ref` binding does. `MakeRef` on the root forwards
+                    // the existing handle unchanged.
+                    self.emit(MirInstr::MakeRef {
+                        dest: d,
+                        place: MirPlace::root(var, self.var_types.get(&var).cloned()),
+                    });
+                    return d;
+                }
                 if let Some((mut place, _)) = self.aliases.get(&var).cloned() {
                     place.through = Some(var);
                     self.emit(MirInstr::LoadPlace { dest: d, place });
@@ -1033,6 +1198,21 @@ impl Flatten<'_> {
                 args,
                 kwargs,
             } => {
+                // A checked pointer construction materializes the frame/slot
+                // handle for its source place; the checked pointer type keeps
+                // the origin while the runtime value erases it.
+                if self.checked_adjustments(e).iter().any(|adjustment| {
+                    matches!(adjustment, crate::SemanticAdjustment::PointerToPlace { .. })
+                }) {
+                    let value = &kwargs
+                        .first()
+                        .expect("checked pointer construction has a 'to=' argument")
+                        .value;
+                    let place = self.place(value);
+                    let dest = self.fresh(span(e), Some(place.root));
+                    self.emit(MirInstr::MakeRef { dest, place });
+                    return dest;
+                }
                 if let Some(crate::SemanticAdjustment::ConstructVariant {
                     alternatives,
                     index,
@@ -1410,6 +1590,22 @@ impl Flatten<'_> {
                 {
                     let d = self.fresh(span(e), Some(place.root));
                     self.emit(MirInstr::LoadPlace { dest: d, place });
+                    return d;
+                }
+                // Dereferencing an origin-bearing pointer reads its source
+                // place; the checker fixed the offset to 0. A stably bound
+                // pointer substitutes the owner place directly, keeping the
+                // owner touched (and so droppable) at each access; otherwise
+                // the access reads through the runtime handle.
+                if let Some(place) = self.pointer_deref_place(object) {
+                    let d = self.fresh(span(e), Some(place.root));
+                    self.emit(MirInstr::LoadPlace { dest: d, place });
+                    return d;
+                }
+                if self.is_origin_bearing_pointer(object) {
+                    let reference = self.expr(object);
+                    let d = self.fresh(span(e), None);
+                    self.emit(MirInstr::ReadRef { dest: d, reference });
                     return d;
                 }
                 let base = self.expr(object);
@@ -2076,6 +2272,7 @@ impl Flatten<'_> {
                 aliases: self.aliases.clone(),
                 runtime_aliases: self.runtime_aliases.clone(),
                 aggregate_loans: self.aggregate_loans.clone(),
+                reassigned_names: self.reassigned_names.clone(),
                 returns_reference: self.returns_reference,
             };
             for hb in region_cfg.g.node_indices() {
@@ -2315,6 +2512,24 @@ impl Flatten<'_> {
                 if self.lower_subscript_set(place, src) {
                     return;
                 }
+                // A store through an origin-bearing pointer writes its source
+                // place; the checker fixed the offset to 0 and required
+                // mutable provenance. A stably bound pointer substitutes the
+                // owner place; otherwise the store goes through the handle.
+                if let ExprKind::Index { object, .. } = &place.kind {
+                    if let Some(target) = self.pointer_deref_place(object) {
+                        self.emit(MirInstr::Store { place: target, src });
+                        return;
+                    }
+                    if self.is_origin_bearing_pointer(object) {
+                        let reference = self.expr(object);
+                        self.emit(MirInstr::WriteRef {
+                            reference,
+                            value: src,
+                        });
+                        return;
+                    }
+                }
                 let p = self.place(place);
                 let stores_reference = matches!(p.ty, Some(Ty::Ref(_)))
                     && self.checked_adjustments(value).iter().any(|adjustment| {
@@ -2377,6 +2592,51 @@ impl Flatten<'_> {
                             binding_ty: None,
                         });
                     }
+                } else if let ExprKind::Index { object, .. } = &place.kind
+                    && let Some(target) = self.pointer_deref_place(object)
+                {
+                    // `p[0] OP= e` through a stably bound pointer: owner-place
+                    // load and store, exactly like an alias write-back.
+                    let cur = self.fresh(span(place), Some(target.root));
+                    self.emit(MirInstr::LoadPlace {
+                        dest: cur,
+                        place: target.clone(),
+                    });
+                    let rhs = self.expr(value);
+                    let res = self.fresh(span(place), None);
+                    self.emit(MirInstr::BinOp {
+                        op: *op,
+                        dest: res,
+                        a: cur,
+                        b: rhs,
+                    });
+                    self.emit(MirInstr::Store {
+                        place: target,
+                        src: res,
+                    });
+                } else if let ExprKind::Index { object, .. } = &place.kind
+                    && self.is_origin_bearing_pointer(object)
+                {
+                    // `p[0] OP= e` through an origin-bearing pointer: read and
+                    // write through the handle, evaluated once.
+                    let reference = self.expr(object);
+                    let cur = self.fresh(span(place), None);
+                    self.emit(MirInstr::ReadRef {
+                        dest: cur,
+                        reference,
+                    });
+                    let rhs = self.expr(value);
+                    let res = self.fresh(span(place), None);
+                    self.emit(MirInstr::BinOp {
+                        op: *op,
+                        dest: res,
+                        a: cur,
+                        b: rhs,
+                    });
+                    self.emit(MirInstr::WriteRef {
+                        reference,
+                        value: res,
+                    });
                 } else {
                     let p = self.place(place);
                     let cur = self.fresh(span(place), None);
@@ -2647,6 +2907,7 @@ fn lower_cfg_nested(
                 .filter_map(|(slot, reference)| reference.then_some(slot as VarId))
                 .collect(),
             aggregate_loans: HashMap::new(),
+            reassigned_names: reassigned_names(cfg, nested),
             returns_reference,
         };
         for hb in cfg.g.node_indices() {

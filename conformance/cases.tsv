@@ -79,6 +79,8 @@ hidden-unsafe-any-origin	reject	conformance/fixtures/hidden_unsafe_any_origin.mo
 reference-valued-aggregate	mojito-only	conformance/fixtures/reference_valued_aggregate.mojo
 reborrows	run	conformance/fixtures/reborrows.mojo
 pointer-provenance	run	conformance/fixtures/pointer_provenance.mojo
+pointer-origin-escape	reject	conformance/fixtures/pointer_origin_escape.mojo
+pointer-loan-conflict	mojo-only	conformance/fixtures/pointer_loan_conflict.mojo
 variant-completion	run	conformance/fixtures/variant_completion.mojo
 kwargs-forwarding	run	conformance/fixtures/kwargs_forwarding.mojo
 kwargs-call-kinds	run	conformance/fixtures/kwargs_call_kinds.mojo

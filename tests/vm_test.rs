@@ -598,6 +598,30 @@ fn slice_subscript_runs() {
 }
 
 #[test]
+fn pointer_to_place_aliases_the_source_place() {
+    let src = "def main():\n    var x = 42\n    var p = UnsafePointer(to=x)\n    print(p[0])\n    p[0] = 7\n    p[0] += 1\n    print(x)\n";
+    assert_eq!(vm(src), "42\n8\n");
+}
+
+#[test]
+fn pointer_owner_drops_after_the_pointer_last_use() {
+    let src = "struct Box:\n    var n: Int\n    def __init__(out self, n: Int):\n        self.n = n\n    def __del__(deinit self):\n        print(\"drop\", self.n)\n\ndef main():\n    var box = Box(1)\n    var p = UnsafePointer(to=box.n)\n    print(\"before\")\n    print(p[0])\n    print(\"after\")\n";
+    assert_eq!(vm(src), "before\ndrop 1\n1\nafter\n");
+}
+
+#[test]
+fn pointer_aggregate_derefs_through_the_stored_handle() {
+    let src = "@fieldwise_init\nstruct Borrowed[origin: Origin]:\n    var ptr: UnsafePointer[Int, Self.origin]\n\ndef main():\n    var value = 42\n    var b = Borrowed(UnsafePointer(to=value))\n    print(b.ptr[0])\n    b.ptr[0] = 9\n    print(value)\n";
+    assert_eq!(vm(src), "42\n9\n");
+}
+
+#[test]
+fn immutable_pointer_allows_concurrent_owner_reads() {
+    let src = "def observe(x: Int):\n    var p = UnsafePointer(to=x)\n    print(p[0], x)\n\ndef main():\n    observe(5)\n";
+    assert_eq!(vm(src), "5 5\n");
+}
+
+#[test]
 fn reference_valued_aggregate_preserves_and_writes_through_handle() {
     let src = "@fieldwise_init\nstruct RefBox[origin: Origin[mut=True]]:\n    var value: ref[origin] Int\n\ndef main():\n    var value = 40\n    ref alias = value\n    var box = RefBox(alias)\n    box.value += 2\n    print(value)\n";
     assert_eq!(parity(src), "42\n");

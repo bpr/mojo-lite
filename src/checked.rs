@@ -110,6 +110,13 @@ pub enum SemanticAdjustment {
         output_index: usize,
         checked: bool,
     },
+    /// Construct an origin-bearing pointer to existing checked storage
+    /// (`UnsafePointer(to=place)`). The checked pointer type retains the
+    /// inferred place origin; execution represents the value as a frame/slot
+    /// handle and erases the origin.
+    PointerToPlace {
+        mutable: bool,
+    },
     /// Descriptor types selected for a subscript's arguments. `None` denotes an
     /// ordinary index; `Some` denotes a source slice and records whether overload
     /// selection chose the contiguous, strided, or general Slice protocol.
@@ -273,7 +280,7 @@ impl CheckedProgram {
         expression_effects: HashMap<SourceSpan, EffectFacts>,
         iteration_protocols: HashMap<SourceSpan, IterationProtocol>,
         simd_constructions: HashMap<SourceSpan, (crate::ast::Dtype, i64)>,
-        variant_operations: HashMap<SourceSpan, SemanticAdjustment>,
+        operation_adjustments: HashMap<SourceSpan, SemanticAdjustment>,
         explicit_destroy_types: HashMap<String, ExplicitDestroyInfo>,
         explicit_destroy_calls: HashSet<SourceSpan>,
         reference_value_uses: HashMap<SourceSpan, bool>,
@@ -288,7 +295,7 @@ impl CheckedProgram {
             &expression_effects,
             &iteration_protocols,
             &simd_constructions,
-            &variant_operations,
+            &operation_adjustments,
             &overload_targets,
             &implicit_conversions,
             &explicit_destroy_calls,
@@ -372,7 +379,7 @@ fn build_checked_expressions(
     effects: &HashMap<SourceSpan, EffectFacts>,
     iteration_protocols: &HashMap<SourceSpan, IterationProtocol>,
     simd_constructions: &HashMap<SourceSpan, (crate::ast::Dtype, i64)>,
-    variant_operations: &HashMap<SourceSpan, SemanticAdjustment>,
+    operation_adjustments: &HashMap<SourceSpan, SemanticAdjustment>,
     calls: &HashMap<SourceSpan, String>,
     conversions: &HashMap<SourceSpan, String>,
     explicit_destroy: &HashSet<SourceSpan>,
@@ -389,7 +396,7 @@ fn build_checked_expressions(
         effects: &'a HashMap<SourceSpan, EffectFacts>,
         iteration_protocols: &'a HashMap<SourceSpan, IterationProtocol>,
         simd_constructions: &'a HashMap<SourceSpan, (crate::ast::Dtype, i64)>,
-        variant_operations: &'a HashMap<SourceSpan, SemanticAdjustment>,
+        operation_adjustments: &'a HashMap<SourceSpan, SemanticAdjustment>,
         calls: &'a HashMap<SourceSpan, String>,
         conversions: &'a HashMap<SourceSpan, String>,
         explicit_destroy: &'a HashSet<SourceSpan>,
@@ -568,12 +575,15 @@ fn build_checked_expressions(
                     width: *width,
                 });
             }
-            if let Some(operation) = self.variant_operations.get(&span) {
+            if let Some(operation) = self.operation_adjustments.get(&span) {
                 adjustments.push(operation.clone());
             }
-            let variant_projection = self.variant_operations.get(&span).is_some_and(|operation| {
-                matches!(operation, SemanticAdjustment::VariantProject { .. })
-            });
+            let variant_projection =
+                self.operation_adjustments
+                    .get(&span)
+                    .is_some_and(|operation| {
+                        matches!(operation, SemanticAdjustment::VariantProject { .. })
+                    });
             let category = match expression.kind {
                 Identifier(_) | Member { .. } | Index { .. } => ValueCategory::Place,
                 TypeApply { .. } if variant_projection => ValueCategory::Place,
@@ -752,7 +762,7 @@ fn build_checked_expressions(
         effects,
         iteration_protocols,
         simd_constructions,
-        variant_operations,
+        operation_adjustments,
         calls,
         conversions,
         explicit_destroy,

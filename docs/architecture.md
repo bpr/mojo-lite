@@ -1146,6 +1146,21 @@ binding, so the owner remains alive and conflicting access remains rejected unti
 the aggregate's final reference use. Stored `UnsafeAnyOrigin` is rejected because
 it would hide an untracked mutable capability behind an otherwise safe value.
 
+`UnsafePointer(to=place)` rides the same machinery. The checker infers
+`PointerOrigin::Place` from the source place — mutability follows the owner
+binding — and the checked pointer type retains that provenance through HIR and
+MIR while the VM value stays an origin-free frame/slot handle. Construction
+lowers to `MakeRef` plus a `BeginLoan` on the pointer binding; a stably bound
+pointer's `p[0]` deref substitutes the frozen owner place (`MirPlace::through`
+names the pointer), so owner liveness, ASAP destruction, and loan conflicts stay
+exact, while reassigned or field-loaded pointers read and write through their
+runtime handles. Aggregates that store place-origin pointers carry the owner
+loan exactly like reference-valued aggregates. Because an origin-bearing
+pointer designates one checked value rather than an allocation, the checker
+rejects non-zero offsets, pointer arithmetic and comparison, `free()`, writes
+through immutable provenance, and returns that would escape the origin
+(`returned pointer escapes storage outside its declared origin`).
+
 ### Loops
 
 Loops matter because a move in one iteration can affect the next iteration.

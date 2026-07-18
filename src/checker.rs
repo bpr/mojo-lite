@@ -565,7 +565,7 @@ pub fn check_program(stmts: &[Stmt]) -> Result<crate::checked::CheckedProgram, T
         checker.expression_effects.into_inner(),
         checker.iteration_protocols.into_inner(),
         checker.simd_constructions.into_inner(),
-        checker.variant_operations.into_inner(),
+        checker.operation_adjustments.into_inner(),
         explicit_destroy_types,
         checker.explicit_destroy_calls.into_inner(),
         checker.reference_value_uses.into_inner(),
@@ -757,9 +757,11 @@ pub struct Checker {
     overload_targets: RefCell<HashMap<SourceSpan, String>>,
     implicit_conversions: RefCell<HashMap<SourceSpan, String>>,
     simd_constructions: RefCell<HashMap<SourceSpan, (Dtype, i64)>>,
-    /// Checked `Variant` construction/tag/projection/update operations.  These
-    /// decisions cross the typed boundary so MIR never reinterprets syntax.
-    variant_operations: RefCell<HashMap<SourceSpan, crate::checked::SemanticAdjustment>>,
+    /// Checked operation decisions — `Variant` construction/tag/projection/
+    /// update and origin-bearing pointer construction — keyed by the source
+    /// expression.  These cross the typed boundary so MIR never reinterprets
+    /// syntax.
+    operation_adjustments: RefCell<HashMap<SourceSpan, crate::checked::SemanticAdjustment>>,
     declaration_types: RefCell<HashMap<crate::checked::AnnotationSite, Ty>>,
     expression_types: RefCell<HashMap<SourceSpan, Ty>>,
     expression_bindings: RefCell<HashMap<SourceSpan, crate::origin::OwnerId>>,
@@ -813,7 +815,7 @@ impl Checker {
             overload_targets: RefCell::new(HashMap::new()),
             implicit_conversions: RefCell::new(HashMap::new()),
             simd_constructions: RefCell::new(HashMap::new()),
-            variant_operations: RefCell::new(HashMap::new()),
+            operation_adjustments: RefCell::new(HashMap::new()),
             declaration_types: RefCell::new(HashMap::new()),
             expression_types: RefCell::new(HashMap::new()),
             expression_bindings: RefCell::new(HashMap::new()),
@@ -2156,7 +2158,7 @@ impl Checker {
                     .borrow_mut()
                     .insert(value.source_span(), declared.clone());
                 let aggregate_origins =
-                    if !matches!(declared, Ty::Ref(_)) && self.type_contains_reference(&declared) {
+                    if !matches!(declared, Ty::Ref(_)) && self.type_carries_loans(&declared) {
                         self.aggregate_origins(value)
                     } else {
                         Vec::new()
@@ -2209,13 +2211,12 @@ impl Checker {
                         if !self.is_binding_mutable(name) {
                             return Err(TypeError::ImmutableBinding(name.clone()));
                         }
-                        let aggregate_origins = if !matches!(target, Ty::Ref(_))
-                            && self.type_contains_reference(&target)
-                        {
-                            self.aggregate_origins(value)
-                        } else {
-                            Vec::new()
-                        };
+                        let aggregate_origins =
+                            if !matches!(target, Ty::Ref(_)) && self.type_carries_loans(&target) {
+                                self.aggregate_origins(value)
+                            } else {
+                                Vec::new()
+                            };
                         let target = match target {
                             Ty::Ref(reference) => *reference.referent,
                             other => other,
@@ -2247,7 +2248,7 @@ impl Checker {
                     None => {
                         let declared = self.inferred_binding_ty(&found, name)?;
                         let aggregate_origins = if !matches!(declared, Ty::Ref(_))
-                            && self.type_contains_reference(&declared)
+                            && self.type_carries_loans(&declared)
                         {
                             self.aggregate_origins(value)
                         } else {
@@ -2717,7 +2718,7 @@ impl Checker {
                         }
                         if result.is_ok()
                             && !matches!(bind_ty, Ty::Ref(_))
-                            && self.type_contains_reference(&bind_ty)
+                            && self.type_carries_loans(&bind_ty)
                             && let Some(owner) = self.lookup_owner(&param.name)
                         {
                             self.set_aggregate_origins(
@@ -3097,12 +3098,18 @@ impl Checker {
                 };
                 if let Some(expression) = expr
                     && !matches!(expected, Ty::Ref(_))
-                    && self.type_contains_reference(expected)
+                    && (self.type_carries_loans(expected) || self.type_carries_loans(&found))
                     && self
                         .aggregate_origins(expression)
                         .iter()
                         .any(|origin| self.aggregate_origin_escapes(origin))
                 {
+                    // A bare pointer return gets the pointer-specific
+                    // diagnostic; an aggregate may mix reference and pointer
+                    // loans and keeps the reference wording.
+                    if matches!(found, Ty::Pointer { .. }) {
+                        return Err(TypeError::PointerEscapesOrigin);
+                    }
                     return Err(TypeError::ReturnsReferenceToLocal);
                 }
                 if let (Some(e), Some(Some((signature, parameter_owners, self_owner)))) =
@@ -4401,7 +4408,7 @@ impl Checker {
         );
         if m.has_self {
             self.declare_with_mutability("self", self_ty.clone(), self_writable)?;
-            if self.type_contains_reference(self_ty)
+            if self.type_carries_loans(self_ty)
                 && let Some(owner) = self.lookup_owner("self")
             {
                 self.set_aggregate_origins(
@@ -4436,7 +4443,7 @@ impl Checker {
                 );
             }
             if !matches!(pty, Ty::Ref(_))
-                && self.type_contains_reference(&pty)
+                && self.type_carries_loans(&pty)
                 && let Some(owner) = self.lookup_owner(&p.name)
             {
                 self.set_aggregate_origins(
@@ -5684,7 +5691,7 @@ impl Checker {
             }
             ExprKind::TypeApply { name, .. }
                 if self
-                    .variant_operations
+                    .operation_adjustments
                     .borrow()
                     .get(&expr.source_span())
                     .is_some_and(|operation| {
@@ -5762,21 +5769,41 @@ impl Checker {
     }
 
     fn type_contains_reference(&self, ty: &Ty) -> bool {
-        fn contains(checker: &Checker, ty: &Ty, seen: &mut HashSet<String>) -> bool {
+        self.type_storage_contains(ty, false)
+    }
+
+    /// Whether storage of this type carries owner loans: reference-valued
+    /// leaves, or pointers whose provenance designates checked storage.
+    fn type_carries_loans(&self, ty: &Ty) -> bool {
+        self.type_storage_contains(ty, true)
+    }
+
+    fn type_storage_contains(&self, ty: &Ty, pointer_loans: bool) -> bool {
+        fn contains(
+            checker: &Checker,
+            ty: &Ty,
+            pointer_loans: bool,
+            seen: &mut HashSet<String>,
+        ) -> bool {
             match ty {
                 Ty::Ref(_) => true,
-                Ty::List(element) | Ty::Set(element) | Ty::Pointer { element, .. } => {
-                    contains(checker, element, seen)
+                Ty::Pointer { element, origin } => {
+                    (pointer_loans && origin.as_origin().is_some())
+                        || contains(checker, element, pointer_loans, seen)
+                }
+                Ty::List(element) | Ty::Set(element) => {
+                    contains(checker, element, pointer_loans, seen)
                 }
                 Ty::Dict(key, value) => {
-                    contains(checker, key, seen) || contains(checker, value, seen)
+                    contains(checker, key, pointer_loans, seen)
+                        || contains(checker, value, pointer_loans, seen)
                 }
                 Ty::Tuple(elements) => elements
                     .iter()
-                    .any(|element| contains(checker, element, seen)),
+                    .any(|element| contains(checker, element, pointer_loans, seen)),
                 Ty::Variant(alternatives) => alternatives
                     .iter()
-                    .any(|alternative| contains(checker, alternative, seen)),
+                    .any(|alternative| contains(checker, alternative, pointer_loans, seen)),
                 Ty::Struct(name, args) => {
                     let key = ty.to_string();
                     if !seen.insert(key.clone()) {
@@ -5787,7 +5814,7 @@ impl Checker {
                         info.fields
                             .iter()
                             .map(|(_, field)| substitute(field, &subst))
-                            .any(|field| contains(checker, &field, seen))
+                            .any(|field| contains(checker, &field, pointer_loans, seen))
                     });
                     seen.remove(&key);
                     result
@@ -5795,7 +5822,7 @@ impl Checker {
                 _ => false,
             }
         }
-        contains(self, ty, &mut HashSet::new())
+        contains(self, ty, pointer_loans, &mut HashSet::new())
     }
 
     fn type_contains_unsafe_any_pointer(ty: &Ty) -> bool {
@@ -5839,6 +5866,10 @@ impl Checker {
                 }
                 match self.lookup(name) {
                     Some(Ty::Ref(reference)) => vec![reference.origin.clone()],
+                    Some(Ty::Pointer { origin, .. }) => origin
+                        .as_origin()
+                        .map(|origin| vec![origin])
+                        .unwrap_or_default(),
                     _ => self
                         .lookup_reference_parameter(name)
                         .map(|reference| vec![reference.origin])
@@ -5877,6 +5908,24 @@ impl Checker {
             ExprKind::Call {
                 name, args, kwargs, ..
             } => {
+                // A checked pointer construction retains exactly its source
+                // place; the checker recorded the decision when it typed the
+                // call, so shadowed `UnsafePointer` names cannot match here.
+                if self
+                    .operation_adjustments
+                    .borrow()
+                    .get(&expression.source_span())
+                    .is_some_and(|operation| {
+                        matches!(
+                            operation,
+                            crate::checked::SemanticAdjustment::PointerToPlace { .. }
+                        )
+                    })
+                    && let Some(argument) = kwargs.first()
+                    && let Ok(place) = self.origin_place(&argument.value)
+                {
+                    return vec![Origin::Place(place)];
+                }
                 let mut result = Vec::new();
                 if let Some(info) = self.structs.get(name) {
                     if info.fieldwise_init {
@@ -6328,7 +6377,7 @@ impl Checker {
                     .or_else(|| Some(ty.clone())),
                 ExprKind::TypeApply { .. }
                     if self
-                        .variant_operations
+                        .operation_adjustments
                         .borrow()
                         .get(&expr.source_span())
                         .is_some_and(|operation| {
@@ -6465,6 +6514,28 @@ impl Checker {
                             } if actual_mutability == mutable
                         ),
                         _ => !matches!(actual.origin, crate::origin::Origin::Untracked { .. }),
+                    }
+            }
+            (
+                Ty::Pointer {
+                    element: actual_element,
+                    origin: actual_origin,
+                },
+                Ty::Pointer {
+                    element: expected_element,
+                    origin: expected_origin,
+                },
+            ) => {
+                coerces(actual_element, expected_element)
+                    && match (actual_origin, expected_origin) {
+                        // A concrete place provenance may bind a declared origin
+                        // parameter, but storage must not invent mutable
+                        // capability an immutable place never had.
+                        (
+                            crate::origin::PointerOrigin::Place { mutable, .. },
+                            crate::origin::PointerOrigin::Param { mutability, .. },
+                        ) => *mutable || *mutability == crate::origin::Mutability::Immutable,
+                        _ => actual_origin == expected_origin,
                     }
             }
             (Ty::Tuple(actual), Ty::Tuple(expected)) => {
@@ -6752,7 +6823,7 @@ impl Checker {
                             .borrow_mut()
                             .insert(expr.source_span(), owner);
                     }
-                    self.variant_operations.borrow_mut().insert(
+                    self.operation_adjustments.borrow_mut().insert(
                         expr.source_span(),
                         crate::checked::SemanticAdjustment::VariantProject {
                             alternatives,
@@ -6821,7 +6892,7 @@ impl Checker {
                             got: args.len(),
                         });
                     }
-                    self.variant_operations.borrow_mut().insert(
+                    self.operation_adjustments.borrow_mut().insert(
                         span,
                         crate::checked::SemanticAdjustment::VariantIs {
                             alternatives,
@@ -6847,7 +6918,7 @@ impl Checker {
                     }
                     let requested =
                         self.type_param_argument(&param_args[0], "Variant.is_type_supported")?;
-                    self.variant_operations.borrow_mut().insert(
+                    self.operation_adjustments.borrow_mut().insert(
                         span,
                         crate::checked::SemanticAdjustment::VariantTypeSupported {
                             supported: alternatives.contains(&requested),
@@ -6875,7 +6946,7 @@ impl Checker {
                         });
                     }
                     self.check_consuming(&args[0], &actual, "argument to 'Variant.set'")?;
-                    self.variant_operations.borrow_mut().insert(
+                    self.operation_adjustments.borrow_mut().insert(
                         span,
                         crate::checked::SemanticAdjustment::VariantSet {
                             alternatives,
@@ -6900,7 +6971,7 @@ impl Checker {
                             reason: "consuming receiver must be an owned place".to_string(),
                         });
                     }
-                    self.variant_operations.borrow_mut().insert(
+                    self.operation_adjustments.borrow_mut().insert(
                         span,
                         crate::checked::SemanticAdjustment::VariantTake {
                             alternatives,
@@ -6968,7 +7039,7 @@ impl Checker {
                         &actual,
                         &format!("argument to 'Variant.{field}'"),
                     )?;
-                    self.variant_operations.borrow_mut().insert(
+                    self.operation_adjustments.borrow_mut().insert(
                         span,
                         crate::checked::SemanticAdjustment::VariantReplace {
                             alternatives,
@@ -7285,7 +7356,7 @@ impl Checker {
                 context: "Variant payload".to_string(),
             });
         }
-        self.variant_operations.borrow_mut().insert(
+        self.operation_adjustments.borrow_mut().insert(
             span,
             crate::checked::SemanticAdjustment::ConstructVariant {
                 alternatives: alternatives.clone(),
@@ -7438,7 +7509,13 @@ impl Checker {
                         return Ok((**value).clone());
                     }
                     // A pointer store `ptr[i] = e`: the target is the pointee type.
-                    Ty::Pointer { element, .. } => (**element).clone(),
+                    // An origin-bearing pointer designates one value and its
+                    // provenance must carry mutable capability.
+                    Ty::Pointer { element, origin } => {
+                        self.check_pointer_offset(origin, index)?;
+                        self.check_pointer_write(origin)?;
+                        (**element).clone()
+                    }
                     // A SIMD lane write `v[i] = e`: the target is the width-1 scalar.
                     Ty::Simd { dtype, .. } => simd_ty(*dtype, 1),
                     _ => return Err(TypeError::NotIndexable(obj_ty.to_string())),
@@ -7477,7 +7554,7 @@ impl Checker {
                         .borrow_mut()
                         .insert(place.source_span(), target);
                 }
-                self.variant_operations.borrow_mut().insert(
+                self.operation_adjustments.borrow_mut().insert(
                     place.source_span(),
                     crate::checked::SemanticAdjustment::SliceDescriptors {
                         descriptors: vec![Some(kind)],
@@ -7524,7 +7601,7 @@ impl Checker {
                         .borrow_mut()
                         .insert(place.source_span(), target);
                 }
-                self.variant_operations.borrow_mut().insert(
+                self.operation_adjustments.borrow_mut().insert(
                     place.source_span(),
                     crate::checked::SemanticAdjustment::SliceDescriptors {
                         descriptors,
@@ -7546,7 +7623,7 @@ impl Checker {
                     return Err(TypeError::InvalidAssignTarget(name.clone()));
                 };
                 let (index, alternative) = self.variant_alternative(&alternatives, args)?;
-                self.variant_operations.borrow_mut().insert(
+                self.operation_adjustments.borrow_mut().insert(
                     place.source_span(),
                     crate::checked::SemanticAdjustment::VariantProject {
                         alternatives,
@@ -7614,7 +7691,7 @@ impl Checker {
             }
             _ => return Err(TypeError::NotIndexable(object_type.to_string())),
         };
-        self.variant_operations.borrow_mut().insert(
+        self.operation_adjustments.borrow_mut().insert(
             span,
             crate::checked::SemanticAdjustment::SliceDescriptors {
                 descriptors: vec![Some(kind)],
@@ -7665,7 +7742,7 @@ impl Checker {
                 .borrow_mut()
                 .insert(span.clone(), target);
         }
-        self.variant_operations.borrow_mut().insert(
+        self.operation_adjustments.borrow_mut().insert(
             span,
             crate::checked::SemanticAdjustment::SliceDescriptors {
                 descriptors,
@@ -7960,7 +8037,10 @@ impl Checker {
                 }
                 return Ok((**value).clone());
             }
-            Ty::Pointer { element, .. } => (**element).clone(),
+            Ty::Pointer { element, origin } => {
+                self.check_pointer_offset(origin, index)?;
+                (**element).clone()
+            }
             _ => return Err(TypeError::NotIndexable(obj_ty.to_string())),
         };
         let idx_ty = self.infer(index)?;
@@ -7975,6 +8055,48 @@ impl Checker {
             Ty::Ref(reference) => *reference.referent,
             other => other,
         })
+    }
+
+    /// An origin-bearing pointer designates exactly one checked value, so only
+    /// offset 0 can be dereferenced; any other offset would be out-of-provenance
+    /// access that Mojo leaves undefined.
+    fn check_pointer_offset(
+        &self,
+        origin: &crate::origin::PointerOrigin,
+        index: &Expr,
+    ) -> Result<(), TypeError> {
+        if origin.as_origin().is_none() {
+            return Ok(());
+        }
+        match self.eval_ct(index) {
+            Ok(0) => Ok(()),
+            _ => Err(TypeError::Unsupported(
+                "an origin-bearing UnsafePointer designates a single value; only \
+                 offset 0 can be dereferenced"
+                    .to_string(),
+            )),
+        }
+    }
+
+    /// Reject a write through an origin-bearing pointer whose provenance does
+    /// not carry mutable capability. A symbolic parameter mutability is
+    /// writable: storage coercion only admits mutable places into fields whose
+    /// declared mutability is not explicitly immutable.
+    fn check_pointer_write(&self, origin: &crate::origin::PointerOrigin) -> Result<(), TypeError> {
+        let writable = match origin {
+            crate::origin::PointerOrigin::Place { mutable, .. } => *mutable,
+            crate::origin::PointerOrigin::Param { mutability, .. } => {
+                *mutability != crate::origin::Mutability::Immutable
+            }
+            _ => return Ok(()),
+        };
+        if writable {
+            Ok(())
+        } else {
+            Err(TypeError::Unsupported(
+                "cannot write through an UnsafePointer with an immutable origin".to_string(),
+            ))
+        }
     }
 
     /// Whether a value can be normalized to the VM's index representation.
@@ -8247,9 +8369,13 @@ impl Checker {
             return self.infer_tuple_method(method, elements, args);
         }
         // Built-in `UnsafePointer` methods (`free`).
-        if let Ty::Pointer { element: elem, .. } = &obj_ty {
+        if let Ty::Pointer {
+            element: elem,
+            origin,
+        } = &obj_ty
+        {
             reject_kwargs(kwargs)?;
-            return self.infer_pointer_method(method, elem, args);
+            return self.infer_pointer_method(method, elem, origin, args);
         }
         // Resolve the method to a concrete signature (params + return + whether
         // it mutates `self`) for this receiver, substituting the receiver's type
@@ -8930,10 +9056,18 @@ impl Checker {
         &self,
         method: &str,
         elem: &Ty,
+        origin: &crate::origin::PointerOrigin,
         args: &[Expr],
     ) -> Result<Ty, TypeError> {
         match method {
             "free" => {
+                if origin.as_origin().is_some() {
+                    return Err(TypeError::Unsupported(
+                        "free() is not supported on an origin-bearing UnsafePointer; \
+                         it does not own an allocation"
+                            .to_string(),
+                    ));
+                }
                 if !args.is_empty() {
                     return Err(TypeError::ArityMismatch {
                         name: "free".to_string(),
@@ -9486,6 +9620,21 @@ impl Checker {
         if matches!(lt, Ty::Simd { .. }) || matches!(rt, Ty::Simd { .. }) {
             return self.infer_simd_infix(op, &lt, &rt);
         }
+        // Arithmetic and identity comparison reason about allocation layout,
+        // which an origin-bearing pointer to a single checked value does not
+        // have; Mojo leaves such use undefined, so Mojito rejects it early.
+        let origin_bearing =
+            |ty: &Ty| matches!(ty, Ty::Pointer { origin, .. } if origin.as_origin().is_some());
+        if matches!(op, Add | Sub | Eq | Ne)
+            && (origin_bearing(&lt) || origin_bearing(&rt))
+            && (matches!(lt, Ty::Pointer { .. }) || matches!(rt, Ty::Pointer { .. }))
+        {
+            return Err(TypeError::Unsupported(
+                "pointer arithmetic and comparison are not supported on an \
+                 origin-bearing UnsafePointer"
+                    .to_string(),
+            ));
+        }
         if let Ty::Pointer { element, .. } = &lt {
             match (op, &rt) {
                 (Add | Sub, Ty::Int | Ty::IntLiteral) => return Ok(lt.clone()),
@@ -9771,6 +9920,58 @@ impl Checker {
         Ok(Ty::Struct("Slice".to_string(), Vec::new()))
     }
 
+    /// Type `UnsafePointer(to=place)`: an origin-bearing pointer to existing
+    /// checked storage. The element type is the place's type and the origin is
+    /// the place itself, so loan analysis keeps the owner alive and rejects
+    /// conflicting access. Execution represents the value as a frame/slot
+    /// handle; only the VM erases the origin.
+    fn infer_pointer_to(
+        &self,
+        span: SourceSpan,
+        param_args: &[crate::ast::ParamArg],
+        args: &[Expr],
+        kwargs: &[crate::ast::KwArg],
+    ) -> Result<Ty, TypeError> {
+        if !param_args.is_empty() {
+            return Err(TypeError::Unsupported(
+                "UnsafePointer(to=...) infers its element type; explicit type \
+                 arguments are not supported"
+                    .to_string(),
+            ));
+        }
+        if !args.is_empty() || kwargs.len() != 1 || kwargs[0].name != "to" {
+            return Err(TypeError::BadCall {
+                func: "UnsafePointer".to_string(),
+                reason: "expected exactly one 'to=' keyword argument".to_string(),
+            });
+        }
+        let value = &kwargs[0].value;
+        if let ExprKind::Identifier(name) = &value.kind
+            && (matches!(self.lookup(name), Some(Ty::Ref(_)))
+                || self.lookup_reference_parameter(name).is_some())
+        {
+            return Err(TypeError::Unsupported(
+                "UnsafePointer(to=...) through a 'ref' binding is not supported yet".to_string(),
+            ));
+        }
+        let place = self.origin_place(value).map_err(|error| match error {
+            TypeError::UndefinedVariable(_) => error,
+            _ => TypeError::Unsupported(
+                "UnsafePointer(to=...) requires a place expression".to_string(),
+            ),
+        })?;
+        let element = self.infer(value)?;
+        let mutable = self.owner_is_mutable(place.root);
+        self.operation_adjustments.borrow_mut().insert(
+            span,
+            crate::checked::SemanticAdjustment::PointerToPlace { mutable },
+        );
+        Ok(Ty::Pointer {
+            element: Box::new(element),
+            origin: crate::origin::PointerOrigin::Place { place, mutable },
+        })
+    }
+
     fn infer_call(
         &self,
         span: SourceSpan,
@@ -9792,6 +9993,9 @@ impl Checker {
             None => match name {
                 _ if self.structs.contains_key(name) => {
                     return self.infer_construction(span, name, param_args, args, kwargs);
+                }
+                "UnsafePointer" if !kwargs.is_empty() => {
+                    return self.infer_pointer_to(span, param_args, args, kwargs);
                 }
                 _ if !kwargs.is_empty() => {
                     return Err(TypeError::BadCall {

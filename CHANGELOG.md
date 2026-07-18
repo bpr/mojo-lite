@@ -8,6 +8,18 @@ to evolve under the `0.x` compatibility rules.
 
 ### Added
 
+- `UnsafePointer(to=place)` infers an origin-bearing pointer whose provenance is
+  the concrete source place, with mutability taken from the owner binding. The
+  checked pointer type retains the origin through HIR and MIR; the VM represents
+  the value as an origin-free frame/slot handle. Pointer bindings and
+  pointer-storing aggregates carry executable owner loans: the owner stays alive
+  through the pointer's last use, and overlapping access, owner invalidation,
+  and dangling escapes (`PointerEscapesOrigin`) are rejected statically. A place
+  pointer binds a declared field origin parameter at aggregate-storage sites
+  without inventing mutable capability, and non-zero offsets, arithmetic,
+  comparison, and `free()` on origin-bearing pointers are rejected as a strict
+  subset.
+
 - Source imports now follow the current source-side namespace rules: source
   packages beat same-named source modules, ordinary directories can form dotted
   namespace paths, every dotted prefix binds, and submodules require explicit

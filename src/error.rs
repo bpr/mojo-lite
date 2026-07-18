@@ -123,6 +123,9 @@ pub enum TypeError {
     ImmutableBinding(String),
     /// A reference return is rooted in storage not named by its declared origin.
     ReturnsReferenceToLocal,
+    /// An origin-bearing pointer would outlive the checked storage it
+    /// designates, e.g. returning `UnsafePointer(to=local)`.
+    PointerEscapesOrigin,
     /// A function value tried to escape by being returned (downward funargs
     /// only). The static counterpart of `RuntimeError::ClosureEscape`.
     ClosureEscape,
@@ -411,6 +414,12 @@ impl fmt::Display for TypeError {
                 write!(
                     f,
                     "returned reference escapes storage outside its declared origin"
+                )
+            }
+            TypeError::PointerEscapesOrigin => {
+                write!(
+                    f,
+                    "returned pointer escapes storage outside its declared origin"
                 )
             }
             TypeError::ClosureEscape => {

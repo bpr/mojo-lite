@@ -26,6 +26,43 @@ fn ownership_reports_invalid_unchecked_input_instead_of_panicking() {
 }
 
 #[test]
+fn pointer_loan_blocks_owner_access_while_live() {
+    let src =
+        "def main():\n    var x = 1\n    var p = UnsafePointer(to=x)\n    x = 5\n    print(p[0])\n";
+    assert!(matches!(own(src), Err(OwnershipError::LoanConflict { .. })));
+}
+
+#[test]
+fn pointer_loan_transfers_through_copies() {
+    let src = "def main():\n    var x = 1\n    var p = UnsafePointer(to=x)\n    var q = p\n    x = 5\n    print(q[0])\n";
+    assert!(matches!(own(src), Err(OwnershipError::LoanConflict { .. })));
+}
+
+#[test]
+fn owner_move_while_pointer_live_is_rejected() {
+    // The stable-pointer deref substitutes the owner place, so the post-move
+    // access surfaces as a use-after-move on the owner; a handle-carried
+    // pointer would surface the same invalidation as a loan conflict.
+    let src = "@fieldwise_init\nstruct Cell:\n    var n: Int\n\ndef main():\n    var cell = Cell(1)\n    var p = UnsafePointer(to=cell.n)\n    var moved = cell^\n    print(p[0])\n";
+    assert!(matches!(
+        own(src),
+        Err(OwnershipError::UseAfterMove { .. } | OwnershipError::LoanConflict { .. })
+    ));
+}
+
+#[test]
+fn pointer_aggregate_extends_the_owner_loan() {
+    let src = "@fieldwise_init\nstruct Borrowed[origin: Origin]:\n    var ptr: UnsafePointer[Int, Self.origin]\n\ndef main():\n    var value = 40\n    var b = Borrowed(UnsafePointer(to=value))\n    value += 1\n    print(b.ptr[0])\n";
+    assert!(matches!(own(src), Err(OwnershipError::LoanConflict { .. })));
+}
+
+#[test]
+fn dead_pointer_releases_its_owner_loan() {
+    let src = "def main():\n    var x = 1\n    var p = UnsafePointer(to=x)\n    p[0] = 2\n    x = 5\n    print(x)\n";
+    assert!(own(src).is_ok());
+}
+
+#[test]
 fn reference_aggregate_extends_the_owner_loan() {
     let src = "@fieldwise_init\nstruct RefBox[origin: Origin[mut=True]]:\n    var value: ref[origin] Int\n\ndef main():\n    var value = 40\n    ref alias = value\n    var box = RefBox(alias)\n    value += 1\n    print(box.value)\n";
     assert!(matches!(own(src), Err(OwnershipError::LoanConflict { .. })));

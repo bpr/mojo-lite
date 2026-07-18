@@ -2688,6 +2688,101 @@ fn checks_current_pointer_origin_aggregate_fields() {
 }
 
 #[test]
+fn pointer_to_place_infers_an_origin_bearing_pointer() {
+    ok("def main():\n    var x = 42\n    var p = UnsafePointer(to=x)\n    print(p[0])\n");
+    ok("def main():\n    var xs = [1, 2]\n    var p = UnsafePointer(to=xs[0])\n    print(p[0])\n");
+    ok(
+        "@fieldwise_init\nstruct Pair:\n    var a: Int\n    var b: Int\n\ndef main():\n    var pair = Pair(1, 2)\n    var p = UnsafePointer(to=pair.b)\n    p[0] = 3\n",
+    );
+}
+
+#[test]
+fn pointer_to_place_requires_a_single_to_keyword_place() {
+    assert!(matches!(
+        err("def main():\n    var p = UnsafePointer(to=1 + 2)\n"),
+        TypeError::Unsupported(message) if message.contains("requires a place expression")
+    ));
+    assert!(matches!(
+        err("def main():\n    var x = 1\n    var p = UnsafePointer(at=x)\n"),
+        TypeError::BadCall { .. }
+    ));
+    assert!(matches!(
+        err("def main():\n    var x = 1\n    var p = UnsafePointer[Int](to=x)\n"),
+        TypeError::Unsupported(message) if message.contains("explicit type")
+    ));
+    assert!(matches!(
+        err("def main():\n    var x = 1\n    ref alias = x\n    var p = UnsafePointer(to=alias)\n"),
+        TypeError::Unsupported(message) if message.contains("'ref' binding")
+    ));
+}
+
+#[test]
+fn origin_bearing_pointer_writes_require_mutable_provenance() {
+    ok("def main():\n    var x = 1\n    var p = UnsafePointer(to=x)\n    p[0] = 2\n");
+    assert!(matches!(
+        err("def f(x: Int):\n    var p = UnsafePointer(to=x)\n    p[0] = 1\n\ndef main():\n    f(3)\n"),
+        TypeError::Unsupported(message) if message.contains("immutable origin")
+    ));
+}
+
+#[test]
+fn origin_bearing_pointer_rejects_allocation_operations() {
+    assert!(matches!(
+        err("def main():\n    var x = 1\n    var p = UnsafePointer(to=x)\n    print(p[1])\n"),
+        TypeError::Unsupported(message) if message.contains("only offset 0")
+    ));
+    assert!(matches!(
+        err("def main():\n    var x = 1\n    var p = UnsafePointer(to=x)\n    var q = p + 1\n"),
+        TypeError::Unsupported(message) if message.contains("arithmetic and comparison")
+    ));
+    assert!(matches!(
+        err(
+            "def main():\n    var x = 1\n    var p = UnsafePointer(to=x)\n    var q = UnsafePointer(to=x)\n    print(p == q)\n"
+        ),
+        TypeError::Unsupported(message) if message.contains("arithmetic and comparison")
+    ));
+    assert!(matches!(
+        err("def main():\n    var x = 1\n    var p = UnsafePointer(to=x)\n    p.free()\n"),
+        TypeError::Unsupported(message) if message.contains("does not own an allocation")
+    ));
+}
+
+#[test]
+fn returned_place_pointer_is_a_precise_escape_error() {
+    assert!(matches!(
+        err(
+            "def escape() -> UnsafePointer[Int]:\n    var local = 7\n    return UnsafePointer(to=local)\n\ndef main():\n    print(1)\n"
+        ),
+        TypeError::PointerEscapesOrigin
+    ));
+}
+
+#[test]
+fn pointer_aggregates_bind_declared_origin_parameters_per_binding() {
+    // A mutable place binds a symbolic or mutable field origin.
+    ok(
+        "@fieldwise_init\nstruct Borrowed[origin: Origin]:\n    var ptr: UnsafePointer[Int, Self.origin]\n\ndef main():\n    var value = 42\n    var b = Borrowed(UnsafePointer(to=value))\n    print(b.ptr[0])\n",
+    );
+    // An immutable place binds only an explicitly immutable field origin, and
+    // writes through the stored pointer stay rejected.
+    ok(
+        "@fieldwise_init\nstruct View[origin: Origin[mut=False]]:\n    var ptr: UnsafePointer[Int, Self.origin]\n\ndef f(x: Int):\n    var v = View(UnsafePointer(to=x))\n    print(v.ptr[0])\n\ndef main():\n    f(3)\n",
+    );
+    assert!(matches!(
+        err(
+            "@fieldwise_init\nstruct Borrowed[origin: Origin]:\n    var ptr: UnsafePointer[Int, Self.origin]\n\ndef f(x: Int):\n    var b = Borrowed(UnsafePointer(to=x))\n\ndef main():\n    f(3)\n"
+        ),
+        TypeError::TypeMismatch { .. }
+    ));
+    assert!(matches!(
+        err(
+            "@fieldwise_init\nstruct View[origin: Origin[mut=False]]:\n    var ptr: UnsafePointer[Int, Self.origin]\n\ndef f(x: Int):\n    var v = View(UnsafePointer(to=x))\n    v.ptr[0] = 1\n\ndef main():\n    f(3)\n"
+        ),
+        TypeError::Unsupported(message) if message.contains("immutable origin")
+    ));
+}
+
+#[test]
 fn checks_ref_self_return_origin() {
     assert!(check_source(
         "@fieldwise_init\nstruct Box:\n    var value: Int\n    def get(ref self) -> ref[self] Int:\n        return self.value\n"

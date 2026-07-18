@@ -72,6 +72,22 @@ pub enum PointerOrigin {
     },
 }
 
+impl PointerOrigin {
+    /// The loan-tracked [`Origin`] a pointer provenance corresponds to, when it
+    /// designates checked storage. `Legacy`, `Static`, `Untracked`, and
+    /// `UnsafeAny` pointers carry no owner loan.
+    pub fn as_origin(&self) -> Option<Origin> {
+        match self {
+            PointerOrigin::Place { place, .. } => Some(Origin::Place(place.clone())),
+            PointerOrigin::Param { id, .. } => Some(Origin::Param(*id)),
+            PointerOrigin::Legacy
+            | PointerOrigin::Static
+            | PointerOrigin::Untracked { .. }
+            | PointerOrigin::UnsafeAny { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Checked reference type: referent, storage origin, and access permission.
 pub struct RefTy {
