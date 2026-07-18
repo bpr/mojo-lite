@@ -1,3 +1,5 @@
-# The walrus operator parses and type-checks but is unsupported at eval.
-# expect: walrus
-var first: Int = (n := 5)
+# Walrus evaluation occurs before the later runtime failure.
+# expect: boom
+def main() raises:
+    var first: Int = (n := 5)
+    raise Error("boom")

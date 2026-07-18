@@ -37,6 +37,9 @@ remain as compatibility mirrors for now, so legacy examples such as
 - `std/collections/hashdict.mojo` — a hash-backed, insertion-ordered
   `HashDict[K, V]`: dense entries preserve order while `List[List[Int]]` buckets
   index them. It grows and rehashes explicitly and mirrors the `Dict` API.
+- `std/collections/string_dict.mojo` — the insertion-ordered owning
+  `StringDict[V]` used for homogeneous `**kwargs`; the VM constructs it in the
+  callee frame and consumes it for `**kwargs^` forwarding.
 - `std/algorithms.mojo` — small generic helpers that exercise comptime-guided library
   code: type predicates, CTFE-computed constants, value parameters, and associated
   compile-time facts. It includes `first_or[C: Iterable]`, which consumes

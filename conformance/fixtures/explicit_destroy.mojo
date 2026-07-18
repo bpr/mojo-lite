@@ -1,5 +1,5 @@
 @explicit_destroy("close the resource")
-struct Resource:
+struct Resource(ImplicitlyDeletable where False):
     var id: Int
 
     def __init__(out self, id: Int):

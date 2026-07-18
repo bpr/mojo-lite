@@ -8,7 +8,7 @@ struct Dog(Animal):
     def make_sound(self):
         print("Woof!")
 
-def bark[T: Animal](read a: T):
+def bark[T: Animal](imm a: T):
     a.make_sound()
 
 def main():

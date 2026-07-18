@@ -1,9 +1,10 @@
 # Mojito Roadmap
 
 This is the project's single task tracker. It records the project's direction,
-current capabilities, and a mostly dependency-ordered list of unfinished work.
-The ordered list contains only pending or demand-driven tasks; completed tasks
-do not remain there as checked boxes.
+current capabilities, and a dependency-ordered list of unfinished work.
+**Ordered Work** contains only pending tasks; completed tasks do not remain
+there as checked boxes. Its first unchecked item is the recommended next
+implementation task, and subsequent work proceeds from top to bottom.
 
 The north star is self-hosting: useful standard-library code should expose the
 next missing compiler capability. Prefer the smallest honest language change
@@ -41,150 +42,182 @@ that unlocks a real library pattern, with positive and negative tests.
 - [x] **Overload rejection hardening** — duplicate, ambiguity, no-match,
   generic-ranking, bound-symbol, nested-def, and namespace regressions are pinned
   by the required overload rejection suite.
-- [x] **Versioned CPU-parity ledger** — the pinned Mojo 1.0.0b2 manual inventory
+- [x] **Versioned CPU-parity ledger** — the Mojo manual inventory and pinned
+  nightly target in `docs/mojo-nightly.md`
   classifies each feature family as parity, strict subset, divergence,
   representation difference, exclusion, or stretch, with validated evidence.
 - [x] **Differential CPU conformance baseline** — shared fixtures exercise every
   implemented first-pass match plus representative subset and divergence edges
   against the pinned Mojo build; manifest validation requires executable evidence
   for parity and divergence claims.
-- [x] **Trait refinement and protocol foundation** — refined traits inherit
-  requirements and capabilities, default bodies materialize statically with
-  override/ambiguity rules, opaque bounded indexing dispatches, incremental
-  hashing has a self-hosted proof, and user formatting is capability-gated.
+- [x] **Core protocol contracts** — refined traits inherit requirements and
+  capabilities; associated-type equalities compose; conditional conformances
+  solve after specialization; and current Indexer, incremental Hasher, Writer,
+  and Writable formatting contracts have checked, self-hosted proofs.
+- [x] **Current lifecycle, conversion, and linearity semantics** — `@implicit`
+  constructors participate in overload ranking and lower as explicit selected
+  conversions. `imm` is the preferred
+  immutable convention (`read` remains a compatibility spelling), ordinary
+  values are implicitly deletable, and `ImplicitlyDeletable where False`
+  creates explicit-destruction obligations independently of the required
+  `@explicit_destroy("message")` diagnostic decorator. Obligations decompose
+  into stable field paths after partial moves, linear fields can be destroyed
+  independently, residual ordinary fields drop normally, and reconstructing all
+  moved fields restores the whole-value destructor.
+- [x] **Current constraints and scalar identity** — generic constraints use only
+  trailing `where`, type predicates use `==`/`!=`, and pack-wide
+  `conforms_to(Ts.values, Trait)` checks every heterogeneous type value. `Int`
+  canonicalizes with `Scalar[DType.int]`; `SIMDSize` is a compile-time width
+  parameter type and `_` infers construction width from explicit lanes.
+- [x] **Current source imports, keyword forwarding, and slicing** — source
+  packages win over same-named source modules, dotted imports bind every prefix,
+  ordinary directories form namespace paths, and package members require an
+  explicit import or initializer re-export. Homogeneous free-function keyword
+  collectors are owned `StringDict[T]` values and forward with `**kwargs^`.
+  Slice syntax selects `ContiguousSlice` or `StridedSlice`, preserves optional
+  bounds, normalizes through `indices()`, and dispatches mixed or variadic
+  `__getitem__`/`__setitem__` arguments through checked overloads.
+- [x] **Generalized parameters and specialization** — type, value, origin,
+  inferred, defaulted, dependent, and variadic parameters share one binder;
+  trailing constraints, heterogeneous packs, nested specialization, structural
+  cache keys, compile-time values, reflected type/declaration facts, and
+  declaration-producing compile-time branches are checked before runtime
+  lowering. The latest reflected-field handle spelling remains the first task
+  below.
+- [x] **Callable and closure completion** — overloaded and contextual generic
+  callable values execute indirectly; explicit `unified { ... }` capture lists
+  preserve immutable, mutable, moved, and reference captures; sibling calls,
+  recursion, and non-escaping generic closures run without write-back emulation.
+- [x] **CPU control and expression surface** — path-joined late initialization
+  and implicit bindings, context managers, loop `else`, reference iteration,
+  declaration destructuring, t-string interpolation, walrus expressions, and
+  the remaining CPU operators have checked lowering and VM coverage. The
+  remaining function-scope flow edge and owned iteration are listed below.
+- [x] **Literal-family completion** — current numeric separators, radices,
+  leading/trailing decimal points, exponents, raw strings, multiline strings,
+  adjacent strings, and adjacent t-strings preserve their lexical and
+  interpolation boundaries. Arbitrary-precision evaluation and lazy `TString`
+  materialization remain explicitly scoped to the MIR-schema-prerequisite
+  milestone below.
+- [x] **Tuple and Variant completion** — bare and typed tuples, destructuring,
+  compile-time indexing, structural operations, heterogeneous pack construction,
+  and consuming operations run. `std.utils.Variant` has checked construction,
+  membership tests, projection, mutation, consuming extraction, replacement,
+  tag-aware places, moves, and element-wise protocol gating; additional library
+  API breadth remains in the CPU standard-library milestone below.
+- [x] **Reference aggregates** — direct and nested tuple/list reference storage,
+  explicit-origin reference fields, aggregate moves, escape checks, owner-loan
+  propagation, initialization, projection, and immutable-write rejection run
+  through checked HIR/MIR and frame/slot handles. Direct `ref` fields are a
+  documented Mojito extension; current Mojo's origin-bearing pointer aggregate
+  model is the first remaining task below.
+- [x] **Unsafe-pointer execution base** — pointer provenance, typed arithmetic,
+  comparisons/conversions, alignment-aware allocation, explicit deallocation,
+  dangling placeholders, and invalid/double-free diagnostics execute. Checked
+  pointer types retain named, static, untracked, and unsafe-any origin kinds, and
+  aggregate fields reject hidden unsafe-any origins.
+- [x] **Typed checked boundary through HIR** — stable checked expression and
+  declaration identities retain resolved types, binding/place categories,
+  effects, origins, semantic adjustments, and recursively checked children. HIR
+  carries those facts into CFGs and typed places; MIR no longer reconstructs
+  semantics from source AST or source annotations.
 
 ## Ordered Work
 
-The order below expresses dependencies, not a promise that every item must be
-implemented. Demand-driven items should be promoted only when a concrete stdlib
-or user program needs them.
+Every entry is in implementation order. The first unchecked checkbox is the
+default next task.
 
-### 1. Close Lifecycle And Call-Semantic Gaps
+### 1. Close Remaining Nightly CPU Language Gaps
 
-- [x] **Current lifecycle trait vocabulary** — implement
-  `ImplicitlyDestructible` throughout generic constraint and explicit-destroy
-  checking, migrate bundled sources away from `ImplicitlyDeletable`, and then
-  reject the obsolete trait name. Legacy `__copyinit__`/`__moveinit__` may remain
-  a documented compatibility extension while bundled code migrates to unified
-  `__init__(copy=)`/`__init__(move=)` declarations.
-- [x] **User-defined implicit conversions** — retain and validate `@implicit`
-  constructors, include their conversion cost in overload ranking, lower the
-  selected conversion explicitly, and reject ambiguous or effect-incompatible
-  conversions. This is independent of explicit-destroy analysis and can land
-  before that larger chain.
-- [x] **Explicit-destroy declaration semantics** — retain `@explicit_destroy`
-  and its diagnostic message in checked/MIR type metadata; require at least one
-  named `deinit self` method; attach explicit-destroy type facts to MIR variables;
-  suppress automatic `DropVar` destruction.
-- [x] **Explicit-destroy obligation analysis** — track obligations for initialized
-  values through moves, partial moves, branches, loops, returns, and exceptional
-  regions; discharge only through an explicit consuming destructor; reject
-  abandonment, conditional destruction, and double destruction.
-- [x] **Raising explicit destruction** — preserve an obligation when a raising
-  destructor fails so an `except` path can select another destructor; verify that
-  every normal and handled-error exit discharges exactly once.
+- [ ] **Current reflected-field handles** — replace the legacy
+  `Reflected.field_type[name]()` query with chainable `.field[name]` and
+  `.field_at[index]` handles whose `.T` exposes the selected type. Migrate bundled
+  code and turn the legacy spelling into a rejection case.
+- [ ] **Keyword collectors across call kinds** — support generic and method
+  `**kwargs: T` collectors plus consuming `**kwargs^` forwarding through the
+  same binder, specialization, duplicate detection, and origin/effect checks as
+  ordinary free functions.
+- [ ] **Literal-default overload selection** — apply Mojo's contextual default
+  type for otherwise-unconstrained integer and floating literals before declaring
+  an overload set ambiguous, while preserving ambiguity for genuinely equivalent
+  conversions.
+- [ ] **Function-scoped implicit-binding flow** — make an implicit binding
+  introduced in a nested block visible throughout its function while retaining
+  path-sensitive definite-initialization errors on paths that do not assign it.
+- [ ] **Trait-requirement effects** — carry `raises` and typed error facts through
+  trait requirements, conforming methods, bounded dispatch, and selected calls so
+  MIR effect verification receives the same contract as direct calls.
+- [ ] **Owned iteration** — implement `for var item in collection^` as consuming
+  iteration over non-Copyable elements, including residual collection state,
+  early exits, and conditional implicit-deletion/explicit-destroy obligations.
+- [ ] **Collection displays and comprehensions** — add set and dictionary
+  displays plus CPU collection comprehensions with checked evaluation order,
+  inference, ownership, and protocol-based construction.
 
-### 2. Finish Traits And Core Protocol Contracts
+### 2. Complete References And Unsafe Pointers
 
-- [ ] **Associated-type equality and composition** — support constraints tying
-  associated types across bounds and composed traits, with conflict diagnostics.
-- [ ] **Conditional conformance clauses** — represent and solve conformance
-  conditions independently of a generic struct's declaration bounds.
-- [ ] **Standard Indexer family** — replace the proof-only `__getitem__` path with
-  the standard associated index/output contracts, mutation, and slicing variants.
-- [ ] **Incremental Hasher contract** — implement the standard byte/value writing
-  surface and make Hashable implementations feed a caller-provided hasher.
-- [ ] **Writer protocol** — implement the generic Writer operation surface,
-  checked writes, error effects, and buffer-backed acceptance tests.
-- [ ] **Formatting protocols** — build current Writable formatting on Writer,
-  including display/repr operations, format specifications, and a self-hosted
-  formatter; do not make deprecated Stringable/Representable a parity target,
-  and retire the temporary direct `__str__` hook.
+- [ ] **Executable origin-bearing pointer loans** — infer the concrete source
+  origin for `UnsafePointer(to=place)`, attach owner loans to aggregates that
+  store such pointers, and reject dangling escape or conflicting access. The VM
+  may erase origins after verification, but checked HIR/MIR must not. This is the
+  remaining current-Mojo half of reference-aggregate parity and precedes the
+  textual MIR/VM schema.
 
-### 3. Generalize Parameters, Packs, And Specialization
+### 3. Finish Typed And Verified MIR
 
-- [ ] **General compile-time parameter values** — accept parameter types beyond
-  Int/Bool/type/origin and define which values may materialize at runtime.
-- [ ] **Complete parameter binding** — unify explicit, inferred, defaulted,
-  positional, keyword, type, value, and origin parameter binding rules.
-- [ ] **Variadic type and value packs** — represent packs explicitly, infer them
-  from arbitrary expressions, and expose per-index concrete types.
-- [ ] **Dependent parameter expressions** — type/evaluate parameter expressions
-  that depend on earlier parameters, including result and field types.
-- [ ] **Generic constraints** — parse and solve general compile-time predicates,
-  including trailing declaration `where` constraints and conditional
-  conformance; do not extend deprecated parameter-list `where` syntax.
-- [ ] **Nested specialization** — specialize generic helpers called by generic
-  CTFE and recursively requested specializations.
-- [ ] **Specialization cache and diagnostics** — canonicalize specialization keys,
-  share fuel, detect cycles, and report recursion/fuel failures at source sites.
-- [ ] **Compile-time value model** — add richer aggregates/type facts with explicit
-  materialization rules instead of ad-hoc evaluator cases.
-- [ ] **Reflection queries** — expose the type/declaration facts required by
-  concrete conformance and standard-library cases through the current unified
-  `reflect[T]` model, not the removed free-function reflection API.
-- [ ] **Compile-time declaration generation** — generate declarations only after
-  reflection use cases establish a minimal, testable contract.
+Do not add a separate rustc-style THIR stage. Strengthen the existing
+`CheckedProgram` handoff into Mojito's typed semantic tree, then let HIR retain
+that checked data while it makes statement control flow explicit. Source spans
+remain diagnostic locations, not semantic identities. Declaration-wide facts
+such as conformances, layouts, specialization records, and destruction policy
+may remain indexed metadata.
 
-### 4. Complete Callable And Closure Semantics
+- [ ] **Complete MIR value and instruction typing** — assign checked types to
+  every synthetic register, constant, instruction result, call input/output, and
+  effect edge. Preserve root, per-projection, and final-storage place types, and
+  reject incomplete metadata without consulting source AST.
+- [ ] **Complete standalone MIR semantic verification** — verify instruction and
+  call types, CFG edges, ownership state, effects, and reference invariants from
+  MIR plus checked declaration metadata alone. Keep the register VM as the
+  executable specification and require production MIR to pass this verifier.
 
-- [ ] **Overloaded callable values** — select or retain overload sets in typed
-  callable contexts, including effects and generic specialization.
-- [ ] **Explicit capture lists** — require and represent current capture-list
-  entries (`read`, `mut`, `ref`, and moved `var` captures) in checked data and
-  MIR closure environments; ordinary nested functions have no implicit capture.
-- [ ] **Non-escaping closure completeness** — support sibling calls, recursion,
-  generics, closure values, and mutable/reference captures without write-back
-  emulation, while rejecting any closure that outlives its defining scope.
+This milestone must complete before the textual MIR schema is frozen or native
+backend work begins.
 
-### 5. Close Remaining CPU Language Surface
+### 4. Complete MIR-Schema-Prerequisite CPU Semantics
 
-- [ ] **Late initialization and function-scoped implicit bindings** — track
-  definite initialization and Mojo's distinct implicit-variable scope rules.
-- [ ] **Context managers** — check and execute `with` through the enter/exit
-  protocol, including raising exits.
-- [ ] **Loop completion** — implement loop `else`, reference loop bindings, and
-  the remaining iterator variants.
-- [ ] **Pattern completion** — add declaration destructuring and remaining
-  CPU-relevant structured patterns beyond tuple assignment.
-- [ ] **String interpolation** — type, lower, and execute t-strings through the
-  formatting protocols.
-- [ ] **Walrus expressions** — define binding scope, ordering, and MIR execution.
-- [ ] **Slice completion** — cover omitted/negative/strided bounds and
-  protocol-driven user slicing.
-- [ ] **Operator completion** — add bitwise operations, shifts, matrix multiply,
-  and missing protocol-dispatched CPU operators.
-- [ ] **Literal-family completion** — implement byte and string literal families,
-  escaping/interpolation interactions, and the remaining numeric literal rules.
-- [ ] **Tuple and variant completion** — general tuple packs, supported dynamic
-  operations, and CPU-relevant variant construction/matching.
+These tasks may change MIR value, constant, or instruction schemas. Complete
+them before freezing the textual format; API-only library growth follows it.
 
-### 6. Complete References And Unsafe Pointers
+- [ ] **Protocolize scalar operations and conversions** — route numeric,
+  comparison, conversion, and rounding behavior through checked protocols; add
+  lossless arbitrary-precision `IntLiteral`/`FloatLiteral` storage and exact
+  compile-time evaluation before contextual scalar materialization.
+- [ ] **Protocolize collections and iteration** — route list/range/tuple indexing,
+  sizing, containment, and iteration through the same contracts as user types.
+- [ ] **Self-hosted Unicode String** — define storage, Unicode indexing/slicing,
+  comparison, hashing, and formatting without VM-only semantics; distinguish
+  compile-time `StringLiteral`, lazy captured `TString`, and explicit runtime
+  `String` materialization.
+- [ ] **CPU Layout and LayoutTensor semantics** — implement the target-independent
+  type, indexing, and memory-view contracts required by CPU programs while
+  leaving observable ABI layout and GPU memory spaces to later milestones.
+- [ ] **SIMD semantic completion** — finish dtype/literal conversions, masks,
+  reductions, shuffles, and other CPU-visible VM semantics.
 
-- [ ] **Advanced origins** — implement static, untracked, and unsafe origins with
-  explicit escape and access rules.
-- [ ] **Reborrows and reference aggregates** — model reborrow lifetimes and permit
-  references inside aggregates only where ownership rules remain sound.
-- [ ] **Pointer provenance and arithmetic** — track allocation identity, typed
-  offsets, bounds where promised, and pointer comparisons/conversions.
-- [ ] **Pointer lifetime operations** — implement explicit deallocation,
-  alignment-aware allocation, non-null dangling placeholders, and invalid/
-  double-free diagnostics; nullable pointers use `Optional`, not the removed
-  default `UnsafePointer()` constructor.
+### 5. Stabilize Textual MIR/VM Assembly
 
-### 7. Stabilize Textual MIR/VM Assembly
-
-- [ ] **Backend-ready MIR** — remove remaining source-AST reconstruction and make
-  checked declarations plus verified MIR sufficient inputs before freezing a
-  serialized schema.
+- [ ] **Backend-ready MIR checkpoint** — confirm that checked declarations plus
+  typed verified MIR are sufficient inputs, with no source-AST reconstruction,
+  before freezing a serialized schema.
 - [ ] **Text format schema** — specify versioning, deterministic identifiers,
   declarations, blocks, instructions, constants, types, and source locations.
 - [ ] **Disassembler** — print every verified MIR program deterministically and
   add stable snapshots for representative programs.
 - [ ] **Assembler parser and diagnostics** — parse the text format with precise
   source errors and no dependency on Mojo source syntax.
-- [ ] **Standalone verifier** — validate symbols, types, CFGs, ownership metadata,
-  and instruction invariants before execution.
+- [ ] **Artifact verifier integration** — run the canonical MIR semantic verifier
+  on assembled programs and report artifact source locations before execution.
 - [ ] **Lossless round trips** — require MIR → text → MIR equivalence across the
   full test corpus.
 - [ ] **VM artifact execution** — run verified textual artifacts directly from
@@ -192,40 +225,37 @@ or user program needs them.
 - [ ] **Compiler/test integration** — expose dumps and use assembly snapshots and
   conformance artifacts as backend-independent contracts.
 
-### 8. Reduce Builtins And Grow The CPU Standard Library
+### 6. Grow The CPU Standard Library
 
-- [ ] **Protocolize scalar operations and conversions** — route numeric,
-  comparison, conversion, and rounding behavior through checked protocols.
-- [ ] **Protocolize collections and iteration** — route list/range/tuple indexing,
-  sizing, containment, and iteration through the same contracts as user types.
-- [ ] **Self-hosted Unicode String** — define storage, Unicode indexing/slicing,
-  literal interop, comparison, hashing, and formatting without VM-only semantics.
 - [ ] **Collection API parity** — grow List, Dict, HashDict, Set, HashSet, tuple,
-  slice, and optional/variant APIs demand-first from conformance cases.
+  slice, and optional/variant APIs demand-first from conformance cases. For
+  `Variant`, finish `destroy_with`, representation writing, and fully generic
+  TypeList-driven conditional protocol synthesis rather than adding compiler
+  special cases for every standard-library method.
 - [ ] **HashSet growth and rehashing** — add load-factor growth while preserving
   deterministic behavior and value semantics.
 - [ ] **Filesystem and I/O slice** — port representative file/path/stream APIs on
   the Writer and explicit-destroy foundations.
 - [ ] **Time, random, and testing slices** — add deterministic testable cores and
   isolate host-dependent behavior behind runtime services.
-- [ ] **SIMD semantic completion** — finish dtype/literal conversions, masks,
-  reductions, shuffles, and other CPU-visible VM semantics.
 
-### 9. Packaging, Artifacts, And Developer Tooling
+### 7. Packaging, Artifacts, And Developer Tooling
 
-- [ ] **Compiled package artifacts** — define and load a versioned `.mojoc`
-  representation without making modules first-class runtime values.
 - [ ] **Feature and target options** — expose checked CLI/build configuration and
   record it in artifacts and diagnostics.
+- [ ] **Compiled package artifacts** — define and load a versioned `.mojoc`
+  representation without making modules first-class runtime values. Complete the
+  per-directory resolution order around the already implemented source choices:
+  source package, `.mojoc`, source module, then legacy `.mojopkg`.
 - [ ] **Debugging metadata and inspection** — provide stack/source diagnostics,
   MIR inspection, and debugger-oriented value rendering.
 - [ ] **Testing tools** — provide Mojito-native assertions, expected-error tests,
   and integration with the differential harness.
-- [ ] **Distribution reproducibility** — continuously verify that the crates.io
-  archive contains everything needed to rebuild, test, document, and reproduce
-  conformance results.
+- [ ] **Distribution reproducibility gate** — make the release check rebuild,
+  test, document, and reproduce conformance results using only the crates.io
+  archive contents.
 
-### 10. Native Backends And Native-Only Semantics
+### 8. Native Backends And Native-Only Semantics
 
 - [ ] **Cranelift scalar backend** — lower the verified scalar CPU subset and
   validate it differentially against the VM/textual corpus.

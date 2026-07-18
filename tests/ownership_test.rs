@@ -25,6 +25,44 @@ fn ownership_reports_invalid_unchecked_input_instead_of_panicking() {
     ));
 }
 
+#[test]
+fn reference_aggregate_extends_the_owner_loan() {
+    let src = "@fieldwise_init\nstruct RefBox[origin: Origin[mut=True]]:\n    var value: ref[origin] Int\n\ndef main():\n    var value = 40\n    ref alias = value\n    var box = RefBox(alias)\n    value += 1\n    print(box.value)\n";
+    assert!(matches!(own(src), Err(OwnershipError::LoanConflict { .. })));
+}
+
+#[test]
+fn reference_aggregate_preserves_every_field_loan() {
+    let src = "@fieldwise_init\nstruct RefPair[a: Origin[mut=True], b: Origin[mut=True]]:\n    var first: ref[a] Int\n    var second: ref[b] Int\n\ndef main():\n    var x = 10\n    var y = 20\n    ref rx = x\n    ref ry = y\n    var pair = RefPair(rx, ry)\n    y += 1\n    print(pair.second)\n";
+    assert!(matches!(own(src), Err(OwnershipError::LoanConflict { .. })));
+}
+
+#[test]
+fn moving_reference_aggregate_transfers_its_owner_loan() {
+    let src = "@fieldwise_init\nstruct RefBox[origin: Origin[mut=True]]:\n    var value: ref[origin] Int\n\ndef main():\n    var value = 40\n    ref alias = value\n    var box = RefBox(alias)\n    var moved = box^\n    value += 1\n    print(moved.value)\n";
+    assert!(matches!(own(src), Err(OwnershipError::LoanConflict { .. })));
+}
+
+#[test]
+fn nested_reference_aggregate_preserves_every_element_loan() {
+    // Executable `ref` fields are a Mojito extension used to prove the checked
+    // aggregate/loan representation; current Mojo spells stored provenance with
+    // origin-bearing pointer types instead.
+    let src = "@fieldwise_init\nstruct RefTuple[origin: Origin[mut=True]]:\n    var values: Tuple[ref[origin] Int, ref[origin] Int]\n\ndef main():\n    var x = 10\n    var y = 20\n    ref rx = x\n    ref ry = y\n    var pair = RefTuple((rx, ry))\n    y += 1\n    print(pair.values[1])\n";
+    assert!(matches!(own(src), Err(OwnershipError::LoanConflict { .. })));
+
+    let src = "@fieldwise_init\nstruct RefList[origin: Origin[mut=True]]:\n    var values: List[ref[origin] Int]\n\ndef main():\n    var x = 10\n    var y = 20\n    ref rx = x\n    ref ry = y\n    var pair = RefList([rx, ry])\n    y += 1\n    print(pair.values[1])\n";
+    assert!(matches!(own(src), Err(OwnershipError::LoanConflict { .. })));
+}
+
+#[test]
+fn variant_payload_reference_loans_the_variant() {
+    // The ownership unit runs the unlinked checker, so a local declaration makes
+    // the compiler-provided Variant name visible without involving module I/O.
+    let src = "struct Variant:\n    pass\n\ndef main():\n    var value = Variant[Int, String](7)\n    ref payload = value[Int]\n    value.set[String](\"changed\")\n    print(payload)\n";
+    assert!(matches!(own(src), Err(OwnershipError::LoanConflict { .. })));
+}
+
 const THING: &str = "@fieldwise_init\nstruct Thing:\n    var x: Int\n\n";
 
 #[test]
@@ -34,6 +72,22 @@ fn move_without_later_use_is_ok() {
         "{THING}def main():\n    var a: Thing = Thing(1)\n    var b: Thing = a^\n    print(b.x)\n"
     );
     assert!(own(&src).is_ok());
+}
+
+#[test]
+fn owned_iteration_consumes_the_source_collection() {
+    let ok_source = format!(
+        "{THING}def main():\n    var values = [Thing(1), Thing(2)]\n    for var item in values^:\n        print(item.x)\n"
+    );
+    assert!(own(&ok_source).is_ok());
+
+    let used_again = format!(
+        "{THING}def main():\n    var values = [Thing(1), Thing(2)]\n    for var item in values^:\n        print(item.x)\n    print(len(values))\n"
+    );
+    match own(&used_again) {
+        Err(OwnershipError::UseAfterMove { .. }) => {}
+        other => panic!("expected owned iteration to consume its source, got {other:?}"),
+    }
 }
 
 #[test]
@@ -50,6 +104,18 @@ fn no_transfer_never_errors() {
     // Without `^`, nothing moves; ordinary value semantics are untouched.
     let src = "def main():\n    var a: Int = 1\n    var b: Int = a\n    print(a)\n    print(b)\n";
     assert!(own(src).is_ok());
+}
+
+#[test]
+fn transferred_tuple_reverse_consumes_the_receiver() {
+    let src = "def main():\n    var pair = Tuple(3, \"seven\")\n    var reversed = pair^.reverse()\n    print(reversed)\n    print(pair)\n";
+    assert!(matches!(own(src), Err(OwnershipError::UseAfterMove { .. })));
+}
+
+#[test]
+fn transferred_tuple_concat_consumes_both_operands() {
+    let src = "def main():\n    var left = Tuple(3, \"seven\")\n    var right = Tuple(True)\n    var joined = left^.concat(right^)\n    print(joined)\n    print(right)\n";
+    assert!(matches!(own(src), Err(OwnershipError::UseAfterMove { .. })));
 }
 
 #[test]

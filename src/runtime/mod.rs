@@ -3,6 +3,7 @@
 //! operations, coercion, and the utility built-ins — the shared value layer the
 //! backend consumes.
 
+use std::cmp::Ordering;
 use std::fmt;
 use std::io::{self, Write};
 
@@ -20,6 +21,11 @@ pub enum Value {
     None,
     /// A non-capturing function value, represented by its resolved MIR symbol.
     Function(String),
+    /// A lifted non-escaping function plus its explicit capture environment.
+    Closure {
+        function: String,
+        captures: Vec<Value>,
+    },
     /// A half-open integer range `[start, stop)` with the given `step`, produced
     /// by the built-in `range(...)` and consumed by `for`. Not a first-class
     /// value: there is no annotation for it, so it only lives in a `for` header.
@@ -27,6 +33,14 @@ pub enum Value {
         start: i64,
         stop: i64,
         step: i64,
+    },
+    /// A checked slice descriptor. Unlike the old fabricated struct layout,
+    /// omitted bounds and descriptor kind are first-class runtime data.
+    Slice {
+        kind: crate::types::SliceKind,
+        start: Option<i64>,
+        end: Option<i64>,
+        step: Option<i64>,
     },
     /// A struct instance: its type name, field values (in declaration order), and
     /// any reified value parameters (`FixedBuffer[8]` stores `size = 8`, read via
@@ -48,13 +62,27 @@ pub enum Value {
     /// A `List` value — a value type (`Clone` deep-copies its elements, so
     /// assigning/passing a list copies it, matching Mojo's value semantics).
     List(Vec<Value>),
+    /// Insertion-ordered set storage used by set displays/comprehensions.
+    Set(Vec<Value>),
+    /// Insertion-ordered dictionary storage used by dictionary displays and
+    /// comprehensions. Equality/lookup compare keys with checked value equality.
+    Dict(Vec<(Value, Value)>),
     /// A `Tuple` value — a fixed-size, heterogeneous value type (`Clone`
     /// deep-copies; immutable — no element write).
     Tuple(Vec<Value>),
-    /// An `UnsafePointer[T]` — a base offset into the VM's type-erased heap arena
-    /// (`Option B`: the arena is a `Vec<Value>`). Copying a pointer copies the
-    /// offset, so two copies **alias** the same storage (the point of a pointer).
-    Pointer(usize),
+    /// A tagged union. `alternatives` is the checked type-level ordering and
+    /// `index` selects the active payload.
+    Variant {
+        alternatives: Vec<crate::types::Ty>,
+        index: usize,
+        value: Box<Value>,
+    },
+    /// An `UnsafePointer[T]`: stable allocation identity plus a typed element
+    /// offset. Allocation zero is reserved for non-null dangling placeholders.
+    Pointer {
+        allocation: u64,
+        offset: i64,
+    },
     /// A verified reference to a variable slot in a live VM frame. Projection
     /// indexes are captured when the handle is created, so later evaluation
     /// cannot silently retarget the reference.
@@ -74,6 +102,7 @@ pub enum Value {
 pub enum RefProjection {
     Field(String),
     Index(usize),
+    Variant(usize),
 }
 
 /// The lanes of a SIMD value, one representation per element-type kind. Integer
@@ -105,6 +134,16 @@ impl PartialEq for Value {
             (Value::Float64(a), Value::Float64(b)) => a == b,
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => a == b,
+            (
+                Value::Pointer {
+                    allocation: aa,
+                    offset: ao,
+                },
+                Value::Pointer {
+                    allocation: ba,
+                    offset: bo,
+                },
+            ) => aa == ba && ao == bo,
             (Value::None, Value::None) => true,
             // Closures have identity, not structural, equality.
             (
@@ -119,6 +158,20 @@ impl PartialEq for Value {
                     step: t2,
                 },
             ) => s1 == s2 && e1 == e2 && t1 == t2,
+            (
+                Value::Slice {
+                    kind: ak,
+                    start: as_,
+                    end: ae,
+                    step: ap,
+                },
+                Value::Slice {
+                    kind: bk,
+                    start: bs,
+                    end: be,
+                    step: bp,
+                },
+            ) => ak == bk && as_ == bs && ae == be && ap == bp,
             (
                 Value::Struct {
                     name: n1,
@@ -143,7 +196,30 @@ impl PartialEq for Value {
             ) => d1 == d2 && l1 == l2,
             (Value::Error(a), Value::Error(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
+            (Value::Set(a), Value::Set(b)) => {
+                a.len() == b.len() && a.iter().all(|item| b.contains(item))
+            }
+            (Value::Dict(a), Value::Dict(b)) => {
+                a.len() == b.len()
+                    && a.iter().all(|(key, value)| {
+                        b.iter()
+                            .find(|(candidate, _)| candidate == key)
+                            .is_some_and(|(_, candidate)| candidate == value)
+                    })
+            }
             (Value::Tuple(a), Value::Tuple(b)) => a == b,
+            (
+                Value::Variant {
+                    alternatives: aa,
+                    index: ai,
+                    value: av,
+                },
+                Value::Variant {
+                    alternatives: ba,
+                    index: bi,
+                    value: bv,
+                },
+            ) => aa == ba && ai == bi && av == bv,
             (
                 Value::Ref {
                     frame: af,
@@ -172,7 +248,21 @@ impl fmt::Display for Value {
             Value::Str(s) => write!(f, "{}", s),
             Value::None => write!(f, "None"),
             Value::Function(name) => write!(f, "<function {name}>"),
+            Value::Closure { function, .. } => write!(f, "<closure {function}>"),
             Value::Range { start, stop, step } => write!(f, "range({}, {}, {})", start, stop, step),
+            Value::Slice {
+                kind,
+                start,
+                end,
+                step,
+            } => write!(
+                f,
+                "{}({:?}, {:?}, {:?})",
+                kind.type_name(),
+                start,
+                end,
+                step
+            ),
             Value::Struct {
                 name,
                 fields,
@@ -221,7 +311,9 @@ impl fmt::Display for Value {
                 }
             }
             Value::Error(msg) => write!(f, "Error({:?})", msg),
-            Value::Pointer(base) => write!(f, "UnsafePointer(0x{:x})", base),
+            Value::Pointer { allocation, offset } => {
+                write!(f, "UnsafePointer({allocation:#x}+{offset})")
+            }
             Value::Ref { frame, slot, .. } => write!(f, "<ref {frame}:{slot}>"),
             Value::Moved => write!(f, "<moved>"),
             Value::List(items) => {
@@ -233,6 +325,26 @@ impl fmt::Display for Value {
                     write!(f, "{}", item)?;
                 }
                 write!(f, "]")
+            }
+            Value::Set(items) => {
+                write!(f, "{{")?;
+                for (index, item) in items.iter().enumerate() {
+                    if index > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", item)?;
+                }
+                write!(f, "}}")
+            }
+            Value::Dict(entries) => {
+                write!(f, "{{")?;
+                for (index, (key, value)) in entries.iter().enumerate() {
+                    if index > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}: {}", key, value)?;
+                }
+                write!(f, "}}")
             }
             Value::Tuple(items) => {
                 write!(f, "(")?;
@@ -248,6 +360,7 @@ impl fmt::Display for Value {
                 }
                 write!(f, ")")
             }
+            Value::Variant { value, .. } => value.fmt(f),
         }
     }
 }
@@ -279,8 +392,9 @@ pub(crate) fn type_name(value: &Value) -> String {
         Value::Bool(_) => "Bool".to_string(),
         Value::Str(_) => "String".to_string(),
         Value::None => "None".to_string(),
-        Value::Function(_) => "function".to_string(),
+        Value::Function(_) | Value::Closure { .. } => "function".to_string(),
         Value::Range { .. } => "range".to_string(),
+        Value::Slice { kind, .. } => kind.type_name().to_string(),
         Value::Struct { name, .. } => name.clone(),
         Value::Simd { dtype, lanes } => {
             if lanes.width() == 1 {
@@ -290,20 +404,33 @@ pub(crate) fn type_name(value: &Value) -> String {
             }
         }
         Value::Error(_) => "Error".to_string(),
-        Value::Pointer(_) => "UnsafePointer".to_string(),
+        Value::Pointer { .. } => "UnsafePointer".to_string(),
         Value::Ref { .. } => "ref".to_string(),
         Value::Moved => "<moved>".to_string(),
         Value::List(_) => "List".to_string(),
+        Value::Set(_) => "Set".to_string(),
+        Value::Dict(_) => "Dict".to_string(),
         Value::Tuple(items) => {
             let elems: Vec<String> = items.iter().map(type_name).collect();
             format!("Tuple[{}]", elems.join(", "))
         }
+        Value::Variant { alternatives, .. } => {
+            let names: Vec<String> = alternatives.iter().map(ToString::to_string).collect();
+            format!("Variant[{}]", names.join(", "))
+        }
     }
 }
 
-/// Structural equality for `==`/`!=`. Defined only between values of the same
-/// scalar type; comparing across types (or closures) is a type error.
+/// Structural equality for `==`/`!=`. Numeric values use ordinary promotion;
+/// tuples recurse element-wise. Other scalar values must have the same type.
 pub(crate) fn values_equal(a: &Value, b: &Value) -> Result<bool, RuntimeError> {
+    if let (Some(a), Some(b)) = (as_num(a), as_num(b)) {
+        return Ok(match a.rank().max(b.rank()) {
+            2 => a.as_f64() == b.as_f64(),
+            1 => a.as_u64() == b.as_u64(),
+            _ => a.as_i64() == b.as_i64(),
+        });
+    }
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => Ok(x == y),
         (Value::UInt(x), Value::UInt(y)) => Ok(x == y),
@@ -311,12 +438,98 @@ pub(crate) fn values_equal(a: &Value, b: &Value) -> Result<bool, RuntimeError> {
         (Value::Bool(x), Value::Bool(y)) => Ok(x == y),
         (Value::Str(x), Value::Str(y)) => Ok(x == y),
         (Value::None, Value::None) => Ok(true),
+        (
+            Value::Variant {
+                alternatives: aa,
+                index: ai,
+                value: av,
+            },
+            Value::Variant {
+                alternatives: ba,
+                index: bi,
+                value: bv,
+            },
+        ) if aa == ba => {
+            if ai != bi {
+                Ok(false)
+            } else {
+                values_equal(av, bv)
+            }
+        }
+        (Value::Tuple(left), Value::Tuple(right)) => {
+            if left.len() != right.len() {
+                return Ok(false);
+            }
+            for (left, right) in left.iter().zip(right) {
+                match values_equal(left, right) {
+                    Ok(true) => {}
+                    Ok(false) | Err(_) => return Ok(false),
+                }
+            }
+            Ok(true)
+        }
+        (Value::Set(left), Value::Set(right)) => {
+            if left.len() != right.len() {
+                return Ok(false);
+            }
+            Ok(left.iter().all(|item| {
+                right
+                    .iter()
+                    .any(|candidate| values_equal(item, candidate).unwrap_or(false))
+            }))
+        }
+        (Value::Dict(left), Value::Dict(right)) => {
+            if left.len() != right.len() {
+                return Ok(false);
+            }
+            Ok(left.iter().all(|(key, value)| {
+                right.iter().any(|(candidate_key, candidate_value)| {
+                    values_equal(key, candidate_key).unwrap_or(false)
+                        && values_equal(value, candidate_value).unwrap_or(false)
+                })
+            }))
+        }
         _ => Err(RuntimeError::TypeError(format!(
             "cannot compare {} and {}",
             type_name(a),
             type_name(b)
         ))),
     }
+}
+
+/// Compare two tuple elements for lexicographic tuple ordering. Numeric values
+/// use the same promotion ranks as arithmetic; strings and nested tuples compare
+/// structurally.
+fn compare_tuple_values(left: &Value, right: &Value) -> Result<Ordering, RuntimeError> {
+    if let (Some(left), Some(right)) = (as_num(left), as_num(right)) {
+        return match left.rank().max(right.rank()) {
+            2 => left
+                .as_f64()
+                .partial_cmp(&right.as_f64())
+                .ok_or_else(|| RuntimeError::TypeError("cannot order NaN tuple elements".into())),
+            1 => Ok(left.as_u64().cmp(&right.as_u64())),
+            _ => Ok(left.as_i64().cmp(&right.as_i64())),
+        };
+    }
+    match (left, right) {
+        (Value::Str(left), Value::Str(right)) => Ok(left.cmp(right)),
+        (Value::Tuple(left), Value::Tuple(right)) => compare_tuples(left, right),
+        _ => Err(RuntimeError::TypeError(format!(
+            "cannot order {} and {} tuple elements",
+            type_name(left),
+            type_name(right)
+        ))),
+    }
+}
+
+fn compare_tuples(left: &[Value], right: &[Value]) -> Result<Ordering, RuntimeError> {
+    for (left, right) in left.iter().zip(right) {
+        let ordering = compare_tuple_values(left, right)?;
+        if ordering != Ordering::Equal {
+            return Ok(ordering);
+        }
+    }
+    Ok(left.len().cmp(&right.len()))
 }
 
 /// Intrinsic `__hash__` for a built-in hashable value (roadmap milestone 6) — a
@@ -435,6 +648,20 @@ pub(crate) fn apply_infix(op: InfixOp, l: Value, r: Value) -> Result<Value, Runt
     if let (InfixOp::Add, Value::Str(a), Value::Str(b)) = (op, &l, &r) {
         return Ok(Value::Str(format!("{}{}", a, b)));
     }
+    if let (Value::Tuple(left), Value::Tuple(right)) = (&l, &r) {
+        let result = match op {
+            InfixOp::Eq => Some(values_equal(&l, &r)?),
+            InfixOp::Ne => Some(!values_equal(&l, &r)?),
+            InfixOp::Lt => Some(compare_tuples(left, right)? == Ordering::Less),
+            InfixOp::Le => Some(compare_tuples(left, right)? != Ordering::Greater),
+            InfixOp::Gt => Some(compare_tuples(left, right)? == Ordering::Greater),
+            InfixOp::Ge => Some(compare_tuples(left, right)? != Ordering::Less),
+            _ => None,
+        };
+        if let Some(result) = result {
+            return Ok(Value::Bool(result));
+        }
+    }
     // Numeric operators (arithmetic, ordering, and numeric equality), with
     // promotion of mixed numeric kinds.
     if let (Some(a), Some(b)) = (as_num(&l), as_num(&r)) {
@@ -481,13 +708,14 @@ fn int_op(op: InfixOp, x: i64, y: i64) -> Result<Value, RuntimeError> {
         Shr => Value::Int(x.wrapping_shr(y as u32)),
         BitAnd => Value::Int(x & y),
         BitOr => Value::Int(x | y),
+        BitXor => Value::Int(x ^ y),
         Lt => Value::Bool(x < y),
         Gt => Value::Bool(x > y),
         Le => Value::Bool(x <= y),
         Ge => Value::Bool(x >= y),
         Eq => Value::Bool(x == y),
         Ne => Value::Bool(x != y),
-        Div | And | Or | In | NotIn => {
+        Div | MatMul | And | Or | In | NotIn => {
             return Err(RuntimeError::TypeError(format!(
                 "operator '{op:?}' is invalid for integer dispatch"
             )));
@@ -509,13 +737,14 @@ fn uint_op(op: InfixOp, x: u64, y: u64) -> Result<Value, RuntimeError> {
         Shr => Value::UInt(x.wrapping_shr(y as u32)),
         BitAnd => Value::UInt(x & y),
         BitOr => Value::UInt(x | y),
+        BitXor => Value::UInt(x ^ y),
         Lt => Value::Bool(x < y),
         Gt => Value::Bool(x > y),
         Le => Value::Bool(x <= y),
         Ge => Value::Bool(x >= y),
         Eq => Value::Bool(x == y),
         Ne => Value::Bool(x != y),
-        Div | And | Or | In | NotIn => {
+        Div | MatMul | And | Or | In | NotIn => {
             return Err(RuntimeError::TypeError(format!(
                 "operator '{op:?}' is invalid for unsigned dispatch"
             )));
@@ -538,7 +767,7 @@ fn float_op(op: InfixOp, x: f64, y: f64) -> Result<Value, RuntimeError> {
         Ge => Value::Bool(x >= y),
         Eq => Value::Bool(x == y),
         Ne => Value::Bool(x != y),
-        Div | Shl | Shr | BitAnd | BitOr | And | Or | In | NotIn => {
+        Div | MatMul | Shl | Shr | BitAnd | BitOr | BitXor | And | Or | In | NotIn => {
             return Err(RuntimeError::TypeError(format!(
                 "operator '{op:?}' is invalid for float dispatch"
             )));
@@ -622,6 +851,36 @@ pub(crate) fn slice_indices(
     upper: Option<i64>,
     step: Option<i64>,
 ) -> Result<Vec<usize>, RuntimeError> {
+    let (start, stop, step) = normalize_slice_bounds(len, lower, upper, step)?;
+    let mut idxs = Vec::new();
+    let mut i = start;
+    if step > 0 {
+        while i < stop {
+            idxs.push(i as usize);
+            i += step;
+        }
+    } else {
+        while i > stop {
+            idxs.push(i as usize);
+            i += step;
+        }
+    }
+    Ok(idxs)
+}
+
+/// Normalize a `Slice` against a concrete length, implementing the public
+/// `Slice.indices(length)` contract.
+pub(crate) fn normalize_slice_bounds(
+    len: i64,
+    lower: Option<i64>,
+    upper: Option<i64>,
+    step: Option<i64>,
+) -> Result<(i64, i64, i64), RuntimeError> {
+    if len < 0 {
+        return Err(RuntimeError::TypeError(
+            "slice length cannot be negative".to_string(),
+        ));
+    }
     let step = step.unwrap_or(1);
     if step == 0 {
         return Err(RuntimeError::TypeError(
@@ -642,20 +901,7 @@ pub(crate) fn slice_indices(
     } else {
         (lower.map_or(len - 1, adjust), upper.map_or(-1, adjust))
     };
-    let mut idxs = Vec::new();
-    let mut i = start;
-    if step > 0 {
-        while i < stop {
-            idxs.push(i as usize);
-            i += step;
-        }
-    } else {
-        while i > stop {
-            idxs.push(i as usize);
-            i += step;
-        }
-    }
-    Ok(idxs)
+    Ok((start, stop, step))
 }
 
 /// Slice a `List`/`String` value (`a[lower:upper:step]`), returning a new value of
@@ -806,11 +1052,11 @@ pub(crate) fn list_query(
     }
 }
 
-/// Evaluate `x in c` / `x not in c` → `Bool`. `c` is a `List` (element
-/// membership, comparing the coerced value) or a `String` (substring test).
+/// Evaluate `x in c` / `x not in c` → `Bool`. `c` is a `List`/`Tuple` (element
+/// membership) or a `String` (substring test).
 pub(crate) fn eval_membership(op: InfixOp, l: &Value, r: &Value) -> Result<Value, RuntimeError> {
     let found = match r {
-        Value::List(items) => {
+        Value::List(items) | Value::Set(items) => {
             let target = match items.first() {
                 Some(f) => coerce_like(l.clone(), f),
                 None => l.clone(),
@@ -819,6 +1065,12 @@ pub(crate) fn eval_membership(op: InfixOp, l: &Value, r: &Value) -> Result<Value
                 .iter()
                 .any(|it| values_equal(it, &target).unwrap_or(false))
         }
+        Value::Dict(entries) => entries
+            .iter()
+            .any(|(key, _)| values_equal(key, l).unwrap_or(false)),
+        Value::Tuple(items) => items
+            .iter()
+            .any(|item| values_equal(item, l).unwrap_or(false)),
         Value::Str(s) => match l {
             Value::Str(sub) => s.contains(sub.as_str()),
             other => {
@@ -830,7 +1082,7 @@ pub(crate) fn eval_membership(op: InfixOp, l: &Value, r: &Value) -> Result<Value
         },
         other => {
             return Err(RuntimeError::TypeError(format!(
-                "'in' requires a List or String, got {}",
+                "'in' requires a List, Set, Dict, Tuple, or String, got {}",
                 type_name(other)
             )));
         }
@@ -864,6 +1116,7 @@ pub(crate) fn promote_numeric_elems(items: &mut [Value]) {
 /// post-wrap mathematical value (non-negative for unsigned dtypes).
 fn wrap(dtype: Dtype, v: i128) -> i128 {
     match dtype {
+        Dtype::Int => v,
         Dtype::Int8 => v as i8 as i128,
         Dtype::Int16 => v as i16 as i128,
         Dtype::Int32 => v as i32 as i128,
@@ -1036,7 +1289,7 @@ pub(crate) fn builtin_convert(name: &str, v: Value) -> Result<Value, RuntimeErro
         }
     };
     Ok(match name {
-        "Int" => Value::Int(as_i),
+        "Int" | "Scalar" => Value::Int(as_i),
         "UInt" => Value::UInt(as_u),
         "Bool" => Value::Bool(as_bool),
         _ => Value::Float64(as_f), // "Float64"
@@ -1395,6 +1648,12 @@ pub(crate) fn coerce_checked(value: Value, ty: &crate::types::Ty) -> Value {
             Value::UInt(n) => Value::Float64(n as f64),
             value => value,
         },
+        Ty::Simd { dtype, width: 1 } => {
+            match simd_from_values(*dtype, 1, std::slice::from_ref(&value)) {
+                Ok(materialized) => materialized,
+                Err(_) => value,
+            }
+        }
         Ty::Tuple(types) => match value {
             Value::Tuple(items) => Value::Tuple(
                 items
@@ -1403,6 +1662,50 @@ pub(crate) fn coerce_checked(value: Value, ty: &crate::types::Ty) -> Value {
                     .map(|(value, ty)| coerce_checked(value, ty))
                     .collect(),
             ),
+            value => value,
+        },
+        Ty::List(element) => match value {
+            Value::List(items) => Value::List(
+                items
+                    .into_iter()
+                    .map(|value| coerce_checked(value, element))
+                    .collect(),
+            ),
+            value => value,
+        },
+        Ty::Set(element) => match value {
+            Value::Set(items) => Value::Set(
+                items
+                    .into_iter()
+                    .map(|value| coerce_checked(value, element))
+                    .collect(),
+            ),
+            value => value,
+        },
+        Ty::Dict(key, element) => match value {
+            Value::Dict(entries) => Value::Dict(
+                entries
+                    .into_iter()
+                    .map(|(actual_key, value)| {
+                        (
+                            coerce_checked(actual_key, key),
+                            coerce_checked(value, element),
+                        )
+                    })
+                    .collect(),
+            ),
+            value => value,
+        },
+        Ty::Variant(types) => match value {
+            Value::Variant {
+                alternatives,
+                index,
+                value,
+            } if alternatives == *types && index < types.len() => Value::Variant {
+                alternatives,
+                index,
+                value: Box::new(coerce_checked(*value, &types[index])),
+            },
             value => value,
         },
         Ty::Struct(name, args) if name == "Tuple" => match value {

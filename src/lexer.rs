@@ -23,6 +23,9 @@ pub struct Lexer<'a> {
     paren_count: usize,
     at_line_start: bool,
     eof_emitted: bool,
+    /// Whether the preceding significant token can participate in Mojo's
+    /// indentation-based adjacent-string continuation.
+    last_token_was_string: bool,
 
     // Queue for when a single character (or EOF) produces multiple tokens. Each
     // entry carries the token's source span (see `emit`).
@@ -39,6 +42,7 @@ impl<'a> Lexer<'a> {
             paren_count: 0,
             at_line_start: true,
             eof_emitted: false,
+            last_token_was_string: false,
             pending_tokens: VecDeque::new(),
         }
     }
@@ -59,26 +63,14 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// Advance past a run of ASCII digits.
-    fn consume_digits(&mut self) {
-        while self
-            .remainder()
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_digit())
-        {
-            self.pos += 1;
-        }
-    }
-
-    /// Advance past a run of base-`radix` digits with optional `_` digit
-    /// separators (each `_` must sit between two digits, e.g. `1_000`, `0xFF_00`).
+    /// Advance past a run of base-`radix` digits and `_` separators. Current Mojo
+    /// permits consecutive and trailing underscores; validation still requires at
+    /// least one real digit after a radix prefix.
     fn consume_digit_run(&mut self, radix: u32) {
         loop {
-            let mut chars = self.remainder().chars();
-            match chars.next() {
+            match self.remainder().chars().next() {
                 Some(c) if c.is_digit(radix) => self.pos += c.len_utf8(),
-                Some('_') if chars.next().is_some_and(|d| d.is_digit(radix)) => self.pos += 1,
+                Some('_') => self.pos += 1,
                 _ => break,
             }
         }
@@ -87,10 +79,10 @@ impl<'a> Lexer<'a> {
     /// If the remainder begins with a well-formed exponent (`e`/`E`, an optional
     /// sign, then at least one digit), consume it and return `true`. A lone `e`
     /// not followed by digits is left untouched (it is not part of the number).
-    fn consume_exponent(&mut self) -> bool {
+    fn consume_exponent(&mut self) -> Result<bool, LexError> {
         let rem = self.remainder();
         if !(rem.starts_with('e') || rem.starts_with('E')) {
-            return false;
+            return Ok(false);
         }
         let after_e = &rem[1..];
         let sign_len = match after_e.chars().next() {
@@ -103,10 +95,10 @@ impl<'a> Lexer<'a> {
             .is_some_and(|c| c.is_ascii_digit())
         {
             self.pos += 1 + sign_len; // consume 'e' and the optional sign
-            self.consume_digits();
-            true
+            self.consume_digit_run(10);
+            Ok(true)
         } else {
-            false
+            Err(LexError::InvalidFloat(self.pos))
         }
     }
 
@@ -114,7 +106,7 @@ impl<'a> Lexer<'a> {
     /// `triple`-quoted. `self.pos` must point at the opening delimiter. Escapes are
     /// the full Mojo set (see `decode_escape`); a triple-quoted string may span
     /// newlines.
-    fn lex_string(&mut self, quote: char, triple: bool) -> Result<Token, LexError> {
+    fn lex_string(&mut self, quote: char, triple: bool, raw: bool) -> Result<Token, LexError> {
         let start = self.pos;
         let delim: String = quote.to_string().repeat(if triple { 3 } else { 1 });
         self.pos += delim.len(); // consume the opening delimiter (quotes are ASCII)
@@ -137,9 +129,15 @@ impl<'a> Lexer<'a> {
             match c {
                 // A single-line string cannot contain a raw newline.
                 '\n' if !triple => return Err(LexError::UnterminatedString(start)),
-                '\\' => {
+                '\\' if !raw => {
                     self.pos += 1; // consume the backslash
-                    value.push(self.decode_escape(start)?);
+                    if triple && self.remainder().starts_with("\r\n") {
+                        self.pos += 2;
+                    } else if triple && self.remainder().starts_with('\n') {
+                        self.pos += 1;
+                    } else {
+                        value.push(self.decode_escape(start)?);
+                    }
                 }
                 _ => {
                     value.push(c);
@@ -153,8 +151,8 @@ impl<'a> Lexer<'a> {
     /// immediately after the `\`; this advances `self.pos` past the whole escape
     /// body and returns the decoded character. `start` is the string's start offset
     /// (for the unterminated-string error). Supports the simple escapes
-    /// `\a \b \f \n \r \t \v \\ \' \"` and the numeric escapes — octal `\ooo`
-    /// (leading digit 0–3, then two octal digits), `\xHH`, `\uHHHH`, `\UHHHHHHHH`
+    /// `\a \b \f \n \r \t \v \\ \' \"` and the numeric escapes — one-to-three
+    /// digit octal `\ooo`, `\xHH`, `\uHHHH`, `\UHHHHHHHH`
     /// — each a Unicode scalar value, encoded UTF-8 into the string.
     fn decode_escape(&mut self, start: usize) -> Result<char, LexError> {
         let esc = match self.remainder().chars().next() {
@@ -193,8 +191,8 @@ impl<'a> Lexer<'a> {
                 self.pos += 1; // consume 'U'
                 self.read_hex_digits(8, start)?
             }
-            // Octal: the leading digit (0–3) is part of the value; read 3 in all.
-            '0'..='3' => self.read_octal_digits(start)?,
+            // Octal escapes contain one to three octal digits.
+            '0'..='7' => self.read_octal_digits(start)?,
             other => return Err(LexError::InvalidEscape(other, self.pos)),
         };
         char::from_u32(code).ok_or(LexError::InvalidEscape(esc, self.pos))
@@ -216,28 +214,124 @@ impl<'a> Lexer<'a> {
         Ok(code)
     }
 
-    /// Read exactly 3 octal digits into a byte value (the leading digit, already
-    /// known to be 0–3, is the first). `self.pos` is at that leading digit.
+    /// Read one to three octal digits into a byte value. `self.pos` is at the
+    /// leading digit.
     fn read_octal_digits(&mut self, start: usize) -> Result<u32, LexError> {
         let mut code = 0u32;
         for _ in 0..3 {
-            let ch = match self.remainder().chars().next() {
-                Some(c) if c.is_digit(8) => c,
-                Some(c) => return Err(LexError::InvalidEscape(c, self.pos)),
-                None => return Err(LexError::UnterminatedString(start)),
+            let Some(ch) = self
+                .remainder()
+                .chars()
+                .next()
+                .filter(|character| character.is_digit(8))
+            else {
+                break;
             };
             code = code * 8 + ch.to_digit(8).unwrap();
             self.pos += 1;
         }
-        Ok(code)
+        if code <= u8::MAX as u32 {
+            Ok(code)
+        } else {
+            Err(LexError::InvalidEscape('0', start))
+        }
+    }
+
+    /// Consume a t-string interpolation until its matching `}`. Braces inside
+    /// nested quoted strings and comments do not affect the depth; nested calls,
+    /// collections, and t-strings therefore remain valid expression source for
+    /// the parser's interpolation sub-parser.
+    fn take_interpolation(&mut self, string_start: usize) -> Result<String, LexError> {
+        let expr_start = self.pos;
+        let mut depth = 1usize;
+        loop {
+            let rem = self.remainder();
+            let ch = rem
+                .chars()
+                .next()
+                .ok_or(LexError::UnterminatedString(string_start))?;
+            match ch {
+                '\'' | '"' => {
+                    let quote = ch;
+                    let triple = rem.starts_with(&quote.to_string().repeat(3));
+                    let delimiter = quote.to_string().repeat(if triple { 3 } else { 1 });
+                    let before = &self.input[expr_start..self.pos];
+                    let has_prefix = |candidates: &[&str]| {
+                        candidates.iter().copied().any(|prefix| {
+                            before.ends_with(prefix)
+                                && before[..before.len() - prefix.len()]
+                                    .chars()
+                                    .next_back()
+                                    .is_none_or(|previous| {
+                                        !(previous.is_ascii_alphanumeric() || previous == '_')
+                                    })
+                        })
+                    };
+                    let raw =
+                        has_prefix(&["r", "R", "rt", "rT", "Rt", "RT", "tr", "tR", "Tr", "TR"]);
+                    let templated =
+                        has_prefix(&["t", "T", "rt", "rT", "Rt", "RT", "tr", "tR", "Tr", "TR"]);
+                    self.pos += delimiter.len();
+                    loop {
+                        let nested = self.remainder();
+                        if nested.starts_with(&delimiter) {
+                            self.pos += delimiter.len();
+                            break;
+                        }
+                        if templated && nested.starts_with("{{") {
+                            self.pos += 2;
+                            continue;
+                        }
+                        if templated && nested.starts_with('{') {
+                            self.pos += 1;
+                            let _ = self.take_interpolation(string_start)?;
+                            continue;
+                        }
+                        if templated && nested.starts_with("}}") {
+                            self.pos += 2;
+                            continue;
+                        }
+                        let nested_ch = nested
+                            .chars()
+                            .next()
+                            .ok_or(LexError::UnterminatedString(string_start))?;
+                        if nested_ch == '\\' && !raw {
+                            self.pos += 1;
+                            let escaped = self
+                                .remainder()
+                                .chars()
+                                .next()
+                                .ok_or(LexError::UnterminatedString(string_start))?;
+                            self.pos += escaped.len_utf8();
+                        } else {
+                            self.pos += nested_ch.len_utf8();
+                        }
+                    }
+                }
+                '#' => self.skip_to_line_end(),
+                '{' => {
+                    depth += 1;
+                    self.pos += 1;
+                }
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let source = self.input[expr_start..self.pos].to_string();
+                        self.pos += 1;
+                        return Ok(source);
+                    }
+                    self.pos += 1;
+                }
+                _ => self.pos += ch.len_utf8(),
+            }
+        }
     }
 
     /// Lex a t-string body (the prefix `t`/`rt` has been scanned; `self.pos` is at
     /// the opening `quote`). Splits into literal `Text` chunks and `Interp` chunks
     /// holding each `{…}` interpolation's raw source (the parser parses those into
     /// expressions). `{{`/`}}` are literal braces; a raw (`rt`) t-string does not
-    /// expand escapes. Brace matching for an interpolation is naive (it does not
-    /// look inside nested string literals).
+    /// expand escapes.
     fn lex_tstring(&mut self, quote: char, triple: bool, raw: bool) -> Result<Token, LexError> {
         let start = self.pos;
         let delim: String = quote.to_string().repeat(if triple { 3 } else { 1 });
@@ -268,27 +362,7 @@ impl<'a> Lexer<'a> {
                         chunks.push(TStringChunk::Text(std::mem::take(&mut text)));
                     }
                     self.pos += 1; // consume '{'
-                    let expr_start = self.pos;
-                    let mut depth = 1usize;
-                    loop {
-                        let ch = match self.remainder().chars().next() {
-                            Some(c) => c,
-                            None => return Err(LexError::UnterminatedString(start)),
-                        };
-                        match ch {
-                            '{' => depth += 1,
-                            '}' => {
-                                depth -= 1;
-                                if depth == 0 {
-                                    break;
-                                }
-                            }
-                            _ => {}
-                        }
-                        self.pos += ch.len_utf8();
-                    }
-                    let expr_text = self.input[expr_start..self.pos].to_string();
-                    self.pos += 1; // consume '}'
+                    let expr_text = self.take_interpolation(start)?;
                     chunks.push(TStringChunk::Interp(expr_text));
                 }
                 '}' if rem.starts_with("}}") => {
@@ -298,7 +372,13 @@ impl<'a> Lexer<'a> {
                 '\n' if !triple => return Err(LexError::UnterminatedString(start)),
                 '\\' if !raw => {
                     self.pos += 1; // consume the backslash
-                    text.push(self.decode_escape(start)?);
+                    if triple && self.remainder().starts_with("\r\n") {
+                        self.pos += 2;
+                    } else if triple && self.remainder().starts_with('\n') {
+                        self.pos += 1;
+                    } else {
+                        text.push(self.decode_escape(start)?);
+                    }
                 }
                 _ => {
                     text.push(c);
@@ -313,8 +393,44 @@ impl<'a> Lexer<'a> {
     /// tokens (Indent/Dedent/Newline/Eof) get whatever narrow range is current,
     /// which is fine since they carry no source text.
     fn emit(&mut self, token: Token) {
+        self.last_token_was_string = matches!(
+            &token,
+            Token::StringLiteral(_) | Token::TripleStringLiteral(_) | Token::TString { .. }
+        );
         self.pending_tokens
             .push_back((token, (self.token_start, self.pos)));
+    }
+
+    /// Mojo joins an adjacent string on the following physical line when that
+    /// line is indented beyond the current suite. Suppressing layout here makes
+    /// it the same token sequence as same-line adjacency without teaching the
+    /// statement parser a second continuation grammar.
+    fn has_indented_string_continuation(&self) -> bool {
+        if !self.last_token_was_string || !self.remainder().starts_with('\n') {
+            return false;
+        }
+        let after_newline = &self.remainder()[1..];
+        let spaces = after_newline.chars().take_while(|&ch| ch == ' ').count();
+        if spaces <= *self.indent_stack.last().unwrap_or(&0) {
+            return false;
+        }
+        let rest = &after_newline[spaces..];
+        if matches!(rest.chars().next(), Some('\'' | '"')) {
+            return true;
+        }
+        let prefix: String = rest
+            .chars()
+            .take(2)
+            .take_while(|character| matches!(character, 'r' | 'R' | 't' | 'T'))
+            .collect();
+        matches!(
+            prefix.to_ascii_lowercase().as_str(),
+            "r" | "t" | "rt" | "tr"
+        ) && matches!(
+            rest.get(prefix.len()..)
+                .and_then(|tail| tail.chars().next()),
+            Some('\'' | '"')
+        )
     }
 }
 
@@ -433,6 +549,10 @@ impl<'a> Iterator for Lexer<'a> {
                     self.skip_to_line_end();
                 }
                 '\n' => {
+                    if self.paren_count == 0 && self.has_indented_string_continuation() {
+                        self.pos += 1;
+                        continue;
+                    }
                     self.pos += 1;
                     if self.paren_count == 0 {
                         self.at_line_start = true;
@@ -544,6 +664,25 @@ impl<'a> Iterator for Lexer<'a> {
                     if self.remainder().starts_with("...") {
                         self.pos += 3;
                         self.emit(Token::Ellipsis);
+                    } else if self.remainder()[1..]
+                        .chars()
+                        .next()
+                        .is_some_and(|next| next.is_ascii_digit())
+                    {
+                        let start = self.pos;
+                        self.pos += 1;
+                        self.consume_digit_run(10);
+                        if let Err(error) = self.consume_exponent() {
+                            return Some(Err(error));
+                        }
+                        let cleaned: String = self.input[start..self.pos]
+                            .chars()
+                            .filter(|&ch| ch != '_')
+                            .collect();
+                        match cleaned.parse::<f64>() {
+                            Ok(value) => self.emit(Token::FloatLiteral(value)),
+                            Err(_) => return Some(Err(LexError::InvalidFloat(start))),
+                        }
                     } else {
                         self.pos += 1;
                         self.emit(Token::Dot);
@@ -672,7 +811,7 @@ impl<'a> Iterator for Lexer<'a> {
                 '"' | '\'' => {
                     // Triple-quoted (`"""` / `'''`) if the next three chars match.
                     let triple = self.remainder().starts_with(&c.to_string().repeat(3));
-                    match self.lex_string(c, triple) {
+                    match self.lex_string(c, triple, false) {
                         Ok(token) => {
                             self.emit(token);
                             continue;
@@ -715,14 +854,17 @@ impl<'a> Iterator for Lexer<'a> {
                     }
 
                     let text = self.input[start..self.pos].to_string();
-                    // A `t"…"` / `rt"…"` string prefix: the word is exactly `t`/`rt`
-                    // and is immediately followed by a quote (no space).
-                    let tprefix = match text.as_str() {
-                        "t" => Some(false),
-                        "rt" => Some(true),
+                    // String prefixes are case-insensitive and must touch the
+                    // opening quote. `t` enables interpolation; `r` disables
+                    // escape expansion, and the two may appear in either order.
+                    let prefix = text.to_ascii_lowercase();
+                    let string_prefix = match prefix.as_str() {
+                        "r" => Some((false, true)),
+                        "t" => Some((true, false)),
+                        "rt" | "tr" => Some((true, true)),
                         _ => None,
                     };
-                    if let Some(raw) = tprefix
+                    if let Some((interpolated, raw)) = string_prefix
                         && let Some(quote) = self
                             .remainder()
                             .chars()
@@ -730,7 +872,12 @@ impl<'a> Iterator for Lexer<'a> {
                             .filter(|&q| q == '"' || q == '\'')
                     {
                         let triple = self.remainder().starts_with(&quote.to_string().repeat(3));
-                        match self.lex_tstring(quote, triple, raw) {
+                        let token = if interpolated {
+                            self.lex_tstring(quote, triple, raw)
+                        } else {
+                            self.lex_string(quote, triple, raw)
+                        };
+                        match token {
                             Ok(token) => {
                                 self.emit(token);
                                 continue;
@@ -765,9 +912,7 @@ impl<'a> Iterator for Lexer<'a> {
                             .chars()
                             .filter(|&c| c != '_')
                             .collect();
-                        match i64::from_str_radix(&cleaned, radix)
-                            .or_else(|_| u64::from_str_radix(&cleaned, radix).map(|n| n as i64))
-                        {
+                        match i64::from_str_radix(&cleaned, radix) {
                             Ok(num) => self.emit(Token::IntLiteral(num)),
                             Err(_) => return Some(Err(LexError::InvalidInteger(start))),
                         }
@@ -781,16 +926,22 @@ impl<'a> Iterator for Lexer<'a> {
                     // trailing `.` is left for a future member-access `.`.)
                     let mut is_float = false;
                     let rem = self.remainder();
-                    if rem.starts_with('.')
-                        && rem[1..].chars().next().is_some_and(|c| c.is_ascii_digit())
-                    {
+                    if rem.starts_with('.') && !rem.starts_with("..") {
                         is_float = true;
                         self.pos += 1; // consume '.'
-                        self.consume_digit_run(10);
+                        if self
+                            .remainder()
+                            .chars()
+                            .next()
+                            .is_some_and(|digit| digit.is_ascii_digit())
+                        {
+                            self.consume_digit_run(10);
+                        }
                     }
-                    if self.consume_exponent() {
-                        is_float = true;
-                    }
+                    is_float |= match self.consume_exponent() {
+                        Ok(found) => found,
+                        Err(error) => return Some(Err(error)),
+                    };
 
                     // Strip `_` separators before parsing (Rust's parsers reject them).
                     let cleaned: String = self.input[start..self.pos]
@@ -802,10 +953,12 @@ impl<'a> Iterator for Lexer<'a> {
                             Ok(num) => self.emit(Token::FloatLiteral(num)),
                             Err(_) => return Some(Err(LexError::InvalidFloat(start))),
                         }
-                    } else if let Ok(num) = cleaned
-                        .parse::<i64>()
-                        .or_else(|_| cleaned.parse::<u64>().map(|n| n as i64))
+                    } else if cleaned.len() > 1
+                        && cleaned.starts_with('0')
+                        && cleaned.chars().any(|digit| digit != '0')
                     {
+                        return Some(Err(LexError::InvalidInteger(start)));
+                    } else if let Ok(num) = cleaned.parse::<i64>() {
                         self.emit(Token::IntLiteral(num));
                     } else {
                         return Some(Err(LexError::InvalidInteger(start)));

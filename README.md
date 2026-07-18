@@ -1,15 +1,13 @@
 # mojito
 
-mojito is a small Rust implementation of an evolving subset of [Mojo](https://www.modular.com/mojo). It is not Mojo, and it is not trying to
-compete with Mojo's production compiler. It is a compact compiler playground for
-studying the shape of a modern systems programming language compiler. Mojo was chosen because it is a rich language, with value semantics, ownership/borrowing, ASAP destruction, generics, overloading, and compile time execution. It has interesting features associated with C++, Rust, and Zig. 
-
-## Why not mojito?
-- mojito does not generate optimized code yet
-- the first parity target explicitly excludes GPUs, concurrency, parallel and
-  distributed execution, Python interoperability, and MLIR
-- This list could grow very long, but really, 
-  this is the kind of thing you like, then you'll like this kind of thing.
+mojito is a small Rust implementation of an evolving subset of
+[Mojo](https://www.modular.com/mojo). It is not Mojo, and it is not
+trying to compete with Mojo's production compiler. It is a compact
+compiler playground for studying the shape of a modern systems
+programming language compiler. Mojo was chosen as a target because it
+is a rich language, with value semantics, ownership/borrowing, ASAP
+destruction, generics, overloading, and compile time execution. It has
+interesting features associated with C++, Rust, and Zig.
 
 ## Project goals
 - Parse all of current Mojo and report syntax
@@ -34,8 +32,9 @@ mojito currently has:
   generics, value parameters, builtin scalar types, lists, tuples, strings, and
   SIMD-like values
 - source modules and packages with lexical, dotted, relative, qualified, and
-  aliased imports; `__init__.mojo` re-exports; isolated linked identities;
-  configurable roots; and bundled standard-library lookup
+  aliased imports; dotted-prefix namespaces; ordinary namespace directories;
+  source-package precedence; explicit `__init__.mojo` re-exports; isolated linked
+  identities; configurable roots; and bundled standard-library lookup
 - compile-time elaboration for `comptime if`, `comptime for`, richer compile-time
   values, and fuel-bounded pure-function CTFE through the MIR/VM path
 - a HIR control-flow graph lowering pass
@@ -48,15 +47,15 @@ mojito currently has:
 - liveness-driven ASAP destruction via `__del__(deinit self)`
 - a register VM backend used as the runtime implementation
 - self-hosted standard-library proofs in `stdlib/`, including generic
-  `Optional`, `List`, `Set`, and `Dict` implementations
+  `Optional`, `List`, `Set`, `Dict`, and keyword-owning `StringDict`
+  implementations
 - basic collection/protocol traits such as `Iterable`, `Iterator`, `Sized`,
   `Equatable`, and `Comparable` where the current self-hosted library needs
   them
 - fixture-based tests for accepted programs, parse errors, type errors, runtime
   errors, ownership errors, and ownership-ok cases
 
-This project is intentionally small and direct. Rust plus `petgraph` is the core
-tooling; the compiler is not wrapped in a large framework.
+This project is intentionally small and direct. The compiler is not wrapped in a large framework.
 
 ## Not Mojo Proper
 
@@ -73,9 +72,9 @@ Language deficiencies:
   methods run, but the complete Mojo protocol and constraint libraries remain
   incomplete
 - no full parametric polymorphism story comparable to Mojo; generics, value
-  parameters, bound-checked heterogeneous pack iteration, and contextual generic
-  callable specialization cover the current library, but not per-index concrete
-  pack reflection or the full language
+  parameters, bound-checked heterogeneous packs with per-index concrete types,
+  dependent parameters, and contextual generic callable specialization cover the
+  current library, but not the full language
 - overload resolution ranks conversion count, variadic use, signature length,
   and generic ties across functions, methods, and constructors; checked
   user-defined `@implicit` constructors participate in that ranking, while the
@@ -85,9 +84,9 @@ Language deficiencies:
   `Never`, but trait-requirement effects and full unwind semantics remain open
 - no full exception/unwind model beyond the VM-supported subset
 - no complete model of Mojo's ownership, origins, and lifetime semantics
-- limited nested-function/capture support; Mojo does not support general escaping
-  closures, so this is about matching Mojo's supported non-escaping patterns, not
-  adding a Python-style closure system
+- non-escaping nested functions use explicit unified capture lists and support
+  sibling calls, recursion, generics, mutable/reference environments, and nominal
+  callable structs; escaping closures remain intentionally rejected to match Mojo
 - no self-hosted `String`; string literals and runtime strings still rely on VM
   support while storage, Unicode, slicing, and literal interop are designed
 - `Tuple` remains mostly compiler/runtime-shaped; fully self-hosting arbitrary
@@ -186,6 +185,11 @@ evidence. Relations distinguish matching semantics, strict-subset rejection,
 true divergence, representation differences, explicit exclusions, and stretch
 goals. `conformance/manual-sections.tsv` fixes the official manual inventory
 boundary.
+
+The current language target is recorded in
+[`docs/mojo-nightly.md`](docs/mojo-nightly.md). Mojito presently tracks
+**Mojo 1.0.0b3.dev2026071705 (2026-07-17)**; the audit records nightly language
+drift separately from claims of implemented parity.
 
 Shared cases in `conformance/cases.tsv` run under both implementations. They can
 assert matching output, matching rejection, a documented strict-subset gap, or a
@@ -458,13 +462,3 @@ let mut backend = BackendKind::Vm.make();
 backend.run(&checked)?;
 println!("{}", backend.output());
 ```
-
-## Philosophy
-
-mojito is deliberately modest. It should be small enough to read, strict
-enough to be meaningful, and honest enough to say "unsupported" when a feature
-has not earned its semantics yet.
-
-The aspiration is a clear reference implementation of a Mojo-like systems
-language core: lexing, parsing, checking, MIR lowering, ownership, borrowing,
-ASAP destruction, and execution on a transparent register VM.

@@ -80,17 +80,28 @@ pub type SourceType = Type;
 /// is one or more trait names (`T: Copyable & Movable`) or a **value parameter**
 /// when `X` is a concrete type (`n: Int`). The checker classifies by resolving
 /// `bounds` — a single entry naming a type means a value parameter; trait names
-/// mean a type parameter. Value parameters are restricted to type `Int`.
+/// mean a type parameter. The checker retains and validates the declared value
+/// type; runtime materialization is governed by `CtValue::materialize`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypeParam {
     /// The source name. A leading `*` is retained for a variadic type pack.
     pub name: String,
     /// The trait bound(s), or (for a value parameter) the single value type name.
     pub bounds: Vec<String>,
+    /// Full source type for a syntactically unambiguous value parameter such as
+    /// `items: List[Int]`. Scalar value parameters are classified semantically.
+    pub value_type: Option<Type>,
     /// `Some(expr)` for `Origin[mut=expr]`; `None` for type/value parameters.
     pub origin_mutability: Option<Expr>,
     /// Whether this parameter follows the `//` infer-only marker.
     pub infer_only: bool,
+    /// A retained compile-time default. Semantic classification and dependency
+    /// checking happen after all earlier parameters have entered scope.
+    pub default: Option<Expr>,
+    /// Legacy storage retained during the typed-boundary migration. Current
+    /// syntax rejects parameter-local `where`, so parsed declarations leave it
+    /// empty and use the declaration's trailing predicate instead.
+    pub constraints: Vec<Expr>,
 }
 
 /// A parameter **argument** supplied in a `[...]` list at a use site, i.e. a
@@ -103,6 +114,11 @@ pub struct TypeParam {
 pub enum ParamArg {
     Type(Type),
     Value(Expr),
+    /// A keyword compile-time argument (`name=value`).
+    Named {
+        name: String,
+        value: Box<ParamArg>,
+    },
 }
 
 /// A SIMD element type — the `<dt>` in `SIMD[DType.<dt>, width]`. mojito
@@ -110,6 +126,8 @@ pub enum ParamArg {
 /// `float64`, wider integers, low-precision floats).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dtype {
+    /// Platform-sized signed integer, used by `Int = Scalar[DType.int]`.
+    Int,
     Int8,
     Int16,
     Int32,
@@ -127,6 +145,7 @@ impl Dtype {
     /// The `DType.<name>` spelling → the dtype (e.g. `"int32"` → `Int32`).
     pub fn from_name(name: &str) -> Option<Dtype> {
         Some(match name {
+            "int" => Dtype::Int,
             "int8" => Dtype::Int8,
             "int16" => Dtype::Int16,
             "int32" => Dtype::Int32,
@@ -145,6 +164,7 @@ impl Dtype {
     /// The `DType.<name>` spelling of this dtype.
     pub fn name(self) -> &'static str {
         match self {
+            Dtype::Int => "int",
             Dtype::Int8 => "int8",
             Dtype::Int16 => "int16",
             Dtype::Int32 => "int32",
@@ -174,12 +194,17 @@ impl Dtype {
             Dtype::Float32 => "Float32",
             // `float64` is spelled by the native `Float64` type (with which it is
             // unified), and `bool` by `Bool` — neither is a SIMD *alias* name here.
-            Dtype::Float64 | Dtype::Bool => return None,
+            Dtype::Int | Dtype::Float64 | Dtype::Bool => return None,
         })
     }
 
     /// The dtype a scalar alias names (`"Int32"` → `Int32`), or `None`.
     pub fn from_scalar_alias(name: &str) -> Option<Dtype> {
+        // Mojo's `Byte` is an exact public alias of `UInt8`, not a distinct
+        // byte-string or character type.
+        if name == "Byte" {
+            return Some(Dtype::UInt8);
+        }
         [
             Dtype::Int8,
             Dtype::Int16,
@@ -219,7 +244,7 @@ pub struct FnParam {
     pub default: Option<Expr>,
     /// `*args` (variadic) / `**kwargs` (keyword variadic) / a plain parameter.
     pub kind: ParamKind,
-    /// An argument convention (`read`/`mut`/`var`/`out`); `None` = default.
+    /// An argument convention (`imm`/`mut`/`var`/`out`); `None` = default.
     pub convention: Option<ArgConvention>,
     /// Retained source origin clause for a `ref[...]` convention.
     pub origin: Option<OriginSpec>,
@@ -235,9 +260,9 @@ pub enum ParamKind {
     KwVariadic,
 }
 
-/// An argument-passing convention on an ordinary parameter (Mojo's `read`
+/// An argument-passing convention on an ordinary parameter (Mojo's `imm`
 /// (a.k.a. borrowed, the default), `mut`, `var`, `out`, and `ref` — a
-/// parametric-mutability reference). `read`, `mut`, `var`, call-scoped `ref`,
+/// parametric-mutability reference). `imm`, `mut`, `var`, call-scoped `ref`,
 /// and a single free-function named `out` result are modeled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArgConvention {
@@ -260,6 +285,31 @@ pub struct KwArg {
     pub value: Expr,
 }
 
+/// One argument inside a multi-dimensional subscript. Slice arguments remain
+/// structured until checking selects their concrete descriptor type.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SubscriptArg {
+    Index(Expr),
+    Slice {
+        lower: Option<Box<Expr>>,
+        upper: Option<Box<Expr>>,
+        step: Option<Box<Expr>>,
+        explicit_step: bool,
+    },
+}
+
+/// Internal call-AST marker for current Mojo's moved keyword-dictionary
+/// forwarding form, `**kwargs^`. Keeping it in the keyword stream preserves
+/// source evaluation order while the checker and VM distinguish it from a named
+/// keyword.
+pub const FORWARDED_KWARGS_NAME: &str = "**";
+
+impl KwArg {
+    pub fn is_forwarded(&self) -> bool {
+        self.name == FORWARDED_KWARGS_NAME
+    }
+}
+
 /// A decorator `@name`, `@dotted.name`, or `@name(args)` preceding a `def` or
 /// `struct` (or a struct method). Parsed into the AST; only `@fieldwise_init` on a
 /// struct is acted on (it sets `Stmt::Struct.fieldwise_init`) — the rest are
@@ -279,6 +329,7 @@ pub struct Decorator {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Method {
     pub name: String,
+    pub type_params: Vec<TypeParam>,
     /// Whether the method has a `self` receiver. `false` for a `@staticmethod`,
     /// which uses the ordinary call ABI without an implicit receiver slot.
     pub has_self: bool,
@@ -300,6 +351,7 @@ pub struct Method {
     /// The declared typed error, or `None` for bare `raises`/non-raising.
     pub raises_type: Option<Type>,
     pub ret: Option<Type>,
+    pub where_clause: Option<Expr>,
     pub body: Vec<Stmt>,
 }
 
@@ -310,6 +362,7 @@ pub struct Method {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TraitMethod {
     pub name: String,
+    pub type_params: Vec<TypeParam>,
     /// The receiver's argument convention: `None` = plain read-only `self`,
     /// or one of Mojo's explicit receiver conventions (`mut self`, `var self`,
     /// `ref self`, ...). Like `Method`, `self` is implicit and not stored in
@@ -319,7 +372,12 @@ pub struct TraitMethod {
     pub params: Vec<FnParam>,
     pub positional_only: Option<usize>,
     pub keyword_only: Option<usize>,
+    /// Whether the trait requirement/default declares a `raises` effect.
+    pub raises: bool,
+    /// The declared typed error, or `None` for bare `raises`/non-raising.
+    pub raises_type: Option<Type>,
     pub ret: Option<Type>,
+    pub where_clause: Option<Expr>,
     /// The method body. `None` for a pure requirement (`...`); `Some(body)` for a
     /// **default implementation**. The checker currently rejects default bodies.
     pub default_body: Option<Vec<Stmt>>,
@@ -462,12 +520,16 @@ pub enum StmtKind {
         positional_only: Option<usize>,
         /// Index of a bare `*` (keyword-only) marker in `params`, if present (parsed).
         keyword_only: Option<usize>,
+        /// Current Mojo unified-closure captures. `None` is an ordinary function
+        /// (which cannot capture); `Some` marks a `unified { ... }` closure.
+        captures: Option<CaptureList>,
         /// Whether the `raises` effect was declared. A following typed-error
         /// annotation is currently parsed but not retained.
         raises: bool,
         /// The typed error following `raises`, if present.
         raises_type: Option<Type>,
         ret: Option<Type>,
+        where_clause: Option<Expr>,
         body: Vec<Stmt>,
     },
     /// `[decorators] struct Name[type_params](conforms): <fields, associated
@@ -482,6 +544,11 @@ pub enum StmtKind {
         /// Traits this struct declares conformance to (`struct S(A, B):`); empty
         /// if none. Nominal — a `[T: A]` bound is satisfied only if `A` is here.
         conforms: Vec<String>,
+        /// The nominal closure trait (`def(...) -> ...`), when declared.
+        callable_conformance: Option<Type>,
+        /// Conditions attached to entries in `conforms`, represented as
+        /// `(trait_name, comptime predicate)`. An absent entry is unconditional.
+        conformance_conditions: Vec<(String, Expr)>,
         fields: Vec<Param>,
         associated: Vec<StructComptime>,
         methods: Vec<Method>,
@@ -531,12 +598,22 @@ pub enum StmtKind {
         orelse: Option<Vec<Stmt>>,
     },
     /// `while cond: <body>`
-    While { cond: Expr, body: Vec<Stmt> },
+    While {
+        cond: Expr,
+        body: Vec<Stmt>,
+        orelse: Option<Vec<Stmt>>,
+    },
     /// `for var in iter: <body>` — `iter` must evaluate to a `range(...)`.
     For {
         var: String,
+        reference: bool,
+        /// An explicit `var` target. Current Mojo uses this only with a
+        /// transferred iterable (`for var item in collection^`) to request
+        /// consuming/owned iteration.
+        owned: bool,
         iter: Expr,
         body: Vec<Stmt>,
+        orelse: Option<Vec<Stmt>>,
     },
     /// `return` or `return expr`
     Return(Option<Expr>),
@@ -581,6 +658,28 @@ pub enum StmtKind {
     Continue,
     /// A bare expression used for its side effects, e.g. `f(1)`.
     Expr(Expr),
+}
+
+/// The explicit environment of a nested `unified` closure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureList {
+    pub entries: Vec<Capture>,
+    /// A trailing bare `imm` captures otherwise-unlisted free variables by
+    /// immutable reference.
+    pub default_read: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Capture {
+    pub name: String,
+    pub kind: CaptureKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureKind {
+    Read,
+    Mut,
+    Move,
 }
 
 /// An expression node: its [`ExprKind`] plus the source [`Span`] it was parsed
@@ -632,6 +731,8 @@ pub enum ExprKind {
     Bool(bool),
     Str(String),
     None,
+    /// Compiler-internal marker for `var name: Type` without an initializer.
+    Uninitialized,
     Identifier(String),
     /// A type used as a compile-time value, such as a function/closure signature.
     /// Parsed for source compatibility; semantic treatment as a first-class
@@ -687,6 +788,9 @@ pub enum ExprKind {
         name: String,
         args: Vec<ParamArg>,
     },
+    /// Positional call-argument expansion (`*values`). Heterogeneous pack
+    /// specialization expands this into ordinary arguments before checking.
+    Spread(Box<Expr>),
     /// The transfer sigil `expr^`: an ownership move checked by MIR dataflow,
     /// including field-sensitive partial moves.
     Transfer(Box<Expr>),
@@ -694,8 +798,19 @@ pub enum ExprKind {
     /// inferred from the elements.
     ListLit(Vec<Expr>),
     /// A brace-delimited set/dictionary literal. Entries retain an optional
-    /// value (`key: value`); semantics are deferred.
+    /// value (`key: value`). All entries must consistently be set elements or
+    /// dictionary pairs; `{}` is the empty dictionary display.
     BraceLit(Vec<(Expr, Option<Expr>)>),
+    /// A Python-style collection comprehension. Clauses are retained in source
+    /// order because each iterable/filter can observe effects from all clauses
+    /// to its left. `key` is present only for a dictionary comprehension; `value`
+    /// is the list/set element or dictionary value.
+    Comprehension {
+        kind: CollectionKind,
+        key: Option<Box<Expr>>,
+        value: Box<Expr>,
+        clauses: Vec<ComprehensionClause>,
+    },
     /// A tuple literal `(a, b, …)` — a fixed-size, heterogeneous `Tuple`. `()` is
     /// the empty tuple and `(a,)` a 1-tuple; a plain `(e)` is grouping, not a tuple.
     TupleLit(Vec<Expr>),
@@ -728,6 +843,16 @@ pub enum ExprKind {
         lower: Option<Box<Expr>>,
         upper: Option<Box<Expr>>,
         step: Option<Box<Expr>>,
+        /// Whether the source contained the second colon. `a[:]` selects a
+        /// contiguous descriptor; `a[::]` selects a strided descriptor even
+        /// though both have an omitted step value.
+        explicit_step: bool,
+    },
+    /// Multiple subscript arguments, including mixed indices and slices:
+    /// `matrix[row, 1:5:2]` → `matrix.__getitem__(row, <slice>)`.
+    MultiIndex {
+        object: Box<Expr>,
+        args: Vec<SubscriptArg>,
     },
     /// A t-string `t"…{expr}…"` (or raw `rt"…"`, `raw = true`): alternating
     /// literal text and interpolated expressions. Each `{…}` is a fully parsed
@@ -736,6 +861,26 @@ pub enum ExprKind {
         parts: Vec<TStringPart>,
         raw: bool,
     },
+}
+
+/// The result family selected by collection-display delimiters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectionKind {
+    List,
+    Set,
+    Dict,
+}
+
+/// One left-to-right generator/filter clause in a collection comprehension.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ComprehensionClause {
+    For {
+        var: String,
+        reference: bool,
+        owned: bool,
+        iter: Box<Expr>,
+    },
+    If(Box<Expr>),
 }
 
 /// One piece of a t-string: literal text or an interpolated expression.
@@ -761,10 +906,12 @@ pub enum InfixOp {
     Div,
     FloorDiv,
     Mod,
+    MatMul,
     Shl,
     Shr,
     BitAnd,
     BitOr,
+    BitXor,
     Pow,
     Eq,
     Ne,
@@ -794,10 +941,12 @@ impl InfixOp {
             InfixOp::Div => "__truediv__",
             InfixOp::FloorDiv => "__floordiv__",
             InfixOp::Mod => "__mod__",
+            InfixOp::MatMul => "__matmul__",
             InfixOp::Shl => "__lshift__",
             InfixOp::Shr => "__rshift__",
             InfixOp::BitAnd => "__and__",
             InfixOp::BitOr => "__or__",
+            InfixOp::BitXor => "__xor__",
             InfixOp::Pow => "__pow__",
             InfixOp::Eq => "__eq__",
             InfixOp::Ne => "__ne__",
@@ -826,7 +975,9 @@ fn stamp_block(block: &mut [Stmt], source: &str) {
 fn stamp_expr(expr: &mut Expr, source: &str) {
     expr.source = Some(source.to_string());
     match &mut expr.kind {
-        ExprKind::Prefix(_, value) | ExprKind::Transfer(value) => stamp_expr(value, source),
+        ExprKind::Prefix(_, value) | ExprKind::Transfer(value) | ExprKind::Spread(value) => {
+            stamp_expr(value, source)
+        }
         ExprKind::Infix(_, left, right)
         | ExprKind::Index {
             object: left,
@@ -893,6 +1044,23 @@ fn stamp_expr(expr: &mut Expr, source: &str) {
                 }
             }
         }
+        ExprKind::Comprehension {
+            key,
+            value,
+            clauses,
+            ..
+        } => {
+            if let Some(key) = key {
+                stamp_expr(key, source);
+            }
+            stamp_expr(value, source);
+            for clause in clauses {
+                match clause {
+                    ComprehensionClause::For { iter, .. } => stamp_expr(iter, source),
+                    ComprehensionClause::If(condition) => stamp_expr(condition, source),
+                }
+            }
+        }
         ExprKind::Named { value, .. } => stamp_expr(value, source),
         ExprKind::IfExpr {
             cond,
@@ -914,10 +1082,26 @@ fn stamp_expr(expr: &mut Expr, source: &str) {
             lower,
             upper,
             step,
+            ..
         } => {
             stamp_expr(object, source);
             for value in [lower, upper, step].into_iter().flatten() {
                 stamp_expr(value, source);
+            }
+        }
+        ExprKind::MultiIndex { object, args } => {
+            stamp_expr(object, source);
+            for argument in args {
+                match argument {
+                    SubscriptArg::Index(value) => stamp_expr(value, source),
+                    SubscriptArg::Slice {
+                        lower, upper, step, ..
+                    } => {
+                        for value in [lower, upper, step].into_iter().flatten() {
+                            stamp_expr(value, source);
+                        }
+                    }
+                }
             }
         }
         ExprKind::TString { parts, .. } => {
@@ -933,6 +1117,7 @@ fn stamp_expr(expr: &mut Expr, source: &str) {
         | ExprKind::Bool(_)
         | ExprKind::Str(_)
         | ExprKind::None
+        | ExprKind::Uninitialized
         | ExprKind::Identifier(_) => {}
     }
 }
@@ -1025,9 +1210,12 @@ fn stamp_stmt_kind(kind: &mut StmtKind, source: &str) {
                 stamp_block(block, source);
             }
         }
-        StmtKind::While { cond, body } => {
+        StmtKind::While { cond, body, orelse } => {
             stamp_expr(cond, source);
             stamp_block(body, source);
+            if let Some(body) = orelse {
+                stamp_block(body, source);
+            }
         }
         StmtKind::For { iter, body, .. } | StmtKind::ComptimeFor { iter, body, .. } => {
             stamp_expr(iter, source);
@@ -1058,6 +1246,7 @@ fn stamp_stmt_kind(kind: &mut StmtKind, source: &str) {
         }
         StmtKind::Def {
             params,
+            raises_type,
             ret,
             body,
             decorators,
@@ -1065,6 +1254,9 @@ fn stamp_stmt_kind(kind: &mut StmtKind, source: &str) {
         } => {
             for param in params {
                 stamp_fn_param(param, source);
+            }
+            if let Some(error) = raises_type {
+                stamp_type(error, source);
             }
             if let Some(ret) = ret {
                 stamp_type(ret, source);
@@ -1090,6 +1282,9 @@ fn stamp_stmt_kind(kind: &mut StmtKind, source: &str) {
                 for param in &mut method.params {
                     stamp_fn_param(param, source);
                 }
+                if let Some(error) = &mut method.raises_type {
+                    stamp_type(error, source);
+                }
                 if let Some(ret) = &mut method.ret {
                     stamp_type(ret, source);
                 }
@@ -1105,6 +1300,9 @@ fn stamp_stmt_kind(kind: &mut StmtKind, source: &str) {
             for method in methods {
                 for param in &mut method.params {
                     stamp_fn_param(param, source);
+                }
+                if let Some(error) = &mut method.raises_type {
+                    stamp_type(error, source);
                 }
                 if let Some(ret) = &mut method.ret {
                     stamp_type(ret, source);

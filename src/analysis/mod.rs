@@ -83,16 +83,34 @@ fn var_uses(i: &MirInstr) -> Vec<(VarId, Reg)> {
     match i {
         MirInstr::BeginLoan { place, marker, .. } => vec![(place.root, *marker)],
         MirInstr::MakeRef { dest, place } => place_loan_uses(place, *dest),
+        MirInstr::MakeClosure { dest, captures, .. } => captures
+            .iter()
+            .flat_map(|capture| place_loan_uses(&capture.place, *dest))
+            .collect(),
         MirInstr::UseVar { dest, var, .. } => vec![(*var, *dest)],
+        MirInstr::KeepAlive { var } => vec![(*var, Reg(0))],
         MirInstr::MovePlace { dest, place } => place_loan_uses(place, *dest),
         MirInstr::Store { place, src } => place_loan_uses(place, *src),
+        MirInstr::StoreRef { place, reference } => place_loan_uses(place, *reference),
+        MirInstr::MultiSet {
+            receiver_place,
+            value,
+            ..
+        } => place_loan_uses(receiver_place, *value),
+        MirInstr::VariantSet { place, value, .. } => place_loan_uses(place, *value),
+        MirInstr::VariantReplace { place, value, .. } => place_loan_uses(place, *value),
         MirInstr::LoadPlace { dest, place } => place_loan_uses(place, *dest),
         MirInstr::MethodCall {
             dest,
             recv_place: Some(p),
             ..
         } => vec![(p.root, *dest)],
-        MirInstr::HasNext { dest, iter } | MirInstr::Next { dest, iter } => vec![(*iter, *dest)],
+        MirInstr::HasNext { dest, iter, .. } | MirInstr::Next { dest, iter, .. } => {
+            vec![(*iter, *dest)]
+        }
+        MirInstr::CollectionInsert {
+            collection, value, ..
+        } => vec![(*collection, *value)],
         // A `try` reads every variable its sub-regions read: the outer liveness must
         // treat it as one big use, so a value used only inside the `try` is not
         // dropped *before* it.
@@ -359,11 +377,12 @@ fn elaborate_drops(f: &MirFunction) -> MirFunction {
         n_vars: f.n_vars,
         var_names: f.var_names.clone(),
         n_params: f.n_params,
-        param_annotations: f.param_annotations.clone(),
+        param_types: f.param_types.clone(),
         owned_params: f.owned_params.clone(),
         ref_params: f.ref_params.clone(),
         returns_reference: f.returns_reference,
         spans: SpanTable(f.spans.0.clone()),
+        reg_types: f.reg_types.clone(),
     }
 }
 
@@ -749,6 +768,7 @@ fn mir_places_overlap(left: &MirPlace, right: &MirPlace) -> bool {
         && left.proj.iter().zip(&right.proj).all(|(a, b)| {
             matches!((a, b), (Proj::Field(x), Proj::Field(y)) if x == y)
                 || matches!((a, b), (Proj::Index(_), Proj::Index(_)))
+                || matches!((a, b), (Proj::Variant(x), Proj::Variant(y)) if x == y)
         })
 }
 
@@ -766,11 +786,7 @@ fn loan_accesses(
     };
     match instr {
         MirInstr::UseVar { var, dest, mode } => vec![(
-            MirPlace {
-                root: *var,
-                proj: Vec::new(),
-                through: None,
-            },
+            MirPlace::root(*var, None),
             if matches!(mode, UseMode::Move) {
                 LoanAccess::Write
             } else {
@@ -779,11 +795,7 @@ fn loan_accesses(
             span_for(*dest),
         )],
         MirInstr::DefVar { var, src, .. } => vec![(
-            MirPlace {
-                root: *var,
-                proj: Vec::new(),
-                through: None,
-            },
+            MirPlace::root(*var, None),
             LoanAccess::Write,
             span_for(*src),
         )],
@@ -793,8 +805,39 @@ fn loan_accesses(
         MirInstr::Store { place, src } => {
             vec![(place.clone(), LoanAccess::Write, span_for(*src))]
         }
+        MirInstr::StoreRef { place, reference } => {
+            vec![(place.clone(), LoanAccess::Write, span_for(*reference))]
+        }
+        MirInstr::MultiSet {
+            receiver_place,
+            value,
+            ..
+        } => vec![(receiver_place.clone(), LoanAccess::Write, span_for(*value))],
+        MirInstr::VariantSet { place, value, .. } => {
+            vec![(place.clone(), LoanAccess::Write, span_for(*value))]
+        }
+        MirInstr::VariantReplace { place, value, .. } => {
+            vec![(place.clone(), LoanAccess::Write, span_for(*value))]
+        }
         MirInstr::MovePlace { dest, place } => {
             vec![(place.clone(), LoanAccess::Write, span_for(*dest))]
+        }
+        MirInstr::MakeClosure { dest, captures, .. } => captures
+            .iter()
+            .map(|capture| {
+                (
+                    capture.place.clone(),
+                    if capture.moved {
+                        LoanAccess::Write
+                    } else {
+                        LoanAccess::Read
+                    },
+                    span_for(*dest),
+                )
+            })
+            .collect(),
+        MirInstr::ConsumePlace { place, marker } => {
+            vec![(place.clone(), LoanAccess::Write, span_for(*marker))]
         }
         MirInstr::Call {
             dest, arg_places, ..
@@ -815,15 +858,9 @@ fn loan_accesses(
             .cloned()
             .map(|place| (place, LoanAccess::Write, span_for(*dest)))
             .collect(),
-        MirInstr::DropVar { var } => vec![(
-            MirPlace {
-                root: *var,
-                proj: Vec::new(),
-                through: None,
-            },
-            LoanAccess::Write,
-            fallback,
-        )],
+        MirInstr::DropVar { var } => {
+            vec![(MirPlace::root(*var, None), LoanAccess::Write, fallback)]
+        }
         _ => Vec::new(),
     }
 }
@@ -883,6 +920,7 @@ fn severity(o: Own) -> u8 {
 enum Key {
     Field(String),
     Index,
+    Variant(usize),
 }
 
 /// Map a MIR place's projection chain to a path of lattice keys.
@@ -893,6 +931,7 @@ fn place_path(place: &MirPlace) -> Vec<Key> {
         .map(|p| match p {
             Proj::Field(f) => Key::Field(f.clone()),
             Proj::Index(_) => Key::Index,
+            Proj::Variant(index) => Key::Variant(*index),
         })
         .collect()
 }
@@ -907,6 +946,11 @@ fn place_display(root: &str, path: &[Key]) -> String {
                 s.push_str(f);
             }
             Key::Index => s.push_str("[…]"),
+            Key::Variant(index) => {
+                s.push_str("[alternative#");
+                s.push_str(&index.to_string());
+                s.push(']');
+            }
         }
     }
     s
@@ -1094,6 +1138,9 @@ fn place_uses(i: &MirInstr) -> Vec<(VarId, Vec<Key>, Touch, Reg)> {
         MirInstr::LoadPlace { dest, place } | MirInstr::MovePlace { dest, place } => {
             vec![(place.root, place_path(place), Touch::Read, *dest)]
         }
+        MirInstr::ConsumePlace { place, marker } => {
+            vec![(place.root, place_path(place), Touch::Read, *marker)]
+        }
         // A place write `p…​.f = e`: the *parent* place must be initialized (the
         // field itself is being overwritten, so it need not be). A dynamic-index
         // write keeps the whole chain as the parent (conservative).
@@ -1104,10 +1151,44 @@ fn place_uses(i: &MirInstr) -> Vec<(VarId, Vec<Key>, Touch, Reg)> {
             }
             vec![(place.root, path, Touch::WriteParent, *src)]
         }
+        MirInstr::StoreRef { place, reference } => {
+            let mut path = place_path(place);
+            if matches!(place.proj.last(), Some(Proj::Field(_))) {
+                path.pop();
+            }
+            vec![(place.root, path, Touch::WriteParent, *reference)]
+        }
+        MirInstr::MultiSet {
+            receiver_place,
+            value,
+            ..
+        } => vec![(
+            receiver_place.root,
+            place_path(receiver_place),
+            Touch::Read,
+            *value,
+        )],
+        MirInstr::VariantSet { place, value, .. } => {
+            let mut path = place_path(place);
+            if matches!(place.proj.last(), Some(Proj::Field(_))) {
+                path.pop();
+            }
+            vec![(place.root, path, Touch::WriteParent, *value)]
+        }
+        MirInstr::VariantReplace { place, value, .. } => {
+            let mut path = place_path(place);
+            if matches!(place.proj.last(), Some(Proj::Field(_))) {
+                path.pop();
+            }
+            vec![(place.root, path, Touch::WriteParent, *value)]
+        }
         // The `for` iterator variable is read (and advanced) — treat as a whole read.
-        MirInstr::HasNext { dest, iter } | MirInstr::Next { dest, iter } => {
+        MirInstr::HasNext { dest, iter, .. } | MirInstr::Next { dest, iter, .. } => {
             vec![(*iter, Vec::new(), Touch::Read, *dest)]
         }
+        MirInstr::CollectionInsert {
+            collection, value, ..
+        } => vec![(*collection, Vec::new(), Touch::Read, *value)],
         _ => Vec::new(),
     }
 }
@@ -1127,10 +1208,18 @@ fn apply_effects(state: &mut [Node], i: &MirInstr) {
         MirInstr::MovePlace { place, .. } => {
             state[place.root as usize].do_move(&place_path(place));
         }
+        MirInstr::ConsumePlace { place, .. } => {
+            state[place.root as usize].do_move(&place_path(place));
+        }
         // A field store reinitializes exactly that field; a dynamic-index store
         // can't precisely reinitialize one element (index-insensitive), so it is
         // left conservative (no reinit).
-        MirInstr::Store { place, .. } if matches!(place.proj.last(), Some(Proj::Field(_))) => {
+        MirInstr::Store { place, .. }
+        | MirInstr::StoreRef { place, .. }
+        | MirInstr::VariantSet { place, .. }
+        | MirInstr::VariantReplace { place, .. }
+            if matches!(place.proj.last(), Some(Proj::Field(_))) =>
+        {
             state[place.root as usize].do_def(&place_path(place));
         }
         _ => {}
@@ -1169,8 +1258,13 @@ fn analyze_moves(f: &MirFunction) -> Result<(), OwnershipError> {
     // assignment before use, so this never causes a false negative for our
     // purpose (tracking transfers) and avoids a spurious "uninitialized" lattice.
     let entry: Vec<Node> = vec![Node::owned(); nv];
-    let mut in_states: Vec<Vec<Node>> = vec![entry.clone(); nb];
-    let mut out_states: Vec<Vec<Node>> = vec![entry.clone(); nb];
+    // `Owned` is a real program state, not the lattice bottom. Seeding every
+    // block with it makes a loop header spuriously join a definite preheader
+    // move with an as-yet-unvisited backedge and permanently report
+    // `MaybeMoved`. Keep unreachable/unvisited states absent until a predecessor
+    // supplies a fact instead.
+    let mut in_states: Vec<Option<Vec<Node>>> = vec![None; nb];
+    let mut out_states: Vec<Option<Vec<Node>>> = vec![None; nb];
 
     // Iterate to a fixpoint: in[b] = ⨆ out[pred], out[b] = transfer(in[b]).
     let mut changed = true;
@@ -1181,17 +1275,23 @@ fn analyze_moves(f: &MirFunction) -> Result<(), OwnershipError> {
             let new_in = if b == 0 || preds[b].is_empty() {
                 entry.clone() // entry block, or an unreachable one
             } else {
-                let mut acc = out_states[preds[b][0]].clone();
-                for &p in &preds[b][1..] {
-                    acc = join_states(&acc, &out_states[p]);
+                let mut predecessors = preds[b]
+                    .iter()
+                    .filter_map(|predecessor| out_states[*predecessor].as_ref());
+                let Some(first) = predecessors.next() else {
+                    continue;
+                };
+                let mut acc = first.clone();
+                for predecessor in predecessors {
+                    acc = join_states(&acc, predecessor);
                 }
                 acc
             };
             let mut new_out = new_in.clone();
             transfer(&mut new_out, &f.blocks[b].instrs);
-            if new_in != in_states[b] || new_out != out_states[b] {
-                in_states[b] = new_in;
-                out_states[b] = new_out;
+            if in_states[b].as_ref() != Some(&new_in) || out_states[b].as_ref() != Some(&new_out) {
+                in_states[b] = Some(new_in);
+                out_states[b] = Some(new_out);
                 changed = true;
             }
         }
@@ -1201,7 +1301,7 @@ fn analyze_moves(f: &MirFunction) -> Result<(), OwnershipError> {
     // every place use against the current move-state. Returns the first violation.
     #[allow(clippy::needless_range_loop)]
     for b in 0..nb {
-        let mut state = in_states[b].clone();
+        let mut state = in_states[b].clone().unwrap_or_else(|| entry.clone());
         for instr in &f.blocks[b].instrs {
             for (root, path, touch, reg) in place_uses(instr) {
                 let node = &state[root as usize];

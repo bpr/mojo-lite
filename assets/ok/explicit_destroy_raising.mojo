@@ -1,5 +1,5 @@
 @explicit_destroy("finish the transaction")
-struct Transaction:
+struct Transaction(ImplicitlyDeletable where False):
     var id: Int
 
     def __init__(out self, id: Int):

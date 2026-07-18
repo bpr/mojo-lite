@@ -84,7 +84,7 @@ fn struct_and_generic_parameter_types_mangle_from_their_annotations() {
 fn nested_defs_lift_to_dollar_joined_names() {
     let names = lowered_names(
         "def outer(x: Int) -> Int:\n\
-         \x20   def inner(y: Int) -> Int:\n\
+         \x20   def inner(y: Int) unified {imm x} -> Int:\n\
          \x20       return y + x\n\
          \x20   return inner(1)\n",
     );

@@ -244,3 +244,71 @@ fn nested_loop_in_region_absorbs_its_own_break() {
         "a break of the region's own loop stays a local Jump"
     );
 }
+
+#[test]
+fn checked_hir_retains_semantic_identity_type_and_adjustments() {
+    let body = mojito::parse(
+        "def f(x: Int) -> Int:\n    return x\n\ndef main():\n    var y: Int = f(1 + 2)\n",
+    )
+    .expect("parse");
+    let checked = mojito::check_program(&body).expect("check");
+    let main_body = match &checked.statements()[1].kind {
+        mojito::ast::StmtKind::Def { body, .. } => body,
+        _ => panic!("expected main"),
+    };
+    let cfg = Cfg::build_checked_fn(&checked, &[], main_body);
+    let expression = cfg
+        .g
+        .node_weights()
+        .flat_map(|block| &block.instrs)
+        .find_map(|instr| match instr {
+            mojito::hir::HirInstr::Bind { expr, .. } => Some(expr),
+            _ => None,
+        })
+        .expect("checked bind");
+    assert!(expression.checked.is_some());
+    assert!(expression.ty.is_some());
+    assert_eq!(
+        expression.children.len(),
+        1,
+        "the call retains its argument"
+    );
+    assert_eq!(
+        expression.children[0].children.len(),
+        2,
+        "the argument retains both operator operands"
+    );
+    assert!(
+        expression
+            .children
+            .iter()
+            .flat_map(|child| std::iter::once(child).chain(&child.children))
+            .all(|child| child.checked.is_some()),
+        "every recursively retained child has checked identity"
+    );
+}
+
+#[test]
+fn checked_hir_places_use_owner_identity_and_typed_projections() {
+    let program = mojito::parse(
+        "@fieldwise_init\nstruct Cell:\n    var value: Int\n\ndef read(cell: Cell) -> Int:\n    return cell.value\n",
+    ).expect("parse");
+    let checked = mojito::check_program(&program).expect("check");
+    let body = match &checked.statements()[1].kind {
+        mojito::ast::StmtKind::Def { body, .. } => body,
+        _ => panic!("expected function"),
+    };
+    let cfg = Cfg::build_checked_fn(&checked, &["cell".to_string()], body);
+    let expression = cfg
+        .g
+        .node_weights()
+        .find_map(|block| match &block.term {
+            Some(Terminator::Return(Some(expression))) => Some(expression),
+            _ => None,
+        })
+        .expect("return expression");
+    let place = expression.place.as_ref().expect("checked place");
+    assert!(matches!(place.root_ty, mojito::Ty::Struct(ref name, _) if name == "Cell"));
+    assert_eq!(place.projections.len(), 1);
+    assert_eq!(place.ty, mojito::Ty::Int);
+}

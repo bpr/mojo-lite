@@ -2,17 +2,18 @@
 
 ## Decision context
 
-Mojito parses and binds homogeneous free-function `**kwargs` parameters. The ordinary call
-path already carries ordered keyword pairs and `match_call_slots` is the shared
-checker binder. Unknown keywords are therefore the natural point at which a
-keyword collector would take ownership of the remaining arguments; duplicate
-keywords are already rejected.
+Mojito parses and binds homogeneous `**kwargs` parameters on free, generic,
+instance, static, and trait-bounded calls. The ordinary call path carries ordered
+keyword pairs and `match_call_slots` is the shared checker binder. Unknown
+keywords are therefore the natural point at which a keyword collector takes
+ownership of the remaining arguments; duplicate keywords are rejected by the
+same structural contract.
 
 The strengthened self-hosted collections establish that nested pointer-backed
-containers can copy correctly, that `Dict` and `HashDict` preserve insertion
-order, and that `HashDict[String, V]` can represent a homogeneous Mojo
-`**kwargs: V` mapping. They also expose the cost: copying a hash dictionary walks
-its dense entries, bucket-index lists, and inner pointer buffers.
+containers can copy correctly and preserve insertion order. Earlier Mojito used
+`HashDict[String, V]` as a provisional public collector type. The tracked Mojo
+nightly subsequently standardized the purpose-built owning `StringDict[V]`, so
+the generic hash-table choice is now historical rather than an open decision.
 
 ## Options
 
@@ -37,19 +38,24 @@ its dense entries, bucket-index lists, and inner pointer buffers.
   duplicates remain errors.
 - `FnSig` needs keyword-collector metadata parallel to its variadic positional
   metadata, and the checker must type the local consistently on every backend.
+- `callee(**kwargs^)` consumes exactly one `StringDict[T]`; entries retain source
+  order, flow back through ordinary binding, and keep duplicate-key diagnostics.
 
 ## Recommendation
 
-Use the existing ordered keyword-pair vector as the initial internal ABI and
-delay choosing the public local type. Once implicit stdlib identity and direct
-in-frame construction are available, expose or lower that storage as a
-self-hosted `HashDict[String, T]`. Do not add a new builtin dictionary `Value`:
-it would be cheap initially but would duplicate ordering, copying, hashing, and
-iteration semantics now demonstrated by the library implementation.
+Keep the ordered keyword-pair vector as the internal ABI and expose it through
+the nightly's self-hosted `StringDict[T]`. Do not add a second builtin dictionary
+`Value`: that would duplicate ordering, ownership, iteration, and destruction
+semantics already expressed by the library implementation.
 
 ## Implemented decision
 
 The ordered pair vector remains the internal ABI. The linker injects the bundled
-`HashDict` implementation for programs declaring a collector, the checker exposes
-the local as `HashDict[String, T]`, and the VM constructs it directly in the callee
-frame. Method and generic collectors remain separate language-expansion work.
+`StringDict` implementation for programs declaring a collector, the checker
+exposes the local as `StringDict[T]`, and the VM constructs it directly in the
+callee frame. For `**kwargs^`, the parser requires the transfer sigil and the VM
+moves each entry out of the consumed dictionary before applying the shared call
+binder. Generic specialization infers from collected values, and instance,
+static, and bounded-trait methods use the same element coercion, ownership,
+origin, duplicate, and selected-effect checks as ordinary calls. A forwarded
+dictionary is a move and cannot be reused by the caller.

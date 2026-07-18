@@ -20,7 +20,10 @@ pub(super) fn parameter_is_writable(convention: Option<ArgConvention>) -> bool {
 pub(super) fn is_place_expr(e: &Expr) -> bool {
     matches!(
         e.kind,
-        ExprKind::Identifier(_) | ExprKind::Member { .. } | ExprKind::Index { .. }
+        ExprKind::Identifier(_)
+            | ExprKind::Member { .. }
+            | ExprKind::Index { .. }
+            | ExprKind::TypeApply { .. }
     )
 }
 

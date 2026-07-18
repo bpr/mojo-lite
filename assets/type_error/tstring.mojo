@@ -1,4 +1,7 @@
-# A t-string (interpolation) — parsed into sub-expressions, semantics deferred.
-# expect: t-string
-def greet(name: String, count: Int):
-    print(t"Hello {name}, you have {count + 1} messages")
+# Interpolated values must satisfy Writable.
+# expect: Writable
+struct Opaque:
+    var value: Int
+
+def greet(value: Opaque):
+    print(t"opaque={value}")

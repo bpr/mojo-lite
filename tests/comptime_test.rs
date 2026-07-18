@@ -64,6 +64,16 @@ fn comptime_for_quota_rejects_a_huge_unroll() {
 }
 
 #[test]
+fn fixed_width_comptime_overflow_is_a_diagnostic_not_a_panic() {
+    let error = run("def main():\n    comptime huge = 2 ** 200\n    print(huge)\n")
+        .expect_err("arbitrary-precision literal evaluation remains a recorded gap");
+    assert!(
+        error.contains("compile-time integer overflow"),
+        "got {error}"
+    );
+}
+
+#[test]
 fn comptime_for_iterates_a_heterogeneous_tuple() {
     // The payoff: `t[i]` needs a compile-time-constant index (tuple elements are
     // heterogeneous), which a runtime `for` can't provide — but `comptime for`
@@ -77,6 +87,14 @@ fn comptime_for_over_a_tuple_of_strings() {
     // The codex-direction milestone: iterate a compile-time tuple of strings.
     let src = "comptime states = (\"empty\", \"occupied\", \"deleted\")\n\ndef main():\n    comptime for state in states:\n        print(state)\n";
     assert_eq!(run(src).unwrap(), "empty\noccupied\ndeleted\n");
+}
+
+#[test]
+fn heterogeneous_type_pack_round_trips_through_tuple_spread() {
+    // Mirrors current Mojo: a heterogeneous variadic pack can be transferred
+    // into `Tuple[*Ts]`; this is not general fixed-arity call spreading.
+    let src = "def repack[*Ts: Movable](var *args: *Ts) -> Tuple[*Ts]:\n    return Tuple[*Ts](*args^)\n\ndef main():\n    var values: Tuple[Int, String, Bool] = repack(3, \"seven\", True)\n    print(values)\n";
+    assert_eq!(run(src).unwrap(), "(3, seven, True)\n");
 }
 
 #[test]
@@ -117,7 +135,7 @@ fn ctfe_supports_recursion() {
 
 #[test]
 fn ctfe_is_fuel_bounded() {
-    let err = run("def spin(n: Int) -> Int:\n    while True:\n        n = n + 1\n    return n\ncomptime X = spin(0)\n\ndef main():\n    print(X)\n").unwrap_err();
+    let err = run("def spin(n: Int) -> Int:\n    var i = n\n    while True:\n        i = i + 1\n    return i\ncomptime X = spin(0)\n\ndef main():\n    print(X)\n").unwrap_err();
     assert!(err.contains("quota"), "got {err}");
 }
 
@@ -147,6 +165,85 @@ fn generic_value_param_comptime_if_selects_per_instantiation() {
     // needs monomorphization: the template is specialized after its argument known.
     let src = "def f[n: Int]() -> Int:\n    comptime if n == 0:\n        return 10\n    else:\n        return 20\n\ndef main():\n    print(f[0](), f[1]())\n";
     assert_eq!(run(src).unwrap(), "10 20\n");
+}
+
+#[test]
+fn string_value_parameter_specializes_and_materializes() {
+    let src = "def label[text: String]() -> String:\n    comptime if text == \"short\":\n        return text + \"!\"\n    else:\n        return \"other\"\n\ndef main():\n    print(label[\"short\"]())\n    print(label[\"long\"]())\n";
+    assert_eq!(run(src).unwrap(), "short!\nother\n");
+}
+
+#[test]
+fn specialization_uses_defaulted_compile_time_value_parameter() {
+    let src = "def width[n: Int = 4]() -> Int:\n    comptime if n == 4:\n        return n\n    else:\n        return 0\n\ndef main():\n    print(width())\n    print(width[8]())\n";
+    assert_eq!(run(src).unwrap(), "4\n0\n");
+}
+
+#[test]
+fn specialization_evaluates_dependent_parameter_defaults() {
+    let src = "def columns[rows: Int, count: Int = rows + 1]() -> Int:\n    comptime if count > rows:\n        return count\n    else:\n        return 0\n\ndef main():\n    print(columns[3]())\n";
+    assert_eq!(run(src).unwrap(), "4\n");
+}
+
+#[test]
+fn unified_reflection_handle_exposes_struct_field_facts() {
+    let src = "@fieldwise_init\nstruct Point:\n    var x: Int\n    var label: String\n\ndef main():\n    comptime r = reflect[Point]\n    comptime count = r.field_count()\n    comptime names = r.field_names()\n    comptime types = r.field_types()\n    print(count, names[0], names[1])\n    comptime if is_same_type[types[0], Int]():\n        print(\"int\")\n";
+    assert_eq!(run(src).unwrap(), "2 x label\nint\n");
+}
+
+#[test]
+fn reflection_supports_named_indexed_and_chainable_field_handles() {
+    let src = "struct Coordinates:\n    var x: Int\n    var y: Float64\n\nstruct Point:\n    var coordinates: Coordinates\n\ndef main():\n    comptime r = reflect[Point]\n    comptime index = r.field_index[\"coordinates\"]()\n    comptime reflected = r.field[\"coordinates\"].field_at[1]\n    var value: reflected.T = 3.5\n    print(index, value)\n";
+    assert_eq!(run(src).unwrap(), "0 3.5\n");
+}
+
+#[test]
+fn reflection_field_handles_substitute_generic_struct_arguments() {
+    let src = "@fieldwise_init\nstruct Boxed[T: Copyable & Movable]:\n    var value: Self.T\n\ndef main():\n    comptime reflected = reflect[Boxed[String]].field_at[0]\n    var value: reflected.T = \"generic\"\n    print(value)\n";
+    assert_eq!(run(src).unwrap(), "generic\n");
+}
+
+#[test]
+fn reflection_rejects_removed_field_type_spelling() {
+    let error = run("struct Point:\n    var x: Int\n\ndef main():\n    comptime reflected = reflect[Point].field_type[\"x\"]()\n")
+        .unwrap_err();
+    assert!(
+        error.contains("field_type was removed") && error.contains("field[name]"),
+        "got {error}"
+    );
+}
+
+#[test]
+fn reflection_rejects_invalid_named_and_indexed_field_selection() {
+    let missing = run("struct Point:\n    var x: Int\n\ndef main():\n    comptime reflected = reflect[Point].field[\"missing\"]\n")
+        .unwrap_err();
+    assert!(
+        missing.contains("has no field named 'missing'"),
+        "got {missing}"
+    );
+
+    let out_of_range = run("struct Point:\n    var x: Int\n\ndef main():\n    comptime reflected = reflect[Point].field_at[1]\n")
+        .unwrap_err();
+    assert!(
+        out_of_range.contains("field index 1 is out of range"),
+        "got {out_of_range}"
+    );
+}
+
+#[test]
+fn reflection_can_conditionally_generate_a_declaration() {
+    let src = "struct Unit:\n    var value: Int\n\ncomptime reflected = reflect[Unit]\ncomptime if reflected.field_count() == 1:\n    def generated() -> String:\n        return \"generated\"\nelse:\n    def generated() -> String:\n        return \"wrong\"\n\ndef main():\n    print(generated())\n";
+    assert_eq!(run(src).unwrap(), "generated\n");
+}
+
+#[test]
+fn string_value_parameter_rejects_a_value_of_the_wrong_type() {
+    let src = "def label[text: String]() -> String:\n    return text\n\ndef main():\n    print(label[1]())\n";
+    let error = run(src).unwrap_err();
+    assert!(
+        error.contains("expected: \"String\"") && error.contains("found: \"Int\""),
+        "got {error}"
+    );
 }
 
 #[test]
@@ -182,6 +279,18 @@ fn generic_comptime_specialization_recurses_and_unrolls() {
 fn heterogeneous_pack_length_drives_comptime_iteration() {
     let src = "def sum_values[*ArgTypes: Intable](*args: *ArgTypes) -> Int:\n    var total: Int = 0\n    comptime for i in range(args.__len__()):\n        total = total + Int(args[i])\n    return total\n\ndef main():\n    print(sum_values(1, True, 2.0))\n";
     assert_eq!(run(src).unwrap(), "4\n");
+}
+
+#[test]
+fn heterogeneous_pack_indexes_expose_concrete_element_types() {
+    let src = "def first_plus_one[*Types: Copyable](*args: *Types) -> Int:\n    comptime if is_same_type[Types[0], Int]():\n        return args[0] + 1\n    else:\n        return 0\n\ndef main():\n    print(first_plus_one(4, \"tail\"))\n    print(first_plus_one(\"head\", 4))\n";
+    assert_eq!(run(src).unwrap(), "5\n0\n");
+}
+
+#[test]
+fn variadic_value_pack_specializes_and_unrolls() {
+    let src = "def total[*values: Int]() -> Int:\n    var result = 0\n    comptime for value in values:\n        result = result + value\n    return result\n\ndef main():\n    print(total[1, 2, 3, 4]())\n";
+    assert_eq!(run(src).unwrap(), "10\n");
 }
 
 #[test]

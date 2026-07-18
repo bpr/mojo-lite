@@ -27,7 +27,11 @@ pub use ast::{
     TypeParam,
 };
 pub use backend::{Backend, BackendKind};
-pub use checked::{CheckedConst, CheckedProgram};
+pub use checked::{
+    CheckedConst, CheckedDeclId, CheckedDeclKind, CheckedDeclaration, CheckedExpr, CheckedNodeId,
+    CheckedProgram, EffectFacts, IterationMode, IterationProtocol, SemanticAdjustment,
+    ValueCategory,
+};
 pub use checker::{Checker, check, check_program};
 pub use compiler::{CompiledProgram, Compiler, CompilerError, Execution, validate_module_scope};
 pub use comptime::{ComptimeError, elaborate};
@@ -37,7 +41,9 @@ pub use lexer::Lexer;
 pub use module::{
     LinkOptions, ModuleError, link, link_source, link_source_with_options, link_with_options,
 };
-pub use origin::{Mutability, Origin, OriginParamId, OriginPlace, OriginSeg, OwnerId, RefTy};
+pub use origin::{
+    Mutability, Origin, OriginParamId, OriginPlace, OriginSeg, OwnerId, PointerOrigin, RefTy,
+};
 pub use parser::{ParseReport, Parser};
 pub use runtime::Value;
 pub use token::{SourceSpan, Token};

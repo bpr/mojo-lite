@@ -6,7 +6,7 @@
 //!
 //! The regression cases documented in `overload_errors.md` are required tests.
 //! The rest of the suite pins correct-by-design behavior — including the deliberately
-//! conservative ambiguity rejections that Mojo's full ranking would resolve.
+//! literal-default ranking and the ambiguity rejections that remain after it.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -315,18 +315,18 @@ fn generic_overloads_differing_only_in_bounds_get_distinct_symbols() {
 // =========================================================================
 
 #[test]
-fn rejects_ambiguous_int_literal_between_int_and_float64() {
-    assert_ambiguous(
-        "def f(x: Int) -> Int:\n    return 0\n\ndef f(x: Float64) -> Int:\n    return 1\n\nvar r: Int = f(1)\n",
-        "f",
+fn int_literal_defaults_to_int_over_float64() {
+    assert_eq!(
+        vm("def f(x: Int) -> Int:\n    return 0\n\ndef f(x: Float64) -> Int:\n    return 1\n\ndef main():\n    print(f(1))\n"),
+        "0\n"
     );
 }
 
 #[test]
-fn rejects_ambiguous_int_literal_between_int_and_uint() {
-    assert_ambiguous(
-        "def f(x: Int) -> Int:\n    return 0\n\ndef f(x: UInt) -> Int:\n    return 1\n\nvar r: Int = f(1)\n",
-        "f",
+fn int_literal_defaults_to_int_over_uint() {
+    assert_eq!(
+        vm("def f(x: Int) -> Int:\n    return 0\n\ndef f(x: UInt) -> Int:\n    return 1\n\ndef main():\n    print(f(1))\n"),
+        "0\n"
     );
 }
 
@@ -348,14 +348,10 @@ fn rejects_ambiguous_multi_argument_literal_tie() {
 }
 
 #[test]
-fn rejects_ambiguous_partial_literal_tie() {
-    // Exact first argument, literal second: (Int, Int) and (Int, Float64) both
-    // score one coercion. Mojo's ranking would prefer (Int, Int); mojito's
-    // conservative coercion count rejects the tie (see overload_errors.md,
-    // design notes) — this test pins the conservative behavior on purpose.
-    assert_ambiguous(
-        "def f(a: Int, b: Int) -> Int:\n    return 0\n\ndef f(a: Int, b: Float64) -> Int:\n    return 1\n\nvar i: Int = 3\nvar r: Int = f(i, 2)\n",
-        "f",
+fn defaulted_literal_breaks_a_partial_overload_tie() {
+    assert_eq!(
+        vm("def f(a: Int, b: Int) -> Int:\n    return 0\n\ndef f(a: Int, b: Float64) -> Int:\n    return 1\n\ndef main():\n    var i: Int = 3\n    print(f(i, 2))\n"),
+        "0\n"
     );
 }
 
@@ -369,25 +365,19 @@ fn rejects_ambiguous_generic_overloads_when_both_bounds_hold() {
 }
 
 #[test]
-fn rejects_ambiguous_keyword_literal_call() {
-    // Keyword binding does not disambiguate a literal coercion tie.
-    assert_ambiguous(
-        "def f(x: Int) -> Int:\n    return 0\n\ndef f(x: Float64) -> Int:\n    return 1\n\nvar r: Int = f(x=1)\n",
-        "f",
+fn keyword_literal_uses_its_default_type_for_overload_selection() {
+    assert_eq!(
+        vm("def f(x: Int) -> Int:\n    return 0\n\ndef f(x: Float64) -> Int:\n    return 1\n\ndef main():\n    print(f(x=1))\n"),
+        "0\n"
     );
 }
 
 #[test]
-fn rejects_ambiguous_constructor_literal() {
-    match err(
-        "struct Box:\n    var n: Int\n    def __init__(out self, x: Int):\n        self.n = x\n    def __init__(out self, x: Float64):\n        self.n = 0\n\nvar b: Box = Box(1)\n",
-    ) {
-        TypeError::BadCall { func, reason } => {
-            assert_eq!(func, "Box");
-            assert!(reason.contains("ambiguous"), "got: {reason}");
-        }
-        other => panic!("expected an ambiguous constructor BadCall, got: {other:?}"),
-    }
+fn constructor_literal_uses_its_default_type() {
+    assert_eq!(
+        vm("struct Box:\n    var n: Int\n    def __init__(out self, x: Int):\n        self.n = x\n    def __init__(out self, x: Float64):\n        self.n = 0\n\ndef main():\n    var b = Box(1)\n    print(b.n)\n"),
+        "1\n"
+    );
 }
 
 #[test]
@@ -433,17 +423,11 @@ fn overload_set_fully_shadows_a_builtin_name() {
 }
 
 #[test]
-fn reports_ambiguous_method_call_as_ambiguous() {
-    // The method exists; the call is ambiguous. Today: "type 'Box' has no
-    // method 'm'".
-    match err(
-        "@fieldwise_init\nstruct Box:\n    var n: Int\n    def m(self, x: Int) -> Int:\n        return x\n    def m(self, x: Float64) -> Int:\n        return 0\n\nvar b: Box = Box(1)\nvar r: Int = b.m(1)\n",
-    ) {
-        TypeError::BadCall { reason, .. } => {
-            assert!(reason.contains("ambiguous"), "got: {reason}")
-        }
-        other => panic!("expected an ambiguous method BadCall, got: {other:?}"),
-    }
+fn method_literal_uses_its_default_type() {
+    assert_eq!(
+        vm("@fieldwise_init\nstruct Box:\n    var n: Int\n    def m(self, x: Int) -> Int:\n        return x\n    def m(self, x: Float64) -> Int:\n        return 0\n\ndef main():\n    var b = Box(1)\n    print(b.m(1))\n"),
+        "1\n"
+    );
 }
 
 #[test]

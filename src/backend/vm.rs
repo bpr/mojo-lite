@@ -12,12 +12,14 @@ use crate::call::{ArgSlot, CallVariadics, match_call_slots};
 use crate::checked::CheckedConst;
 use crate::error::RuntimeError;
 use crate::hir::VarId;
-use crate::mir::{Const, MirBlock, MirInstr, MirPlace, MirProgram, MirTerm, Proj, Reg};
+use crate::mir::{
+    Const, MirBlock, MirInstr, MirPlace, MirProgram, MirSubscriptArg, MirTerm, Proj, Reg,
+};
 use crate::runtime::{
     RefProjection, Value, apply_infix, apply_list_method, apply_prefix, builtin_abs,
     builtin_convert, builtin_divmod, builtin_error, builtin_input, builtin_min_max, builtin_round,
-    coerce, is_list_mutator, list_query, promote_numeric_elems, read_simd_lane, simd_from_values,
-    value_as_index,
+    is_list_mutator, list_query, promote_numeric_elems, read_simd_lane, simd_from_values,
+    value_as_index, values_equal,
 };
 use crate::types::Ty;
 use std::collections::HashMap;
@@ -174,6 +176,39 @@ impl Prog {
             name.to_string()
         }
     }
+
+    /// Resolve a selected method signature against the receiver's concrete
+    /// runtime type. Bounded generic calls carry an abstract checker symbol;
+    /// retargeting its suffix preserves overload selection even when every
+    /// overload has the same positional arity (for example `**kwargs` methods).
+    fn runtime_method_name(
+        &self,
+        receiver_type: &str,
+        method: &str,
+        resolved: Option<&str>,
+        argc: usize,
+    ) -> String {
+        if let Some(selected) = resolved {
+            if let Some(retargeted) =
+                crate::symbol::retarget_method_symbol(selected, receiver_type)
+                && self.index_of(&retargeted).is_some()
+            {
+                return retargeted;
+            }
+            if self.index_of(selected).is_some() {
+                return selected.to_string();
+            }
+        }
+        self.overload_name(&format!("{receiver_type}.{method}"), argc)
+    }
+}
+
+#[derive(Default)]
+struct HeapAllocation {
+    slots: Vec<Value>,
+    #[allow(dead_code)]
+    alignment: usize,
+    live: bool,
 }
 
 #[derive(Default)]
@@ -182,11 +217,10 @@ pub struct VmBackend {
     /// The final top-level (`__toplevel__`) variable values, by name — the global
     /// bindings, captured after execution for the CLI `run` dump and tests.
     bindings: Vec<(String, Value)>,
-    /// The type-erased heap arena backing `UnsafePointer[T]` (Option B): an
-    /// `UnsafePointer(base)` is an offset into this `Vec`. `alloc(n)` appends `n`
-    /// slots and returns the base; `free()` is a no-op (a model-level arena that
-    /// never reclaims — fine for a bounded interpreter).
-    heap: Vec<Value>,
+    /// Provenance-bearing allocations. Pointer copies retain an allocation id;
+    /// freeing invalidates every alias and allocation bounds are never confused
+    /// with adjacent allocations.
+    heap: Vec<HeapAllocation>,
     /// Whether the program defines any `__copyinit__` / `__moveinit__`. When false,
     /// a value copy/move is the default (a raw deep `Clone` / a slot transfer) — the
     /// common fast path, keeping non-lifecycle programs unchanged. When true, a
@@ -219,7 +253,11 @@ impl VmBackend {
         value_params: &[(String, Value)],
         fuel: usize,
     ) -> Result<(Value, usize), RuntimeError> {
-        let checked = crate::checked::CheckedProgram::prevalidated_ctfe(program);
+        let checked = crate::checker::check_program(program).map_err(|error| {
+            RuntimeError::TypeError(format!(
+                "VM compile-time program failed the checked boundary: {error}"
+            ))
+        })?;
         let prog = build_prog_checked(&checked)?;
         self.configure_lifecycle(&prog);
         let idx = prog.index_of(name).ok_or_else(|| {
@@ -252,28 +290,85 @@ impl VmBackend {
 
     /// Allocate `n` uninitialized (`None`) slots in the heap arena, returning a
     /// pointer to the base. A negative/absurd count is a runtime error.
-    fn heap_alloc(&mut self, n: i64) -> Result<Value, RuntimeError> {
+    fn heap_alloc(&mut self, n: i64, alignment: i64) -> Result<Value, RuntimeError> {
         if n < 0 {
             return Err(RuntimeError::TypeError(
                 "vm: UnsafePointer.alloc count must be non-negative".to_string(),
             ));
         }
-        let base = self.heap.len();
-        self.heap.resize(base + n as usize, Value::None);
-        Ok(Value::Pointer(base))
+        if alignment <= 0 || !(alignment as u64).is_power_of_two() {
+            return Err(RuntimeError::TypeError(
+                "vm: UnsafePointer allocation alignment must be a positive power of two"
+                    .to_string(),
+            ));
+        }
+        self.heap.push(HeapAllocation {
+            slots: vec![Value::None; n as usize],
+            alignment: alignment as usize,
+            live: true,
+        });
+        Ok(Value::Pointer {
+            allocation: self.heap.len() as u64,
+            offset: 0,
+        })
     }
 
     /// Resolve `base + offset` to an arena index, bounds-checking against the arena
     /// (a truly out-of-arena access errors rather than panicking; an in-arena but
     /// past-allocation access is permitted — `UnsafePointer` is unchecked).
-    fn heap_index(&self, base: usize, offset: i64) -> Result<usize, RuntimeError> {
-        let i = base as i64 + offset;
-        if i < 0 || i as usize >= self.heap.len() {
+    fn heap_index(
+        &self,
+        allocation: u64,
+        base: i64,
+        offset: i64,
+    ) -> Result<(usize, usize), RuntimeError> {
+        if allocation == 0 {
+            return Err(RuntimeError::TypeError(
+                "vm: dereference of dangling UnsafePointer".to_string(),
+            ));
+        }
+        let allocation_index = usize::try_from(allocation - 1).map_err(|_| {
+            RuntimeError::TypeError("vm: invalid UnsafePointer provenance".to_string())
+        })?;
+        let region = self.heap.get(allocation_index).ok_or_else(|| {
+            RuntimeError::TypeError("vm: invalid UnsafePointer provenance".to_string())
+        })?;
+        if !region.live {
+            return Err(RuntimeError::TypeError(
+                "vm: use after UnsafePointer.free()".to_string(),
+            ));
+        }
+        let i = base.checked_add(offset).ok_or_else(|| {
+            RuntimeError::TypeError("vm: UnsafePointer offset overflow".to_string())
+        })?;
+        if i < 0 || i as usize >= region.slots.len() {
             return Err(RuntimeError::TypeError(
                 "vm: UnsafePointer access out of bounds".to_string(),
             ));
         }
-        Ok(i as usize)
+        Ok((allocation_index, i as usize))
+    }
+
+    fn heap_free(&mut self, allocation: u64, offset: i64) -> Result<(), RuntimeError> {
+        if allocation == 0 || offset != 0 {
+            return Err(RuntimeError::TypeError(
+                "vm: free requires a live allocation-base pointer".to_string(),
+            ));
+        }
+        let region = self
+            .heap
+            .get_mut((allocation - 1) as usize)
+            .ok_or_else(|| {
+                RuntimeError::TypeError("vm: invalid UnsafePointer provenance".to_string())
+            })?;
+        if !region.live {
+            return Err(RuntimeError::TypeError(
+                "vm: double free of UnsafePointer allocation".to_string(),
+            ));
+        }
+        region.live = false;
+        region.slots.clear();
+        Ok(())
     }
 
     /// Execute one function, returning its return value plus the final variable
@@ -316,8 +411,8 @@ impl VmBackend {
         let regs = vec![Value::None; f.n_regs as usize];
         let mut vars = vec![Value::None; f.n_vars];
         for (i, arg) in args.into_iter().enumerate() {
-            vars[i] = match f.param_annotations.get(i) {
-                Some(t) => coerce(arg, t),
+            vars[i] = match f.param_types.get(i) {
+                Some(t) => crate::runtime::coerce_checked(arg, t),
                 None => arg,
             };
         }
@@ -455,35 +550,51 @@ impl VmBackend {
             callee,
             args,
             kwargs,
+            ..
         } = instruction
         {
-            let Value::Function(function_name) = &caller.registers[callee.0 as usize] else {
-                return Err(RuntimeError::NotCallable(crate::runtime::type_name(
-                    &caller.registers[callee.0 as usize],
-                )));
+            let callable = &caller.registers[callee.0 as usize];
+            let mut nominal_receiver = None;
+            let (function_name, captured) = match callable {
+                Value::Function(function_name) => (function_name.clone(), Vec::new()),
+                Value::Closure { function, captures } => (function.clone(), captures.clone()),
+                Value::Struct { name, .. } => {
+                    nominal_receiver = Some(callable.clone());
+                    (
+                        prog.overload_name(&format!("{name}.__call__"), args.len()),
+                        Vec::new(),
+                    )
+                }
+                value => {
+                    return Err(RuntimeError::NotCallable(crate::runtime::type_name(value)));
+                }
             };
             let index = prog
-                .index_of(function_name)
+                .index_of(&function_name)
                 .ok_or_else(|| RuntimeError::NotCallable(function_name.clone()))?;
-            let positional = args
-                .iter()
-                .map(|register| caller.registers[register.0 as usize].clone())
-                .collect();
+            let mut positional = captured;
+            positional.extend(
+                args.iter()
+                    .map(|register| caller.registers[register.0 as usize].clone()),
+            );
             let keywords = kwargs
                 .iter()
                 .map(|(name, register)| {
                     (name.clone(), caller.registers[register.0 as usize].clone())
                 })
                 .collect();
-            let (bound, _) = match prog.sigs.get(function_name) {
+            let (mut bound, _) = match prog.sigs.get(&function_name) {
                 Some(signature) => {
-                    self.bind_for_call(prog, function_name, signature, positional, keywords)?
+                    self.bind_for_call(prog, &function_name, signature, positional, keywords)?
                 }
                 None => (
                     positional,
                     (0..args.len()).map(ArgSlot::Positional).collect(),
                 ),
             };
+            if let Some(receiver) = nominal_receiver {
+                bound.insert(0, receiver);
+            }
             return self
                 .make_frame(
                     prog,
@@ -506,13 +617,16 @@ impl VmBackend {
             kwargs,
             recv_place,
             arg_places,
+            ..
         } = instruction
             && let Value::Struct { name, .. } = &caller.registers[recv.0 as usize]
         {
-            let source_name = format!("{name}.{method}");
-            let function_name = resolved
-                .clone()
-                .unwrap_or_else(|| prog.overload_name(&source_name, args.len()));
+            let function_name = prog.runtime_method_name(
+                name,
+                method,
+                resolved.as_deref(),
+                args.len(),
+            );
             let Some(index) = prog.index_of(&function_name) else {
                 return Ok(None);
             };
@@ -587,6 +701,7 @@ impl VmBackend {
             kwargs,
             arg_places,
             param_arg_regs,
+            ..
         } = instruction
         else {
             return Ok(None);
@@ -665,20 +780,30 @@ impl VmBackend {
     }
 
     fn reference_to_place(&self, frame: &Frame, place: &MirPlace) -> Result<Value, RuntimeError> {
-        let (target_frame, slot, mut projection) = match &frame.variables[place.root as usize] {
+        Self::reference_to_place_parts(frame.id, &frame.registers, &frame.variables, place)
+    }
+
+    fn reference_to_place_parts(
+        frame_id: FrameId,
+        registers: &[Value],
+        variables: &[Value],
+        place: &MirPlace,
+    ) -> Result<Value, RuntimeError> {
+        let (target_frame, slot, mut projection) = match &variables[place.root as usize] {
             Value::Ref {
                 frame,
                 slot,
                 projection,
             } => (*frame, *slot, projection.clone()),
-            _ => (frame.id.0, place.root as usize, Vec::new()),
+            _ => (frame_id.0, place.root as usize, Vec::new()),
         };
         for segment in &place.proj {
             projection.push(match segment {
                 Proj::Field(name) => RefProjection::Field(name.clone()),
-                Proj::Index(register) => RefProjection::Index(value_as_index(
-                    &frame.registers[register.0 as usize],
-                )? as usize),
+                Proj::Index(register) => {
+                    RefProjection::Index(value_as_index(&registers[register.0 as usize])? as usize)
+                }
+                Proj::Variant(index) => RefProjection::Variant(*index),
             });
         }
         Ok(Value::Ref {
@@ -790,6 +915,7 @@ impl VmBackend {
                 Proj::Index(register) => {
                     RefProjection::Index(value_as_index(&registers[register.0 as usize])? as usize)
                 }
+                Proj::Variant(index) => RefProjection::Variant(*index),
             });
         }
         Ok(Some(Value::Ref {
@@ -829,6 +955,38 @@ impl VmBackend {
         self.call_function(prog, idx, args, &[])
     }
 
+    fn call_subscript_dunder(
+        &mut self,
+        prog: &Prog,
+        receiver: Value,
+        arguments: Vec<Value>,
+        resolved: Option<&str>,
+    ) -> Result<Value, RuntimeError> {
+        let Value::Struct { name, .. } = &receiver else {
+            return Err(RuntimeError::TypeError(
+                "user subscript dispatch requires a struct receiver".to_string(),
+            ));
+        };
+        let source = format!("{name}.__getitem__");
+        let function = resolved
+            .map(str::to_string)
+            .unwrap_or_else(|| prog.overload_name(&source, arguments.len()));
+        let index = prog.index_of(&function).ok_or_else(|| {
+            RuntimeError::Unsupported(format!("vm: struct '{name}' has no matching __getitem__"))
+        })?;
+        let user_arguments = match prog.sigs.get(&function) {
+            Some(signature) => {
+                self.bind_for_call(prog, &function, signature, arguments, Vec::new())?
+                    .0
+            }
+            None => arguments,
+        };
+        let mut bound = Vec::with_capacity(user_arguments.len() + 1);
+        bound.push(receiver);
+        bound.extend(user_arguments);
+        self.call_function(prog, index, bound, &[])
+    }
+
     /// Apply a binary operator, dispatching to a user struct's **dunder** when an
     /// operand is a struct (operator overloading): `a OP b` → `a.__op__(b)` for a
     /// struct left operand; `x in c` / `x not in c` → `c.__contains__(x)` (negated
@@ -841,6 +999,55 @@ impl VmBackend {
         r: Value,
     ) -> Result<Value, RuntimeError> {
         use crate::ast::InfixOp;
+        match (&l, &r, op) {
+            (
+                Value::Pointer { allocation, offset },
+                Value::Int(delta),
+                InfixOp::Add | InfixOp::Sub,
+            ) => {
+                let delta = if op == InfixOp::Sub { -*delta } else { *delta };
+                let offset = offset.checked_add(delta).ok_or_else(|| {
+                    RuntimeError::TypeError("vm: UnsafePointer offset overflow".to_string())
+                })?;
+                return Ok(Value::Pointer {
+                    allocation: *allocation,
+                    offset,
+                });
+            }
+            (
+                Value::Pointer {
+                    allocation: left_allocation,
+                    offset: left_offset,
+                },
+                Value::Pointer {
+                    allocation: right_allocation,
+                    offset: right_offset,
+                },
+                InfixOp::Sub,
+            ) => {
+                if left_allocation != right_allocation {
+                    return Err(RuntimeError::TypeError(
+                        "vm: cannot subtract pointers with different provenance".to_string(),
+                    ));
+                }
+                return Ok(Value::Int(left_offset - right_offset));
+            }
+            (
+                Value::Pointer {
+                    allocation: left_allocation,
+                    offset: left_offset,
+                },
+                Value::Pointer {
+                    allocation: right_allocation,
+                    offset: right_offset,
+                },
+                InfixOp::Eq | InfixOp::Ne,
+            ) => {
+                let equal = left_allocation == right_allocation && left_offset == right_offset;
+                return Ok(Value::Bool(if op == InfixOp::Eq { equal } else { !equal }));
+            }
+            _ => {}
+        }
         if matches!(op, InfixOp::In | InfixOp::NotIn) {
             if let Value::Struct { name, .. } = &r {
                 let sname = name.clone();
@@ -903,29 +1110,38 @@ impl VmBackend {
         vars: &mut [Value],
     ) -> Result<(), RuntimeError> {
         enum Target {
-            Pointer(usize, Reg),
-            StructIndex(MirPlace, Reg),
+            Pointer(u64, i64, Reg),
+            StructIndex(Box<MirPlace>, Reg),
             Ordinary,
         }
         let target = if let Some((Proj::Index(index), prefix)) = place.proj.split_last() {
             let parent = MirPlace {
                 root: place.root,
+                root_ty: place.root_ty.clone(),
                 proj: prefix.to_vec(),
+                projection_tys: place.projection_tys[..prefix.len()].to_vec(),
+                ty: if prefix.is_empty() {
+                    place.root_ty.clone()
+                } else {
+                    place.projection_tys.get(prefix.len() - 1).cloned()
+                },
                 through: place.through,
             };
             match nav_mut(vars, regs, &parent)? {
-                Value::Pointer(base) => Target::Pointer(*base, *index),
-                Value::Struct { .. } => Target::StructIndex(parent, *index),
+                Value::Pointer { allocation, offset } => {
+                    Target::Pointer(*allocation, *offset, *index)
+                }
+                Value::Struct { .. } => Target::StructIndex(Box::new(parent), *index),
                 _ => Target::Ordinary,
             }
         } else {
             Target::Ordinary
         };
         match target {
-            Target::Pointer(base, index) => {
+            Target::Pointer(allocation, base, index) => {
                 let offset = value_as_index(&regs[index.0 as usize])?;
-                let slot = self.heap_index(base, offset)?;
-                self.heap[slot] = value;
+                let (region, slot) = self.heap_index(allocation, base, offset)?;
+                self.heap[region].slots[slot] = value;
                 Ok(())
             }
             Target::StructIndex(parent, index) => {
@@ -1059,6 +1275,23 @@ impl VmBackend {
                 }
                 Ok(Value::List(out))
             }
+            Value::Set(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    out.push(self.clone_value(prog, item)?);
+                }
+                Ok(Value::Set(out))
+            }
+            Value::Dict(entries) => {
+                let mut out = Vec::with_capacity(entries.len());
+                for (key, value) in entries {
+                    out.push((
+                        self.clone_value(prog, key)?,
+                        self.clone_value(prog, value)?,
+                    ));
+                }
+                Ok(Value::Dict(out))
+            }
             Value::Tuple(items) => {
                 let mut out = Vec::with_capacity(items.len());
                 for it in items {
@@ -1066,6 +1299,15 @@ impl VmBackend {
                 }
                 Ok(Value::Tuple(out))
             }
+            Value::Variant {
+                alternatives,
+                index,
+                value,
+            } => Ok(Value::Variant {
+                alternatives: alternatives.clone(),
+                index: *index,
+                value: Box::new(self.clone_value(prog, value)?),
+            }),
             // Scalars alias/copy trivially; a bare pointer copy *aliases* (correct —
             // deep-copy is the owning struct's `__copyinit__` job, handled above).
             other => Ok(other.clone()),
@@ -1126,7 +1368,14 @@ impl VmBackend {
         };
         let parent = MirPlace {
             root: place.root,
+            root_ty: place.root_ty.clone(),
             proj: prefix.to_vec(),
+            projection_tys: place.projection_tys[..prefix.len()].to_vec(),
+            ty: if prefix.is_empty() {
+                place.root_ty.clone()
+            } else {
+                place.projection_tys.get(prefix.len() - 1).cloned()
+            },
             through: place.through,
         };
         let recv = nav_mut(vars, regs, &parent)?.clone();
@@ -1141,10 +1390,10 @@ impl VmBackend {
                     vec![recv, idx],
                 )?))
             }
-            Value::Pointer(b) => {
+            Value::Pointer { allocation, offset } => {
                 let off = value_as_index(&regs[ireg.0 as usize])?;
-                let i = self.heap_index(*b, off)?;
-                let value = self.heap[i].clone();
+                let (region, i) = self.heap_index(*allocation, *offset, off)?;
+                let value = self.heap[region].slots[i].clone();
                 Ok(Some(if self.has_copyinit {
                     self.clone_value(prog, &value)?
                 } else {
@@ -1218,6 +1467,22 @@ impl VmBackend {
         argv: Vec<Value>,
         kwargs: Vec<(String, Value)>,
     ) -> Result<(Vec<Value>, Vec<ArgSlot>), RuntimeError> {
+        let mut expanded = Vec::new();
+        let mut forwarded = false;
+        for (name, value) in kwargs {
+            if name == crate::ast::FORWARDED_KWARGS_NAME {
+                if forwarded {
+                    return Err(RuntimeError::TypeError(
+                        "a call may forward only one StringDict".to_string(),
+                    ));
+                }
+                forwarded = true;
+                expanded.extend(self.take_forwarded_kwargs(value)?);
+            } else {
+                expanded.push((name, value));
+            }
+        }
+        let kwargs = expanded;
         let collected: Vec<(String, Value)> = if sig.kw_variadic.is_some() {
             kwargs
                 .iter()
@@ -1240,10 +1505,10 @@ impl VmBackend {
         entries: Vec<(String, Value)>,
     ) -> Result<Value, RuntimeError> {
         let mut dict =
-            self.construct_via_init(prog, "HashDict", None, Vec::new(), Vec::new(), &[])?;
-        let fname = prog.overload_name("HashDict.__setitem__", 2);
+            self.construct_via_init(prog, "StringDict", None, Vec::new(), Vec::new(), &[])?;
+        let fname = prog.overload_name("StringDict.__setitem__", 2);
         let fidx = prog.index_of(&fname).ok_or_else(|| {
-            RuntimeError::Unsupported("vm: kwargs HashDict has no __setitem__".to_string())
+            RuntimeError::Unsupported("vm: kwargs StringDict has no __setitem__".to_string())
         })?;
         for (key, value) in entries {
             let (_, frame) =
@@ -1251,6 +1516,83 @@ impl VmBackend {
             dict = frame.into_iter().next().unwrap_or(Value::None);
         }
         Ok(dict)
+    }
+
+    /// Consume the self-hosted `StringDict` passed by `**kwargs^` and recover its
+    /// insertion-ordered key/value entries. Its `entries` field is a self-hosted
+    /// `List[DictEntry[String, V]]`, so taking the pointer slots is a true move:
+    /// values are not copied and the transferred dictionary cannot be reused.
+    fn take_forwarded_kwargs(
+        &mut self,
+        value: Value,
+    ) -> Result<Vec<(String, Value)>, RuntimeError> {
+        let Value::Struct { name, fields, .. } = value else {
+            return Err(RuntimeError::TypeError(
+                "`**kwargs^` requires a StringDict value".to_string(),
+            ));
+        };
+        if name != "StringDict" {
+            return Err(RuntimeError::TypeError(format!(
+                "`**kwargs^` requires StringDict, got {name}"
+            )));
+        }
+        let entries = fields
+            .into_iter()
+            .find_map(|(field, value)| (field == "entries").then_some(value))
+            .ok_or_else(|| {
+                RuntimeError::TypeError("StringDict has no entries storage".to_string())
+            })?;
+        let Value::Struct { fields, .. } = entries else {
+            return Err(RuntimeError::TypeError(
+                "StringDict entries storage is not a List".to_string(),
+            ));
+        };
+        let mut data = None;
+        let mut size = None;
+        for (field, value) in fields {
+            match (field.as_str(), value) {
+                ("data", Value::Pointer { allocation, offset }) => {
+                    data = Some((allocation, offset));
+                }
+                ("size", Value::Int(value)) => size = Some(value),
+                _ => {}
+            }
+        }
+        let (allocation, base) = data.ok_or_else(|| {
+            RuntimeError::TypeError("StringDict entry List has no data pointer".to_string())
+        })?;
+        let size = size.ok_or_else(|| {
+            RuntimeError::TypeError("StringDict entry List has no size".to_string())
+        })?;
+        let mut result = Vec::with_capacity(size.max(0) as usize);
+        for offset in 0..size {
+            let (region, slot) = self.heap_index(allocation, base, offset)?;
+            let entry = std::mem::replace(&mut self.heap[region].slots[slot], Value::Moved);
+            let Value::Struct { fields, .. } = entry else {
+                return Err(RuntimeError::TypeError(
+                    "StringDict contains a non-entry value".to_string(),
+                ));
+            };
+            let mut key = None;
+            let mut value = None;
+            for (field, field_value) in fields {
+                match field.as_str() {
+                    "key" => key = Some(field_value),
+                    "value" => value = Some(field_value),
+                    _ => {}
+                }
+            }
+            let Some(Value::Str(key)) = key else {
+                return Err(RuntimeError::TypeError(
+                    "StringDict entry key is not a String".to_string(),
+                ));
+            };
+            let value = value.ok_or_else(|| {
+                RuntimeError::TypeError("StringDict entry has no value".to_string())
+            })?;
+            result.push((key, value));
+        }
+        Ok(result)
     }
 
     /// Execute one straight-line MIR instruction against the current frame.
@@ -1270,16 +1612,13 @@ impl VmBackend {
             MirInstr::BeginLoan { .. } => {}
             MirInstr::MakeRef { dest, place } => {
                 let root = vars[place.root as usize].clone();
-                let Value::Ref {
-                    frame,
-                    slot,
-                    mut projection,
-                } = root
-                else {
-                    return Err(RuntimeError::Unsupported(format!(
-                        "vm: reference creation requires caller-owned storage, got {}",
-                        crate::runtime::type_name(&root)
-                    )));
+                let (frame, slot, mut projection) = match root {
+                    Value::Ref {
+                        frame,
+                        slot,
+                        projection,
+                    } => (frame, slot, projection),
+                    _ => (frame_id.0, place.root as usize, Vec::new()),
                 };
                 for segment in &place.proj {
                     projection.push(match segment {
@@ -1288,6 +1627,7 @@ impl VmBackend {
                             &regs[register.0 as usize],
                         )?
                             as usize),
+                        Proj::Variant(index) => RefProjection::Variant(*index),
                     });
                 }
                 regs[dest.0 as usize] = Value::Ref {
@@ -1304,6 +1644,36 @@ impl VmBackend {
                 let handle = regs[reference.0 as usize].clone();
                 self.write_reference(&handle, frame_id, vars, regs[value.0 as usize].clone())?;
             }
+            MirInstr::MakeClosure {
+                dest,
+                function,
+                captures,
+            } => {
+                let mut environment = Vec::with_capacity(captures.len());
+                for capture in captures {
+                    if capture.moved {
+                        let slot = capture.place.root as usize;
+                        environment.push(std::mem::replace(&mut vars[slot], Value::Moved));
+                    } else if let Some(reference) = self.extend_reference(
+                        &vars[capture.place.root as usize],
+                        &capture.place.proj,
+                        regs,
+                    )? {
+                        environment.push(reference);
+                    } else {
+                        environment.push(Value::Ref {
+                            frame: frame_id.0,
+                            slot: capture.place.root as usize,
+                            projection: Vec::new(),
+                        });
+                    }
+                }
+                regs[dest.0 as usize] = Value::Closure {
+                    function: function.clone(),
+                    captures: environment,
+                };
+            }
+            MirInstr::KeepAlive { .. } => {}
             MirInstr::Const { dest, k } => regs[dest.0 as usize] = const_value(k),
             MirInstr::UseVar { dest, var, mode } => {
                 let slot = *var as usize;
@@ -1340,7 +1710,7 @@ impl VmBackend {
             MirInstr::DefVar {
                 var,
                 src,
-                source_annotation,
+                binding_ty,
             } => {
                 let v = regs[src.0 as usize].clone();
                 let slot = *var as usize;
@@ -1349,8 +1719,8 @@ impl VmBackend {
                 } else {
                     vars[slot].clone()
                 };
-                let assigned = match source_annotation {
-                    Some(t) => coerce(v, t),
+                let assigned = match binding_ty {
+                    Some(t) => crate::runtime::coerce_checked(v, t),
                     None => crate::runtime::coerce_like(v, &current),
                 };
                 if let Value::Ref { .. } = &vars[slot] {
@@ -1375,8 +1745,10 @@ impl VmBackend {
                 kwargs,
                 arg_places,
                 param_arg_regs,
+                ..
             } => {
-                let argv: Vec<Value> = args.iter().map(|r| regs[r.0 as usize].clone()).collect();
+                let mut argv: Vec<Value> =
+                    args.iter().map(|r| regs[r.0 as usize].clone()).collect();
                 let kw: Vec<(String, Value)> = kwargs
                     .iter()
                     .map(|(n, r)| (n.clone(), regs[r.0 as usize].clone()))
@@ -1388,11 +1760,54 @@ impl VmBackend {
                     .iter()
                     .map(|o| o.map(|r| regs[r.0 as usize].clone()))
                     .collect();
+                // A handwritten constructor receives reference arguments as
+                // caller-frame handles, just like an ordinary ref-parameter call.
+                // Its synthetic `self` occupies parameter slot zero.
+                let constructor_index =
+                    if let Some(struct_name) = crate::symbol::init_overload_struct(&func.0) {
+                        prog.structs
+                            .contains_key(struct_name)
+                            .then(|| prog.index_of(&func.0))
+                            .flatten()
+                    } else if prog.structs.contains_key(&func.0) {
+                        let init_name = format!("{}.__init__", func.0);
+                        prog.index_of(&init_name)
+                            .or_else(|| prog.index_of(&prog.overload_name(&init_name, args.len())))
+                    } else {
+                        None
+                    };
+                if let Some(index) = constructor_index {
+                    let reference_parameters = &prog.mir.functions[index].1.ref_params;
+                    for (argument, value) in argv.iter_mut().enumerate() {
+                        if !reference_parameters
+                            .get(argument + 1)
+                            .copied()
+                            .unwrap_or(false)
+                        {
+                            continue;
+                        }
+                        let place = arg_places
+                            .get(argument)
+                            .and_then(Option::as_ref)
+                            .ok_or_else(|| {
+                                RuntimeError::Unsupported(format!(
+                                    "vm: reference constructor argument {} to '{}' must be a place",
+                                    argument + 1,
+                                    func.0
+                                ))
+                            })?;
+                        *value = Self::reference_to_place_parts(frame_id, regs, vars, place)?;
+                    }
+                }
                 // A free function with `mut`/`ref` parameters writes each one's final
                 // value back to the caller's argument place after the call.
-                let writeback = prog
-                    .index_of(&func.0)
-                    .filter(|&idx| prog.mir.functions[idx].1.ref_params.iter().any(|&r| r));
+                let writeback = constructor_index
+                    .is_none()
+                    .then(|| {
+                        prog.index_of(&func.0)
+                            .filter(|&idx| prog.mir.functions[idx].1.ref_params.iter().any(|&r| r))
+                    })
+                    .flatten();
                 let result = match writeback {
                     Some(idx) => self.call_with_writeback(
                         prog,
@@ -1412,10 +1827,57 @@ impl VmBackend {
                 };
                 regs[dest.0 as usize] = result;
             }
-            MirInstr::CallIndirect { callee, .. } => {
-                return Err(RuntimeError::NotCallable(crate::runtime::type_name(
-                    &regs[callee.0 as usize],
-                )));
+            MirInstr::CallIndirect {
+                dest,
+                callee,
+                args,
+                kwargs,
+                ..
+            } => {
+                let callable = regs[callee.0 as usize].clone();
+                let (function, mut positional) = match &callable {
+                    Value::Function(function) => (function.clone(), Vec::new()),
+                    Value::Closure { function, captures } => (function.clone(), captures.clone()),
+                    Value::Struct { name, .. } => (
+                        prog.overload_name(&format!("{name}.__call__"), args.len()),
+                        vec![callable.clone()],
+                    ),
+                    value => {
+                        return Err(RuntimeError::NotCallable(crate::runtime::type_name(value)));
+                    }
+                };
+                positional.extend(
+                    args.iter()
+                        .map(|register| regs[register.0 as usize].clone()),
+                );
+                let keywords = kwargs
+                    .iter()
+                    .map(|(name, register)| (name.clone(), regs[register.0 as usize].clone()))
+                    .collect();
+                let index = prog
+                    .index_of(&function)
+                    .ok_or_else(|| RuntimeError::NotCallable(function.clone()))?;
+                let bound = if matches!(callable, Value::Struct { .. }) {
+                    let receiver = positional.remove(0);
+                    let mut args = match prog.sigs.get(&function) {
+                        Some(signature) => {
+                            self.bind_for_call(prog, &function, signature, positional, keywords)?
+                                .0
+                        }
+                        None => positional,
+                    };
+                    args.insert(0, receiver);
+                    args
+                } else {
+                    match prog.sigs.get(&function) {
+                        Some(signature) => {
+                            self.bind_for_call(prog, &function, signature, positional, keywords)?
+                                .0
+                        }
+                        None => positional,
+                    }
+                };
+                regs[dest.0 as usize] = self.call_function(prog, index, bound, &[])?;
             }
             MirInstr::MethodCall {
                 dest,
@@ -1426,6 +1888,7 @@ impl VmBackend {
                 kwargs,
                 recv_place,
                 arg_places,
+                ..
             } => {
                 let recv_val = regs[recv.0 as usize].clone();
                 let argv: Vec<Value> = args.iter().map(|r| regs[r.0 as usize].clone()).collect();
@@ -1465,19 +1928,30 @@ impl VmBackend {
                             self.call_dunder(prog, &sname, "__getitem__", vec![recv, idx])?;
                     }
                     // `ptr[i]` loads the pointee at `base + i` from the heap arena.
-                    Value::Pointer(b) => {
-                        let b = *b;
-                        let off = value_as_index(&regs[index.0 as usize])?;
-                        let i = self.heap_index(b, off)?;
-                        let value = self.heap[i].clone();
+                    Value::Pointer { allocation, offset } => {
+                        let allocation = *allocation;
+                        let base = *offset;
+                        let off = self.normalize_index(prog, &regs[index.0 as usize])?;
+                        let (region, i) = self.heap_index(allocation, base, off)?;
+                        let value = self.heap[region].slots[i].clone();
                         regs[dest.0 as usize] = if self.has_copyinit {
                             self.clone_value(prog, &value)?
                         } else {
                             value
                         };
                     }
+                    Value::Dict(entries) => {
+                        let key = &regs[index.0 as usize];
+                        regs[dest.0 as usize] = entries
+                            .iter()
+                            .find(|(candidate, _)| candidate == key)
+                            .map(|(_, value)| value.clone())
+                            .ok_or_else(|| {
+                                RuntimeError::TypeError("dictionary key not found".to_string())
+                            })?;
+                    }
                     _ => {
-                        let idx = value_as_index(&regs[index.0 as usize])?;
+                        let idx = self.normalize_index(prog, &regs[index.0 as usize])?;
                         regs[dest.0 as usize] = index_value(&regs[base.0 as usize], idx)?;
                     }
                 }
@@ -1485,9 +1959,11 @@ impl VmBackend {
             MirInstr::Slice {
                 dest,
                 object,
+                kind,
                 lower,
                 upper,
                 step,
+                resolved,
             } => {
                 let bound = |b: &Option<Reg>| -> Result<Option<i64>, RuntimeError> {
                     match b {
@@ -1496,18 +1972,431 @@ impl VmBackend {
                     }
                 };
                 let (lo, hi, st) = (bound(lower)?, bound(upper)?, bound(step)?);
-                regs[dest.0 as usize] =
-                    crate::runtime::slice_value(&regs[object.0 as usize], lo, hi, st)?;
+                let receiver = regs[object.0 as usize].clone();
+                regs[dest.0 as usize] = if let Value::Struct { name, .. } = &receiver {
+                    let slice = Value::Slice {
+                        kind: *kind,
+                        start: lo,
+                        end: hi,
+                        step: st,
+                    };
+                    let _ = name;
+                    self.call_subscript_dunder(prog, receiver, vec![slice], resolved.as_deref())?
+                } else {
+                    crate::runtime::slice_value(&receiver, lo, hi, st)?
+                };
             }
-            MirInstr::MakeList { dest, elems } => {
+            MirInstr::MultiIndex {
+                dest,
+                object,
+                args,
+                resolved,
+            } => {
+                let bound = |bound: &Option<Reg>| -> Result<Option<i64>, RuntimeError> {
+                    bound
+                        .map(|register| value_as_index(&regs[register.0 as usize]))
+                        .transpose()
+                };
+                let mut arguments = Vec::with_capacity(args.len());
+                for argument in args {
+                    arguments.push(match argument {
+                        MirSubscriptArg::Index(register) => regs[register.0 as usize].clone(),
+                        MirSubscriptArg::Slice {
+                            kind,
+                            lower,
+                            upper,
+                            step,
+                        } => Value::Slice {
+                            kind: *kind,
+                            start: bound(lower)?,
+                            end: bound(upper)?,
+                            step: bound(step)?,
+                        },
+                    });
+                }
+                regs[dest.0 as usize] = self.call_subscript_dunder(
+                    prog,
+                    regs[object.0 as usize].clone(),
+                    arguments,
+                    resolved.as_deref(),
+                )?;
+            }
+            MirInstr::MultiSet {
+                receiver_place,
+                args,
+                value,
+                value_keyword,
+                resolved,
+            } => {
+                let bound = |bound: &Option<Reg>| -> Result<Option<i64>, RuntimeError> {
+                    bound
+                        .map(|register| value_as_index(&regs[register.0 as usize]))
+                        .transpose()
+                };
+                let mut arguments = Vec::with_capacity(args.len() + usize::from(!value_keyword));
+                for argument in args {
+                    arguments.push(match argument {
+                        MirSubscriptArg::Index(register) => regs[register.0 as usize].clone(),
+                        MirSubscriptArg::Slice {
+                            kind,
+                            lower,
+                            upper,
+                            step,
+                        } => Value::Slice {
+                            kind: *kind,
+                            start: bound(lower)?,
+                            end: bound(upper)?,
+                            step: bound(step)?,
+                        },
+                    });
+                }
+                let keyword_arguments = if *value_keyword {
+                    vec![("value".to_string(), regs[value.0 as usize].clone())]
+                } else {
+                    arguments.push(regs[value.0 as usize].clone());
+                    Vec::new()
+                };
+                let argument_places = vec![None; arguments.len()];
+                let receiver = nav_mut(vars, regs, receiver_place)?.clone();
+                let place = Some(receiver_place.clone());
+                let _ = self.method_call(
+                    prog,
+                    MethodInvocation {
+                        receiver,
+                        method: "__setitem__",
+                        resolved_name: resolved.as_deref(),
+                        arguments,
+                        keyword_arguments,
+                        receiver_place: &place,
+                        argument_places: &argument_places,
+                    },
+                    CallerFrame {
+                        registers: regs,
+                        variables: vars,
+                    },
+                )?;
+            }
+            MirInstr::MakeList {
+                dest,
+                elems,
+                element_type,
+            } => {
                 let mut items: Vec<Value> =
                     elems.iter().map(|r| regs[r.0 as usize].clone()).collect();
-                promote_numeric_elems(&mut items); // unify literal element kinds
+                if let Some(element_type) = element_type {
+                    items = items
+                        .into_iter()
+                        .map(|value| crate::runtime::coerce_checked(value, element_type))
+                        .collect();
+                } else {
+                    promote_numeric_elems(&mut items); // unify literal element kinds
+                }
                 regs[dest.0 as usize] = Value::List(items);
             }
-            MirInstr::MakeTuple { dest, elems } => {
-                let items = elems.iter().map(|r| regs[r.0 as usize].clone()).collect();
+            MirInstr::MakeSet {
+                dest,
+                elems,
+                element_type,
+            } => {
+                let mut raw: Vec<Value> =
+                    elems.iter().map(|register| regs[register.0 as usize].clone()).collect();
+                if let Some(element_type) = element_type {
+                    raw = raw
+                        .into_iter()
+                        .map(|value| crate::runtime::coerce_checked(value, element_type))
+                        .collect();
+                } else {
+                    promote_numeric_elems(&mut raw);
+                }
+                let mut items = Vec::with_capacity(raw.len());
+                for item in raw {
+                    if items
+                        .iter()
+                        .any(|candidate| values_equal(candidate, &item).unwrap_or(false))
+                    {
+                        self.drop_value(prog, item)?;
+                    } else {
+                        items.push(item);
+                    }
+                }
+                regs[dest.0 as usize] = Value::Set(items);
+            }
+            MirInstr::MakeDict {
+                dest,
+                entries,
+                key_type,
+                value_type,
+            } => {
+                let mut keys = entries
+                    .iter()
+                    .map(|(key, _)| regs[key.0 as usize].clone())
+                    .collect::<Vec<_>>();
+                let mut values = entries
+                    .iter()
+                    .map(|(_, value)| regs[value.0 as usize].clone())
+                    .collect::<Vec<_>>();
+                if let Some(key_type) = key_type {
+                    keys = keys
+                        .into_iter()
+                        .map(|value| crate::runtime::coerce_checked(value, key_type))
+                        .collect();
+                } else {
+                    promote_numeric_elems(&mut keys);
+                }
+                if let Some(value_type) = value_type {
+                    values = values
+                        .into_iter()
+                        .map(|value| crate::runtime::coerce_checked(value, value_type))
+                        .collect();
+                } else {
+                    promote_numeric_elems(&mut values);
+                }
+                let mut result = Vec::with_capacity(entries.len());
+                for (key, value) in keys.into_iter().zip(values) {
+                    if let Some(position) = result.iter().position(|(candidate, _)| {
+                        values_equal(candidate, &key).unwrap_or(false)
+                    }) {
+                        let old = std::mem::replace(&mut result[position].1, value);
+                        self.drop_value(prog, old)?;
+                        self.drop_value(prog, key)?;
+                    } else {
+                        result.push((key, value));
+                    }
+                }
+                regs[dest.0 as usize] = Value::Dict(result);
+            }
+            MirInstr::CollectionInsert {
+                collection,
+                key,
+                value,
+            } => {
+                let value = regs[value.0 as usize].clone();
+                match (&mut vars[*collection as usize], key) {
+                    (Value::List(items), None) => items.push(value),
+                    (Value::Set(items), None) => {
+                        if items
+                            .iter()
+                            .any(|candidate| values_equal(candidate, &value).unwrap_or(false))
+                        {
+                            self.drop_value(prog, value)?;
+                        } else {
+                            items.push(value);
+                        }
+                    }
+                    (Value::Dict(entries), Some(key)) => {
+                        let key = regs[key.0 as usize].clone();
+                        if let Some(position) = entries.iter().position(|(candidate, _)| {
+                            values_equal(candidate, &key).unwrap_or(false)
+                        }) {
+                            let old = std::mem::replace(&mut entries[position].1, value);
+                            self.drop_value(prog, old)?;
+                            self.drop_value(prog, key)?;
+                        } else {
+                            entries.push((key, value));
+                        }
+                    }
+                    (collection, _) => {
+                        return Err(RuntimeError::TypeError(format!(
+                            "vm: collection-comprehension insertion does not match {}",
+                            crate::runtime::type_name(collection)
+                        )));
+                    }
+                }
+            }
+            MirInstr::MakeTuple {
+                dest,
+                elems,
+                element_types,
+            } => {
+                let raw: Vec<Value> = elems.iter().map(|r| regs[r.0 as usize].clone()).collect();
+                let items = match element_types {
+                    Some(types) if types.len() == raw.len() => raw
+                        .into_iter()
+                        .zip(types)
+                        .map(|(value, ty)| crate::runtime::coerce_checked(value, ty))
+                        .collect(),
+                    _ => raw,
+                };
                 regs[dest.0 as usize] = Value::Tuple(items);
+            }
+            MirInstr::MakeVariant {
+                dest,
+                alternatives,
+                index,
+                value,
+            } => {
+                let selected = alternatives.get(*index).ok_or_else(|| {
+                    RuntimeError::TypeError("Variant construction has an invalid tag".to_string())
+                })?;
+                let payload =
+                    crate::runtime::coerce_checked(regs[value.0 as usize].clone(), selected);
+                regs[dest.0 as usize] = Value::Variant {
+                    alternatives: alternatives.clone(),
+                    index: *index,
+                    value: Box::new(payload),
+                };
+            }
+            MirInstr::VariantIs {
+                dest,
+                variant,
+                index,
+            } => {
+                let Value::Variant {
+                    alternatives,
+                    index: active,
+                    ..
+                } = &regs[variant.0 as usize]
+                else {
+                    return Err(RuntimeError::TypeError(format!(
+                        "Variant.isa applied to {}",
+                        crate::runtime::type_name(&regs[variant.0 as usize])
+                    )));
+                };
+                if *index >= alternatives.len() {
+                    return Err(RuntimeError::TypeError(
+                        "Variant.isa has an invalid checked tag".to_string(),
+                    ));
+                }
+                regs[dest.0 as usize] = Value::Bool(active == index);
+            }
+            MirInstr::VariantGet {
+                dest,
+                variant,
+                index,
+            } => {
+                let Value::Variant {
+                    alternatives,
+                    index: active,
+                    value,
+                } = &regs[variant.0 as usize]
+                else {
+                    return Err(RuntimeError::TypeError(format!(
+                        "typed Variant projection applied to {}",
+                        crate::runtime::type_name(&regs[variant.0 as usize])
+                    )));
+                };
+                let expected = alternatives.get(*index).ok_or_else(|| {
+                    RuntimeError::TypeError(
+                        "typed Variant projection has an invalid checked tag".to_string(),
+                    )
+                })?;
+                if active != index {
+                    let found = alternatives
+                        .get(*active)
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "<invalid>".to_string());
+                    return Err(RuntimeError::TypeError(format!(
+                        "Variant holds '{found}', not '{expected}'"
+                    )));
+                }
+                regs[dest.0 as usize] = value.as_ref().clone();
+            }
+            MirInstr::VariantTake {
+                dest,
+                variant,
+                index,
+                checked,
+            } => {
+                let Value::Variant {
+                    alternatives,
+                    index: active,
+                    value,
+                } = &regs[variant.0 as usize]
+                else {
+                    return Err(RuntimeError::TypeError(format!(
+                        "Variant.take applied to {}",
+                        crate::runtime::type_name(&regs[variant.0 as usize])
+                    )));
+                };
+                let expected = alternatives.get(*index).ok_or_else(|| {
+                    RuntimeError::TypeError("Variant.take has an invalid checked tag".to_string())
+                })?;
+                if *checked && active != index {
+                    let found = alternatives
+                        .get(*active)
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "<invalid>".to_string());
+                    return Err(RuntimeError::TypeError(format!(
+                        "Variant holds '{found}', not '{expected}'"
+                    )));
+                }
+                // The receiver place was moved to a tombstone before this
+                // instruction, so ownership of the payload is transferred out.
+                regs[dest.0 as usize] = value.as_ref().clone();
+            }
+            MirInstr::VariantSet {
+                dest,
+                place,
+                index,
+                value,
+            } => {
+                let old = load_place(vars, regs, place)?;
+                let Value::Variant { alternatives, .. } = &old else {
+                    return Err(RuntimeError::TypeError(format!(
+                        "Variant.set applied to {}",
+                        crate::runtime::type_name(&old)
+                    )));
+                };
+                let selected = alternatives.get(*index).ok_or_else(|| {
+                    RuntimeError::TypeError("Variant.set has an invalid checked tag".to_string())
+                })?;
+                let replacement = Value::Variant {
+                    alternatives: alternatives.clone(),
+                    index: *index,
+                    value: Box::new(crate::runtime::coerce_checked(
+                        regs[value.0 as usize].clone(),
+                        selected,
+                    )),
+                };
+                self.store_at_place(prog, place, replacement, regs, vars)?;
+                self.drop_value(prog, old)?;
+                regs[dest.0 as usize] = Value::None;
+            }
+            MirInstr::VariantReplace {
+                dest,
+                place,
+                input_index,
+                output_index,
+                value,
+                checked,
+            } => {
+                let old = load_place(vars, regs, place)?;
+                let Value::Variant {
+                    alternatives,
+                    index: active,
+                    value: old_payload,
+                } = old
+                else {
+                    return Err(RuntimeError::TypeError(format!(
+                        "Variant.replace applied to {}",
+                        crate::runtime::type_name(&old)
+                    )));
+                };
+                let input = alternatives.get(*input_index).cloned().ok_or_else(|| {
+                    RuntimeError::TypeError("Variant.replace has an invalid input tag".to_string())
+                })?;
+                let output = alternatives.get(*output_index).cloned().ok_or_else(|| {
+                    RuntimeError::TypeError("Variant.replace has an invalid output tag".to_string())
+                })?;
+                if *checked && active != *output_index {
+                    let found = alternatives
+                        .get(active)
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "<invalid>".to_string());
+                    return Err(RuntimeError::TypeError(format!(
+                        "Variant holds '{found}', not '{output}'"
+                    )));
+                }
+                let replacement = Value::Variant {
+                    alternatives,
+                    index: *input_index,
+                    value: Box::new(crate::runtime::coerce_checked(
+                        regs[value.0 as usize].clone(),
+                        &input,
+                    )),
+                };
+                self.store_at_place(prog, place, replacement, regs, vars)?;
+                regs[dest.0 as usize] = *old_payload;
             }
             MirInstr::MakeSimd {
                 dest,
@@ -1524,9 +2413,21 @@ impl VmBackend {
                     self.extend_reference(&vars[place.root as usize], &place.proj, regs)?
                 {
                     self.write_reference(&reference, frame_id, vars, v)?;
+                } else if matches!(place.ty, Some(Ty::Ref(_))) {
+                    let reference = load_place(vars, regs, place)?.clone();
+                    self.write_reference(&reference, frame_id, vars, v)?;
                 } else {
                     self.store_at_place(prog, place, v, regs, vars)?;
                 }
+            }
+            MirInstr::StoreRef { place, reference } => {
+                let handle = regs[reference.0 as usize].clone();
+                if !matches!(handle, Value::Ref { .. }) {
+                    return Err(RuntimeError::TypeError(
+                        "vm: reference storage requires a reference handle".to_string(),
+                    ));
+                }
+                self.store_at_place(prog, place, handle, regs, vars)?;
             }
             MirInstr::LoadPlace { dest, place } => {
                 // The read half of `c[i] += e` on a user struct goes through
@@ -1538,7 +2439,14 @@ impl VmBackend {
                 } else {
                     match self.load_index_dunder(prog, place, regs, vars)? {
                         Some(v) => v,
-                        None => load_place(vars, regs, place)?,
+                        None => {
+                            let value = load_place(vars, regs, place)?;
+                            if matches!(place.ty, Some(Ty::Ref(_))) {
+                                self.read_reference(&value, frame_id, vars)?
+                            } else {
+                                value.clone()
+                            }
+                        }
                     }
                 };
             }
@@ -1605,7 +2513,8 @@ impl VmBackend {
                         Value::Range { start, stop, step } => {
                             (*step > 0 && start < stop) || (*step < 0 && start > stop)
                         }
-                        Value::List(items) => !items.is_empty(),
+                        Value::List(items) | Value::Set(items) => !items.is_empty(),
+                        Value::Dict(entries) => !entries.is_empty(),
                         other => {
                             return Err(RuntimeError::Unsupported(format!(
                                 "vm: `for` iterator must be a range, List, or a type with \
@@ -1649,6 +2558,14 @@ impl VmBackend {
                         Value::List(items) => {
                             regs[dest.0 as usize] = items.remove(0);
                         }
+                        Value::Set(items) => {
+                            regs[dest.0 as usize] = items.remove(0);
+                        }
+                        Value::Dict(entries) => {
+                            let (key, value) = entries.remove(0);
+                            regs[dest.0 as usize] = key;
+                            self.drop_value(prog, value)?;
+                        }
                         ref other => {
                             return Err(RuntimeError::Unsupported(format!(
                                 "vm: `for` iterator must be a range, List, or a type with \
@@ -1671,6 +2588,14 @@ impl VmBackend {
                     // The named explicit destructor has already consumed the
                     // aggregate. Its fields still receive their ordinary
                     // reverse-order destruction after that call succeeds.
+                    for (_, field) in fields.into_iter().rev() {
+                        self.drop_value(prog, field)?;
+                    }
+                }
+            }
+            MirInstr::ConsumePlace { place, .. } => {
+                let value = std::mem::replace(nav_mut(vars, regs, place)?, Value::Moved);
+                if let Value::Struct { fields, .. } = value {
                     for (_, field) in fields.into_iter().rev() {
                         self.drop_value(prog, field)?;
                     }
@@ -1863,9 +2788,9 @@ impl VmBackend {
         }
     }
 
-    /// Dispatch a method call. `List` methods run in place (mutators via the
-    /// receiver place, queries on the value); struct methods resolve to the
-    /// mangled `Type.method` function, with a `mut self` receiver written back.
+    /// Dispatch a method call. Builtin `List`/`Tuple` methods take intrinsic
+    /// paths; struct methods resolve to the mangled `Type.method` function, with
+    /// a `mut self` receiver written back.
     fn method_call(
         &mut self,
         prog: &Prog,
@@ -1890,7 +2815,7 @@ impl VmBackend {
         if !matches!(recv, Value::Struct { .. }) {
             match (method, args.len()) {
                 // `Hashable` — `x.__hash__()`.
-                ("__hash__", 0) => return crate::runtime::builtin_hash(&recv).map(Value::UInt),
+                ("__hash__", 0) => return self.hash_value(prog, recv).map(Value::UInt),
                 // `Floorable`/`Ceilable`/`Truncable` — `x.__floor__()` etc.
                 // (roadmap milestone 7).
                 ("__floor__" | "__ceil__" | "__trunc__", 0) => {
@@ -1902,6 +2827,34 @@ impl VmBackend {
             }
         }
         match &recv {
+            Value::UInt(state) if method == "update" && args.len() == 1 => {
+                let place = recv_place.as_ref().ok_or_else(|| {
+                    RuntimeError::Unsupported("vm: Hasher.update needs a mutable place".into())
+                })?;
+                let part = self.hash_value(prog, args[0].clone())?;
+                self.store_at_place(
+                    prog,
+                    place,
+                    Value::UInt(state.wrapping_mul(33).wrapping_add(part)),
+                    regs,
+                    vars,
+                )?;
+                Ok(Value::None)
+            }
+            Value::Str(template) if method == "format" => {
+                self.format_template(prog, template, &args).map(Value::Str)
+            }
+            Value::Str(current) if method == "write" => {
+                let place = recv_place.as_ref().ok_or_else(|| {
+                    RuntimeError::Unsupported("vm: Writer.write needs a mutable place".into())
+                })?;
+                let mut text = current.clone();
+                for argument in args {
+                    text.push_str(&self.format_value(prog, argument, false)?);
+                }
+                self.store_at_place(prog, place, Value::Str(text), regs, vars)?;
+                Ok(Value::None)
+            }
             Value::List(_) if is_list_mutator(method) => {
                 // Mutate the list at its place so the change persists.
                 let place = recv_place.as_ref().ok_or_else(|| {
@@ -1916,20 +2869,117 @@ impl VmBackend {
                 }
             }
             Value::List(items) => list_query(items, method, &args),
+            Value::Set(_) if method == "add" && args.len() == 1 => {
+                let place = recv_place.as_ref().ok_or_else(|| {
+                    RuntimeError::Unsupported("vm: Set.add needs a place receiver".into())
+                })?;
+                match nav_mut(vars, regs, place)? {
+                    Value::Set(items) => {
+                        if !items.contains(&args[0]) {
+                            items.push(args[0].clone());
+                        }
+                        Ok(Value::None)
+                    }
+                    other => Err(RuntimeError::TypeError(format!(
+                        "vm: Set.add on non-set place, got {}",
+                        crate::runtime::type_name(other)
+                    ))),
+                }
+            }
+            Value::Tuple(items) => match (method, args.as_slice()) {
+                ("reverse", []) => Ok(Value::Tuple(items.iter().rev().cloned().collect())),
+                ("concat", [Value::Tuple(other)]) => {
+                    let mut result = items.clone();
+                    result.extend(other.iter().cloned());
+                    Ok(Value::Tuple(result))
+                }
+                ("reverse", _) => Err(RuntimeError::ArityMismatch {
+                    name: "reverse".to_string(),
+                    expected: 0,
+                    got: args.len(),
+                }),
+                ("concat", _) => Err(RuntimeError::TypeError(
+                    "vm: Tuple.concat expects one Tuple argument".to_string(),
+                )),
+                _ => Err(RuntimeError::Unsupported(format!(
+                    "vm: Tuple has no method '{method}'"
+                ))),
+            },
+            Value::Slice {
+                start, end, step, ..
+            } if method == "indices" && args.len() == 1 => {
+                let length = value_as_index(&args[0])?;
+                let (start, end, step) =
+                    crate::runtime::normalize_slice_bounds(length, *start, *end, *step)?;
+                Ok(Value::Tuple(vec![
+                    Value::Int(start),
+                    Value::Int(end),
+                    Value::Int(step),
+                ]))
+            }
+            Value::Slice { kind, .. } => Err(RuntimeError::Unsupported(format!(
+                "vm: {} has no method '{method}'",
+                kind.type_name()
+            ))),
             // `UnsafePointer` methods: `free()` releases the allocation (a no-op in
             // the arena model — the arena never reclaims).
-            Value::Pointer(_) => match method {
-                "free" => Ok(Value::None),
+            Value::Pointer { allocation, offset } => match method {
+                "free" => {
+                    self.heap_free(*allocation, *offset)?;
+                    Ok(Value::None)
+                }
                 _ => Err(RuntimeError::Unsupported(format!(
                     "vm: UnsafePointer has no method '{method}'"
                 ))),
             },
+            Value::Struct { name, .. }
+                if method == "write"
+                    && prog.index_of(&format!("{name}.write_string")).is_some() =>
+            {
+                let place = recv_place.as_ref().ok_or_else(|| {
+                    RuntimeError::Unsupported("vm: Writer.write needs a mutable place".into())
+                })?;
+                let mut writer = recv.clone();
+                let index = prog
+                    .index_of(&format!("{name}.write_string"))
+                    .expect("guard established Writer.write_string");
+                for argument in args {
+                    let text = self.format_value(prog, argument, false)?;
+                    let (_, variables) =
+                        self.call_frame(prog, index, vec![writer, Value::Str(text)], &[])?;
+                    writer = variables.into_iter().next().unwrap_or(Value::None);
+                }
+                self.store_at_place(prog, place, writer, regs, vars)?;
+                Ok(Value::None)
+            }
+            Value::Struct { name, fields, .. } if name == "Optional" => {
+                let values = fields
+                    .iter()
+                    .find_map(|(field, value)| (field == "values").then_some(value))
+                    .and_then(|value| match value {
+                        Value::List(values) => Some(values),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        RuntimeError::TypeError(
+                            "builtin Optional has invalid values storage".to_string(),
+                        )
+                    })?;
+                match (method, args.as_slice()) {
+                    ("is_some", []) => Ok(Value::Bool(values.len() == 1)),
+                    ("or_else", [default]) => {
+                        Ok(values.first().cloned().unwrap_or_else(|| default.clone()))
+                    }
+                    _ => Err(RuntimeError::Unsupported(format!(
+                        "vm: Optional has no method '{method}'"
+                    ))),
+                }
+            }
             Value::Struct { name, .. } => {
                 let method_argc = args.len();
                 let source_fname = format!("{name}.{method}");
-                let fname = resolved
-                    .map(str::to_string)
-                    .unwrap_or_else(|| prog.overload_name(&source_fname, method_argc));
+                let fname =
+                    prog.runtime_method_name(name, method, resolved, method_argc);
                 let fidx = prog.index_of(&fname).ok_or_else(|| {
                     RuntimeError::Unsupported(format!("vm: unknown method '{fname}'"))
                 })?;
@@ -2002,6 +3052,20 @@ impl VmBackend {
                     .get(&name)
                     .is_some_and(|definition| definition.explicit_destroy)
                 {
+                    // An intact linear aggregate must be consumed by a named
+                    // destructor. Once a field has been moved or explicitly
+                    // destroyed, the whole destructor is unavailable; dropping
+                    // the residual aggregate destroys only its remaining fields.
+                    if fields
+                        .iter()
+                        .any(|(_, value)| matches!(value, Value::Moved))
+                    {
+                        for (_, field) in fields.into_iter().rev() {
+                            if !matches!(field, Value::Moved) {
+                                self.drop_value(prog, field)?;
+                            }
+                        }
+                    }
                     return Ok(());
                 }
                 let del = format!("{name}.__del__");
@@ -2018,14 +3082,34 @@ impl VmBackend {
                     self.drop_value(prog, fv)?;
                 }
             }
-            Value::List(items) | Value::Tuple(items) => {
+            Value::List(items) | Value::Set(items) | Value::Tuple(items) => {
                 for item in items.into_iter().rev() {
                     self.drop_value(prog, item)?;
                 }
             }
+            Value::Dict(entries) => {
+                for (key, value) in entries.into_iter().rev() {
+                    self.drop_value(prog, value)?;
+                    self.drop_value(prog, key)?;
+                }
+            }
+            Value::Variant { value, .. } => self.drop_value(prog, *value)?,
             _ => {}
         }
         Ok(())
+    }
+
+    /// Normalize an `Indexer` to the VM's signed index representation. Int-like
+    /// values take the intrinsic path; user conformers execute
+    /// `__mlir_index__`, which is the source-level contract even though MIR
+    /// represents its result as an `Int` rather than an MLIR index type.
+    fn normalize_index(&mut self, prog: &Prog, value: &Value) -> Result<i64, RuntimeError> {
+        if let Value::Struct { name, .. } = value {
+            let normalized = self.call_dunder(prog, name, "__mlir_index__", vec![value.clone()])?;
+            value_as_index(&normalized)
+        } else {
+            value_as_index(value)
+        }
     }
 
     /// Dispatch a call by name: a built-in intrinsic, a struct constructor, or a
@@ -2064,55 +3148,39 @@ impl VmBackend {
             "print" => {
                 let mut cells = Vec::with_capacity(args.len());
                 for value in args {
-                    if let Value::Struct {
-                        name,
-                        fields,
-                        value_params,
-                    } = value
-                    {
-                        let recv = Value::Struct {
-                            name: name.clone(),
-                            fields,
-                            value_params,
-                        };
-                        match self.call_dunder(prog, &name, "__str__", vec![recv])? {
-                            Value::Str(text) => cells.push(text),
-                            other => {
-                                return Err(RuntimeError::TypeError(format!(
-                                    "{name}.__str__ returned {}, expected String",
-                                    crate::runtime::type_name(&other)
-                                )));
-                            }
-                        }
-                    } else {
-                        cells.push(value.to_string());
-                    }
+                    cells.push(self.format_value(prog, value, false)?);
                 }
                 self.output.push_str(&cells.join(" "));
                 self.output.push('\n');
                 Ok(Value::None)
             }
-            // `String(c)` on a user struct dispatches to `c.__str__()`; a primitive
-            // value uses its `Display`.
-            "String" => match args.into_iter().next() {
-                Some(Value::Struct {
-                    name,
-                    fields,
-                    value_params,
-                }) => {
-                    let recv = Value::Struct {
-                        name: name.clone(),
-                        fields,
-                        value_params,
-                    };
-                    self.call_dunder(prog, &name, "__str__", vec![recv])
-                }
-                other => Ok(Value::Str(other.map(|v| v.to_string()).unwrap_or_default())),
+            "String" => Ok(Value::Str(match args.into_iter().next() {
+                Some(value) => self.format_value(prog, value, false)?,
+                None => String::new(),
+            })),
+            "repr" => match args.into_iter().next() {
+                Some(value) => Ok(Value::Str(self.format_value(prog, value, true)?)),
+                None => Err(RuntimeError::ArityMismatch {
+                    name: "repr".to_string(),
+                    expected: 1,
+                    got: 0,
+                }),
+            },
+            "hash" => match args.into_iter().next() {
+                Some(value) => Ok(Value::UInt(self.hash_value(prog, value)?)),
+                None => Err(RuntimeError::ArityMismatch {
+                    name: "hash".to_string(),
+                    expected: 1,
+                    got: 0,
+                }),
             },
             // `len(c)` on a user struct dispatches to `c.__len__()`.
             "len" => match args.into_iter().next() {
                 Some(Value::Str(s)) => Ok(Value::Int(s.len() as i64)),
                 Some(Value::List(items)) => Ok(Value::Int(items.len() as i64)),
+                Some(Value::Set(items)) => Ok(Value::Int(items.len() as i64)),
+                Some(Value::Dict(entries)) => Ok(Value::Int(entries.len() as i64)),
+                Some(Value::Tuple(items)) => Ok(Value::Int(items.len() as i64)),
                 Some(Value::Struct {
                     name,
                     fields,
@@ -2126,10 +3194,40 @@ impl VmBackend {
                     self.call_dunder(prog, &name, "__len__", vec![recv])
                 }
                 _ => Err(RuntimeError::Unsupported(
-                    "vm: len supports String, List, and structs with __len__".into(),
+                    "vm: len supports String, List, Tuple, and structs with __len__".into(),
                 )),
             },
             "range" => build_range(&args),
+            "Slice" | "slice" => {
+                let optional = |value: &Value| match value {
+                    Value::Int(value) => Ok(Some(*value)),
+                    Value::None => Ok(None),
+                    other => Err(RuntimeError::TypeError(format!(
+                        "slice bound must be Int or None, got {}",
+                        crate::runtime::type_name(other)
+                    ))),
+                };
+                let (start, end, step) = match (name, args.as_slice()) {
+                    ("slice", [end]) => (None, optional(end)?, None),
+                    ("slice" | "Slice", [start, end]) => (optional(start)?, optional(end)?, None),
+                    ("slice" | "Slice", [start, end, step]) => {
+                        (optional(start)?, optional(end)?, optional(step)?)
+                    }
+                    _ => {
+                        return Err(RuntimeError::ArityMismatch {
+                            name: name.to_string(),
+                            expected: if name == "Slice" { 2 } else { 1 },
+                            got: args.len(),
+                        });
+                    }
+                };
+                Ok(Value::Slice {
+                    kind: crate::types::SliceKind::Slice,
+                    start,
+                    end,
+                    step,
+                })
+            }
             // Utility numeric built-ins use the shared runtime value helpers.
             "abs" => builtin_abs(arg1(name, args)?),
             "min" => {
@@ -2142,7 +3240,9 @@ impl VmBackend {
             }
             "round" => builtin_round(arg1(name, args)?),
             "input" => builtin_input(arg1(name, args)?),
-            "Int" | "UInt" | "Float64" | "Bool" => builtin_convert(name, arg1(name, args)?),
+            "Int" | "Scalar" | "UInt" | "Float64" | "Bool" => {
+                builtin_convert(name, arg1(name, args)?)
+            }
             "divmod" => {
                 let (a, b) = arg2(name, args)?;
                 builtin_divmod(a, b)
@@ -2180,6 +3280,37 @@ impl VmBackend {
                 promote_numeric_elems(&mut items);
                 Ok(Value::List(items))
             }
+            // Intrinsic collection constructors use the same insertion
+            // semantics as their literal forms.  Parameter types are erased
+            // by MIR lowering; the checker has already validated each value.
+            "Set" => {
+                let mut items = args;
+                promote_numeric_elems(&mut items);
+                let mut result = Vec::with_capacity(items.len());
+                for item in items {
+                    let mut duplicate = false;
+                    for existing in &result {
+                        if values_equal(existing, &item)? {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if !duplicate {
+                        result.push(item);
+                    }
+                }
+                Ok(Value::Set(result))
+            }
+            "Dict" => {
+                if !args.is_empty() {
+                    return Err(RuntimeError::ArityMismatch {
+                        name: name.to_string(),
+                        expected: 0,
+                        got: args.len(),
+                    });
+                }
+                Ok(Value::Dict(Vec::new()))
+            }
             // `UnsafePointer[T].alloc(n)` — reserve `n` slots in the heap arena and
             // return a pointer to the base (the element type is erased).
             "UnsafePointer.alloc" => {
@@ -2192,7 +3323,40 @@ impl VmBackend {
                         )));
                     }
                 };
-                self.heap_alloc(n)
+                self.heap_alloc(n, std::mem::align_of::<Value>() as i64)
+            }
+            "UnsafePointer.alloc_aligned" => {
+                if args.len() != 2 {
+                    return Err(RuntimeError::ArityMismatch {
+                        name: name.to_string(),
+                        expected: 2,
+                        got: args.len(),
+                    });
+                }
+                let Value::Int(n) = args[0] else {
+                    return Err(RuntimeError::TypeError(
+                        "vm: UnsafePointer.alloc_aligned count must be Int".to_string(),
+                    ));
+                };
+                let Value::Int(alignment) = args[1] else {
+                    return Err(RuntimeError::TypeError(
+                        "vm: UnsafePointer.alloc_aligned alignment must be Int".to_string(),
+                    ));
+                };
+                self.heap_alloc(n, alignment)
+            }
+            "UnsafePointer.dangling" => {
+                if !args.is_empty() {
+                    return Err(RuntimeError::ArityMismatch {
+                        name: name.to_string(),
+                        expected: 0,
+                        got: args.len(),
+                    });
+                }
+                Ok(Value::Pointer {
+                    allocation: 0,
+                    offset: 0,
+                })
             }
             _ => match prog.index_of(name) {
                 Some(idx) => {
@@ -2224,6 +3388,154 @@ impl VmBackend {
                 ))),
             },
         }
+    }
+
+    fn format_value(
+        &mut self,
+        prog: &Prog,
+        value: Value,
+        repr: bool,
+    ) -> Result<String, RuntimeError> {
+        if let Value::Variant { value, .. } = value {
+            return self.format_value(prog, *value, repr);
+        }
+        let Value::Struct {
+            name,
+            fields,
+            value_params,
+        } = value
+        else {
+            return Ok(value.to_string());
+        };
+        let method = if repr { "write_repr_to" } else { "write_to" };
+        let source = format!("{name}.{method}");
+        if let Some(index) = prog.index_of(&prog.overload_name(&source, 1)) {
+            let receiver = Value::Struct {
+                name,
+                fields,
+                value_params,
+            };
+            let (_, variables) =
+                self.call_frame(prog, index, vec![receiver, Value::Str(String::new())], &[])?;
+            return match variables.get(1) {
+                Some(Value::Str(text)) => Ok(text.clone()),
+                other => Err(RuntimeError::TypeError(format!(
+                    "{source} did not leave a Writer value, got {}",
+                    other
+                        .map(crate::runtime::type_name)
+                        .unwrap_or_else(|| "missing".to_string())
+                ))),
+            };
+        }
+        let mut cells = Vec::with_capacity(fields.len());
+        for (field, value) in fields {
+            cells.push(format!("{field}={}", self.format_value(prog, value, repr)?));
+        }
+        Ok(format!("{name}({})", cells.join(", ")))
+    }
+
+    fn format_template(
+        &mut self,
+        prog: &Prog,
+        template: &str,
+        arguments: &[Value],
+    ) -> Result<String, RuntimeError> {
+        let chars: Vec<char> = template.chars().collect();
+        let mut output = String::new();
+        let mut automatic = 0usize;
+        let mut cursor = 0usize;
+        while cursor < chars.len() {
+            if chars[cursor] == '{' {
+                if chars.get(cursor + 1) == Some(&'{') {
+                    output.push('{');
+                    cursor += 2;
+                    continue;
+                }
+                let Some(end_offset) = chars[cursor + 1..].iter().position(|ch| *ch == '}') else {
+                    return Err(RuntimeError::TypeError("unclosed format field".to_string()));
+                };
+                let end = cursor + 1 + end_offset;
+                let field: String = chars[cursor + 1..end].iter().collect();
+                let repr = field.contains("!r");
+                let spec = field.split_once(':').map(|(_, spec)| spec).unwrap_or("");
+                let selector = field.split(['!', ':']).next().unwrap_or_default();
+                let index = if selector.is_empty() {
+                    let index = automatic;
+                    automatic += 1;
+                    index
+                } else {
+                    selector.parse::<usize>().map_err(|_| {
+                        RuntimeError::TypeError(format!("invalid format field '{{{field}}}'"))
+                    })?
+                };
+                let value = arguments
+                    .get(index)
+                    .ok_or_else(|| RuntimeError::ArityMismatch {
+                        name: "String.format".to_string(),
+                        expected: index + 1,
+                        got: arguments.len(),
+                    })?;
+                let rendered = self.format_value(prog, value.clone(), repr)?;
+                output.push_str(&apply_format_spec(value, &rendered, spec)?);
+                cursor = end + 1;
+                continue;
+            }
+            if chars[cursor] == '}' && chars.get(cursor + 1) == Some(&'}') {
+                output.push('}');
+                cursor += 2;
+                continue;
+            }
+            output.push(chars[cursor]);
+            cursor += 1;
+        }
+        Ok(output)
+    }
+
+    fn hash_value(&mut self, prog: &Prog, value: Value) -> Result<u64, RuntimeError> {
+        if let Value::Variant { index, value, .. } = value {
+            // Include both discriminant and payload. Equal payload bytes in
+            // different alternatives must not collapse to the same Variant hash.
+            let tag = crate::runtime::builtin_hash(&Value::UInt(index as u64))?;
+            return Ok(5381u64
+                .wrapping_mul(33)
+                .wrapping_add(tag)
+                .wrapping_mul(33)
+                .wrapping_add(self.hash_value(prog, *value)?));
+        }
+        let Value::Struct {
+            name,
+            fields,
+            value_params,
+        } = value
+        else {
+            return crate::runtime::builtin_hash(&value);
+        };
+        let source = format!("{name}.__hash__");
+        if let Some(index) = prog.index_of(&prog.overload_name(&source, 1)) {
+            let receiver = Value::Struct {
+                name,
+                fields,
+                value_params,
+            };
+            let (_, variables) =
+                self.call_frame(prog, index, vec![receiver, Value::UInt(5381)], &[])?;
+            return match variables.get(1) {
+                Some(Value::UInt(hash)) => Ok(*hash),
+                other => Err(RuntimeError::TypeError(format!(
+                    "{source} did not leave a Hasher value, got {}",
+                    other
+                        .map(crate::runtime::type_name)
+                        .unwrap_or_else(|| "missing".to_string())
+                ))),
+            };
+        }
+        let mut state = 5381u64;
+        for (_, field) in fields {
+            state = state
+                .wrapping_mul(33)
+                .wrapping_add(self.hash_value(prog, field)?);
+        }
+        Ok(state)
     }
 }
 
@@ -2339,6 +3651,28 @@ use calls::*;
 /// Read a struct field (or a reified value parameter, e.g. `Self.n`) by name.
 fn get_field(base: &Value, field: &str) -> Result<Value, RuntimeError> {
     match base {
+        Value::Slice {
+            start, end, step, ..
+        } => {
+            let value = match field {
+                "start" => *start,
+                "end" => *end,
+                "step" => *step,
+                _ => {
+                    return Err(RuntimeError::TypeError(format!(
+                        "Slice has no field '{field}'"
+                    )));
+                }
+            };
+            Ok(Value::Struct {
+                name: "Optional".to_string(),
+                fields: vec![(
+                    "values".to_string(),
+                    Value::List(value.map(Value::Int).into_iter().collect()),
+                )],
+                value_params: Vec::new(),
+            })
+        }
         Value::Struct {
             fields,
             value_params,
@@ -2356,6 +3690,42 @@ fn get_field(base: &Value, field: &str) -> Result<Value, RuntimeError> {
     }
 }
 
+fn apply_format_spec(value: &Value, rendered: &str, spec: &str) -> Result<String, RuntimeError> {
+    if spec.is_empty() {
+        return Ok(rendered.to_string());
+    }
+    if let Some(precision) = spec
+        .strip_prefix('.')
+        .and_then(|tail| tail.strip_suffix('f'))
+        .and_then(|digits| digits.parse::<usize>().ok())
+        && let Value::Float64(number) = value
+    {
+        return Ok(format!("{number:.precision$}"));
+    }
+    let (alignment, width_text) = match spec.chars().next() {
+        Some(character @ ('<' | '>' | '^')) => (character, &spec[1..]),
+        _ => ('>', spec),
+    };
+    let width = width_text.parse::<usize>().map_err(|_| {
+        RuntimeError::TypeError(format!("unsupported format specification '{spec}'"))
+    })?;
+    if rendered.len() >= width {
+        return Ok(rendered.to_string());
+    }
+    let padding = width - rendered.len();
+    let (left, right) = match alignment {
+        '<' => (0, padding),
+        '^' => (padding / 2, padding - padding / 2),
+        _ => (padding, 0),
+    };
+    Ok(format!(
+        "{}{}{}",
+        " ".repeat(left),
+        rendered,
+        " ".repeat(right)
+    ))
+}
+
 fn navigate_reference<'a>(
     mut value: &'a Value,
     projection: &[RefProjection],
@@ -2371,6 +3741,29 @@ fn navigate_reference<'a>(
                 items.get(*index).ok_or_else(|| {
                     RuntimeError::TypeError("reference index out of bounds".to_string())
                 })?
+            }
+            (
+                RefProjection::Variant(expected),
+                Value::Variant {
+                    index,
+                    value,
+                    alternatives,
+                },
+            ) => {
+                if index != expected {
+                    return Err(RuntimeError::TypeError(format!(
+                        "Variant holds '{}', not '{}'",
+                        alternatives
+                            .get(*index)
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| "<invalid>".to_string()),
+                        alternatives
+                            .get(*expected)
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| "<invalid>".to_string())
+                    )));
+                }
+                value.as_ref()
             }
             _ => {
                 return Err(RuntimeError::TypeError(
@@ -2407,6 +3800,35 @@ fn navigate_reference_mut<'a>(
                 _ => {
                     return Err(RuntimeError::TypeError(
                         "invalid mutable reference index".to_string(),
+                    ));
+                }
+            },
+            RefProjection::Variant(expected) => match value {
+                Value::Variant {
+                    index,
+                    value,
+                    alternatives,
+                } if index == expected => value.as_mut(),
+                Value::Variant {
+                    index,
+                    alternatives,
+                    ..
+                } => {
+                    return Err(RuntimeError::TypeError(format!(
+                        "Variant holds '{}', not '{}'",
+                        alternatives
+                            .get(*index)
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| "<invalid>".to_string()),
+                        alternatives
+                            .get(*expected)
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| "<invalid>".to_string())
+                    )));
+                }
+                _ => {
+                    return Err(RuntimeError::TypeError(
+                        "invalid mutable Variant reference projection".to_string(),
                     ));
                 }
             },

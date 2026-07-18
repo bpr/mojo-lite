@@ -1,6 +1,6 @@
-# expect: was partially moved
+# expect: is incomplete and cannot use a whole-value destructor
 @explicit_destroy("close the resource")
-struct Resource:
+struct Resource(ImplicitlyDeletable where False):
     var id: Int
 
     def __init__(out self, id: Int):
@@ -15,3 +15,4 @@ def consume(var value: Int):
 def main():
     var resource = Resource(1)
     consume(resource.id^)
+    resource^.close()

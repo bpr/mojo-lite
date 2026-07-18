@@ -74,6 +74,15 @@ fn ast_raw(
                         s.push('V');
                         s.push_str(&value_expr_raw(v, comptimes));
                     }
+                    ParamArg::Named { name, value } => {
+                        s.push_str(name);
+                        s.push('=');
+                        match &**value {
+                            ParamArg::Type(t) => s.push_str(&ast_raw(t, comptimes, type_bounds)),
+                            ParamArg::Value(v) => s.push_str(&value_expr_raw(v, comptimes)),
+                            ParamArg::Named { .. } => unreachable!(),
+                        }
+                    }
                 }
             }
             s
@@ -105,6 +114,14 @@ fn ty_raw(ty: &Ty) -> String {
             "Tuple${}",
             elems.iter().map(ty_raw).collect::<Vec<_>>().join("$")
         ),
+        Ty::Variant(alternatives) => format!(
+            "Variant${}",
+            alternatives
+                .iter()
+                .map(ty_raw)
+                .collect::<Vec<_>>()
+                .join("$")
+        ),
         // A struct type spells as its annotation does (`Point`, `Pair$Int`) —
         // no `Struct$` marker, so the MIR definition name matches.
         Ty::Struct(name, args) => {
@@ -127,7 +144,9 @@ fn ty_raw(ty: &Ty) -> String {
             }
             result
         }
-        Ty::Pointer(elem) => format!("UnsafePointer${}", ty_raw(elem)),
+        // Pointer origins affect checking/lifetimes but erase from the runtime
+        // callable ABI, just like origin parameters on `ref` arguments.
+        Ty::Pointer { element, .. } => format!("UnsafePointer${}", ty_raw(element)),
         Ty::Assoc { base, name } => {
             format!("Assoc${}${}", ty_raw(base), encode_identifier(name))
         }
@@ -236,6 +255,20 @@ impl SignatureKey {
             .join("$");
         format!("{OV_SEP}{parts}")
     }
+
+    fn with_receiver(&self, convention: Option<ArgConvention>) -> SignatureKey {
+        let receiver = match convention {
+            None | Some(ArgConvention::Read) => "SelfRead",
+            Some(ArgConvention::Mut) => "SelfMut",
+            Some(ArgConvention::Var) => "SelfVar",
+            Some(ArgConvention::Out) => "SelfOut",
+            Some(ArgConvention::Ref) => "SelfRef",
+            Some(ArgConvention::Deinit) => "SelfDeinit",
+        };
+        let mut parts = vec![TypeKey(receiver.to_string())];
+        parts.extend(self.0.iter().cloned());
+        SignatureKey(parts)
+    }
 }
 
 /// The lowered symbol of an overloaded free function: `pick$ov$Int`.
@@ -247,6 +280,30 @@ pub fn function_symbol(base: &str, sig: &SignatureKey) -> String {
 /// the other lifecycle methods): `Box.value$ov$Int`.
 pub fn method_symbol(type_name: &str, method: &str, sig: &SignatureKey) -> String {
     format!("{type_name}.{method}{}", sig.suffix())
+}
+
+/// Convention-qualified symbol for `__iter__` overloads. Current Mojo permits
+/// borrowed and owned `__iter__` methods with identical explicit parameters;
+/// receiver convention is therefore part of this method's callable identity.
+pub fn iterator_method_symbol(
+    type_name: &str,
+    convention: Option<ArgConvention>,
+    sig: &SignatureKey,
+) -> String {
+    method_symbol(
+        type_name,
+        "__iter__",
+        &sig.with_receiver(convention),
+    )
+}
+
+/// Retarget a checker-selected method symbol from an abstract receiver (for
+/// example `__trait_dispatch.pick$ov$Int`) to the concrete runtime type while
+/// preserving the exact selected method/signature suffix. Keeping this parsing
+/// here preserves this module's ownership of the overload encoding.
+pub fn retarget_method_symbol(symbol: &str, type_name: &str) -> Option<String> {
+    let (_, method_and_signature) = symbol.rsplit_once('.')?;
+    Some(format!("{type_name}.{method_and_signature}"))
 }
 
 /// The overloaded declarations of a program, scanned from its top level: which
@@ -360,13 +417,16 @@ pub fn lowered_method_name(
     source_name: &str,
     type_params: &[TypeParam],
     params: &[FnParam],
+    self_convention: Option<ArgConvention>,
     sets: &OverloadSets,
 ) -> String {
     if sets.method_is_overloaded(source_name, params.len()) {
-        format!(
-            "{source_name}{}",
-            signature_from_ast(params, type_params, &sets.comptimes).suffix()
-        )
+        let signature = signature_from_ast(params, type_params, &sets.comptimes);
+        if let Some(type_name) = source_name.strip_suffix(".__iter__") {
+            iterator_method_symbol(type_name, self_convention, &signature)
+        } else {
+            format!("{source_name}{}", signature.suffix())
+        }
     } else {
         source_name.to_string()
     }

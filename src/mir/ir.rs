@@ -67,6 +67,18 @@ pub enum UseMode {
     BorrowMut,
 }
 
+/// One already-evaluated argument to a multi-dimensional subscript.
+#[derive(Debug, Clone)]
+pub enum MirSubscriptArg {
+    Index(Reg),
+    Slice {
+        kind: crate::types::SliceKind,
+        lower: Option<Reg>,
+        upper: Option<Reg>,
+        step: Option<Reg>,
+    },
+}
+
 /// A compile-time-known literal.
 #[derive(Debug, Clone)]
 pub enum Const {
@@ -96,6 +108,9 @@ impl FuncRef {
 pub enum Proj {
     Field(String),
     Index(Reg), // the subscript index, flattened to a register (evaluated once)
+    /// Payload of a checked `Variant` alternative.  The tag is static; runtime
+    /// navigation traps if the active alternative differs.
+    Variant(usize),
 }
 
 /// A writable location: a root variable plus a chain of projections
@@ -103,10 +118,41 @@ pub enum Proj {
 #[derive(Debug, Clone)]
 pub struct MirPlace {
     pub root: VarId,
+    /// Checked type of the root slot before projections. `None` is permitted only
+    /// for compatibility HIR built without a `CheckedProgram`; production MIR
+    /// verification rejects it.
+    pub root_ty: Option<Ty>,
     pub proj: Vec<Proj>,
+    /// Result type after each corresponding projection in `proj`.
+    pub projection_tys: Vec<Ty>,
+    /// Checked type of the designated storage after all projections.
+    pub ty: Option<Ty>,
     /// The local reference through which this place is accessed. `None` means
     /// direct owner access. This is static metadata ignored by the VM.
     pub through: Option<VarId>,
+}
+
+impl MirPlace {
+    pub fn root(root: VarId, ty: Option<Ty>) -> Self {
+        Self {
+            root,
+            root_ty: ty.clone(),
+            proj: Vec::new(),
+            projection_tys: Vec::new(),
+            ty,
+            through: None,
+        }
+    }
+
+    pub fn project(&mut self, projection: Proj, ty: Ty) {
+        self.proj.push(projection);
+        self.projection_tys.push(ty.clone());
+        self.ty = Some(ty);
+    }
+
+    pub fn is_typed(&self) -> bool {
+        self.root_ty.is_some() && self.ty.is_some() && self.proj.len() == self.projection_tys.len()
+    }
 }
 
 /// A single three-address instruction. Each value-producing instruction writes a
@@ -135,6 +181,19 @@ pub enum MirInstr {
         reference: Reg,
         value: Reg,
     },
+    /// Build a non-escaping closure value from a lifted function and its explicit
+    /// environment. Reference captures are frame/slot handles; moved captures
+    /// transfer the value into the environment.
+    MakeClosure {
+        dest: Reg,
+        function: String,
+        captures: Vec<MirClosureCapture>,
+    },
+    /// Extend an owner's MIR live range through a closure invocation without
+    /// performing a value-level copy. This is erased by execution.
+    KeepAlive {
+        var: VarId,
+    },
     Const {
         dest: Reg,
         k: Const,
@@ -158,14 +217,13 @@ pub enum MirInstr {
     },
     /// `var := <register>` — (re)define a variable slot from a register (lowered
     /// from a HIR `Bind`). The write paired with `UseVar`; Stage 6 reads it as a
-    /// dataflow *def* (transitions the var to `Owned`). `source_annotation` is a
-    /// parsed declaration annotation (`var x: T = …`) so a backend can materialize a numeric literal
-    /// to `T` through checked coercion; `None` = inferred `var`/reassignment,
-    /// which keeps the binding's existing type (`coerce_like`).
+    /// dataflow *def* (transitions the var to `Owned`). `binding_ty` is the
+    /// checker-resolved destination type; source annotation syntax never enters
+    /// MIR. `None` on reassignment keeps the slot's existing runtime type.
     DefVar {
         var: VarId,
         src: Reg,
-        source_annotation: Option<SourceType>,
+        binding_ty: Option<Ty>,
     },
     UnOp {
         op: PrefixOp,
@@ -189,6 +247,8 @@ pub enum MirInstr {
     Call {
         dest: Reg,
         func: FuncRef,
+        /// Checker-selected error contract for this call, if it may raise.
+        raises: Option<Ty>,
         args: Vec<Reg>,
         kwargs: Vec<(String, Reg)>,
         arg_places: Vec<Option<MirPlace>>,
@@ -205,6 +265,8 @@ pub enum MirInstr {
     CallIndirect {
         dest: Reg,
         callee: Reg,
+        /// Checker-selected error contract of the callable value.
+        raises: Option<Ty>,
         args: Vec<Reg>,
         kwargs: Vec<(String, Reg)>,
     },
@@ -218,6 +280,8 @@ pub enum MirInstr {
         recv: Reg,
         method: String,
         resolved: Option<String>,
+        /// Checker-selected concrete or trait-requirement error contract.
+        raises: Option<Ty>,
         args: Vec<Reg>,
         kwargs: Vec<(String, Reg)>,
         recv_place: Option<MirPlace>,
@@ -244,14 +308,41 @@ pub enum MirInstr {
     Slice {
         dest: Reg,
         object: Reg,
+        kind: crate::types::SliceKind,
         lower: Option<Reg>,
         upper: Option<Reg>,
         step: Option<Reg>,
+        resolved: Option<String>,
+    },
+    /// `object[a, b:c]`: variadic `__getitem__` dispatch with every slice
+    /// descriptor selected by the checker and constructed explicitly by the VM.
+    MultiIndex {
+        dest: Reg,
+        object: Reg,
+        args: Vec<MirSubscriptArg>,
+        resolved: Option<String>,
+    },
+    /// `object[a, b:c] = value`: checked `__setitem__` dispatch. The receiver
+    /// place is retained so a `mut self` implementation is written back after
+    /// the call. Variadic setitem methods receive `value` in their keyword-only
+    /// slot; fixed-arity methods receive it as the last positional argument.
+    MultiSet {
+        receiver_place: MirPlace,
+        args: Vec<MirSubscriptArg>,
+        value: Reg,
+        value_keyword: bool,
+        resolved: Option<String>,
     },
     /// `place = src` — a write through a place (`p.x = e`, `xs[i] = e`, nested).
     Store {
         place: MirPlace,
         src: Reg,
+    },
+    /// Initialize reference-valued storage with a reference handle.  Ordinary
+    /// `Store` on the same typed place writes through the established handle.
+    StoreRef {
+        place: MirPlace,
+        reference: Reg,
     },
     /// Read a place into a register — for a read-modify-write (`place OP= e`),
     /// where the place (and its indices) must be evaluated exactly once.
@@ -263,10 +354,79 @@ pub enum MirInstr {
     MakeList {
         dest: Reg,
         elems: Vec<Reg>,
+        element_type: Option<Ty>,
+    },
+    /// Construct a set display in source evaluation order. Duplicate elements
+    /// are discarded while the first insertion position is retained.
+    MakeSet {
+        dest: Reg,
+        elems: Vec<Reg>,
+        element_type: Option<Ty>,
+    },
+    /// Construct a dictionary display in source evaluation order. A later
+    /// duplicate key replaces the earlier value without moving its position.
+    MakeDict {
+        dest: Reg,
+        entries: Vec<(Reg, Reg)>,
+        key_type: Option<Ty>,
+        value_type: Option<Ty>,
+    },
+    /// The insertion protocol used by collection comprehensions: append for a
+    /// list, add for a set, and indexed assignment for a dictionary.
+    CollectionInsert {
+        collection: VarId,
+        key: Option<Reg>,
+        value: Reg,
     },
     MakeTuple {
         dest: Reg,
         elems: Vec<Reg>,
+        /// Resolved element types when available. Typed `Tuple[T, ...](...)`
+        /// construction uses these to materialize each argument precisely.
+        element_types: Option<Vec<Ty>>,
+    },
+    /// Construct a tagged union. Alternative order determines the runtime tag.
+    MakeVariant {
+        dest: Reg,
+        alternatives: Vec<Ty>,
+        index: usize,
+        value: Reg,
+    },
+    /// Test a tag selected during semantic checking.
+    VariantIs {
+        dest: Reg,
+        variant: Reg,
+        index: usize,
+    },
+    /// Extract the active alternative, trapping on a tag mismatch.
+    VariantGet {
+        dest: Reg,
+        variant: Reg,
+        index: usize,
+    },
+    /// Replace a writable variant and destroy its previous payload.
+    VariantSet {
+        dest: Reg,
+        place: MirPlace,
+        index: usize,
+        value: Reg,
+    },
+    /// Move a payload out of an already-consumed variant value.
+    VariantTake {
+        dest: Reg,
+        variant: Reg,
+        index: usize,
+        checked: bool,
+    },
+    /// Replace the active payload without destroying it, returning ownership of
+    /// that previous payload to the caller.
+    VariantReplace {
+        dest: Reg,
+        place: MirPlace,
+        input_index: usize,
+        output_index: usize,
+        value: Reg,
+        checked: bool,
     },
     /// SIMD construction `SIMD[DType.<dt>, width](elems)` (or a scalar-alias like
     /// `Int32(x)`). The element `dtype`/`width` — compile-time parameters the MIR
@@ -315,6 +475,12 @@ pub enum MirInstr {
     ConsumeVar {
         var: VarId,
     },
+    /// Consume one projected subobject after its named explicit destructor
+    /// succeeds, leaving the rest of the aggregate available.
+    ConsumePlace {
+        place: MirPlace,
+        marker: Reg,
+    },
     /// A construct the MIR/backends don't lower yet (a `try` with its exceptional
     /// edges, a nested declaration). Kept as an explicit node — rather than a
     /// lowering-time `panic!` — so a backend can report a clean error instead of
@@ -324,19 +490,29 @@ pub enum MirInstr {
     /// `__iter__()`); a no-op for a built-in `range`/`List`.
     GetIter {
         iter: VarId,
+        mode: crate::IterationMode,
+        prepare: Vec<String>,
     },
     /// Iterator protocol (`for` loops): read whether the iterator variable `iter`
     /// yields another element into `dest` (a `Bool`) — a pure read.
     HasNext {
         dest: Reg,
         iter: VarId,
+        method: Option<String>,
     },
     /// Iterator protocol: bind the current element into `dest` and advance the
     /// iterator variable `iter` in place (a mutating read).
     Next {
         dest: Reg,
         iter: VarId,
+        method: Option<String>,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct MirClosureCapture {
+    pub place: MirPlace,
+    pub moved: bool,
 }
 
 /// How a basic block hands off control. Block targets are indices into
@@ -386,10 +562,9 @@ pub struct MirFunction {
     /// Number of leading vars that are parameters (`vars[0..n_params]`), bound from
     /// the call's arguments in declaration order — the VM call ABI.
     pub n_params: usize,
-    /// The declared type of each parameter (same order/length as the params), so a
-    /// caller can coerce a numeric-literal argument at parameter binding. Empty
-    /// for `__toplevel__`.
-    pub param_annotations: Vec<SourceType>,
+    /// The checker-resolved type of each parameter (same order/length as the
+    /// params), used when binding arguments. Empty for `__toplevel__`.
+    pub param_types: Vec<Ty>,
     /// Whether each parameter is consuming (the callee takes ownership, so it drops
     /// the value — unlike a borrowed `read`/`mut` parameter). Same order as the
     /// params; the caller transfers with `^`, so its own drop is skipped.
@@ -400,6 +575,9 @@ pub struct MirFunction {
     pub ref_params: Vec<bool>,
     pub returns_reference: bool,
     pub spans: SpanTable,
+    /// Resolved type of registers originating in checked expressions. Synthetic
+    /// control-flow registers are filled by instruction typing before verification.
+    pub reg_types: HashMap<u32, Ty>,
 }
 
 /// Maps each generated register to its source span and (if it names one) the

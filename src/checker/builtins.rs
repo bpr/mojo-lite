@@ -8,6 +8,9 @@ pub(super) fn default_literal(ty: &Ty) -> Ty {
         Ty::FloatLiteral => Ty::Float64,
         // Materialize each element of a tuple literal (`(1, 2)` → `Tuple[Int, Int]`).
         Ty::Tuple(elems) => Ty::Tuple(elems.iter().map(default_literal).collect()),
+        Ty::Variant(alternatives) => {
+            Ty::Variant(alternatives.iter().map(default_literal).collect())
+        }
         other => other.clone(),
     }
 }
@@ -41,6 +44,9 @@ pub(super) fn has_equality_bound_or_concrete(checker: &Checker, ty: &Ty) -> bool
             .structs
             .get(name)
             .is_some_and(|s| s.conforms.iter().any(|c| c == "Equatable")),
+        Ty::Variant(alternatives) => alternatives
+            .iter()
+            .all(|alternative| has_equality_bound_or_concrete(checker, alternative)),
         _ => has_equality_bound(ty) || is_scalar(ty) || is_numeric_like(ty),
     }
 }
@@ -141,6 +147,50 @@ pub(super) fn is_list_equatable(ty: &Ty) -> bool {
     is_numeric(ty) || matches!(ty, Ty::Bool | Ty::String | Ty::None) || has_equality_bound(ty)
 }
 
+/// Whether every element in a tuple supports equality. Tuples recurse so nested
+/// tuple comparisons and membership stay structural without making `List`
+/// equality part of this compiler-known subset.
+pub(super) fn tuple_elements_equatable(elements: &[Ty]) -> bool {
+    elements.iter().all(|ty| match ty {
+        Ty::Tuple(nested) => tuple_elements_equatable(nested),
+        other => is_list_equatable(other),
+    })
+}
+
+fn tuple_element_comparable(ty: &Ty) -> bool {
+    match ty {
+        Ty::Tuple(nested) => tuple_elements_comparable(nested),
+        Ty::String => true,
+        other => is_numeric(other) || has_order_bound(other),
+    }
+}
+
+fn tuple_elements_comparable(elements: &[Ty]) -> bool {
+    elements.iter().all(tuple_element_comparable)
+}
+
+fn tuple_order_pair_compatible(left: &Ty, right: &Ty) -> bool {
+    if common_numeric(left, right).is_some() {
+        return true;
+    }
+    match (left, right) {
+        (Ty::String, Ty::String) => true,
+        (Ty::Tuple(left), Ty::Tuple(right)) => tuple_order_compatible(left, right),
+        _ => left == right && has_order_bound(left),
+    }
+}
+
+/// Tuple ordering is lexicographic. Every element must be comparable, and each
+/// pair in the common prefix must have a compatible comparison operation.
+pub(super) fn tuple_order_compatible(left: &[Ty], right: &[Ty]) -> bool {
+    tuple_elements_comparable(left)
+        && tuple_elements_comparable(right)
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| tuple_order_pair_compatible(left, right))
+}
+
 /// Whether a value of type `ty` can be `print`ed (has a user-facing display).
 /// Functions, ranges, and opaque type parameters are not printable.
 pub(super) fn is_printable(ty: &Ty) -> bool {
@@ -156,9 +206,12 @@ pub(super) fn is_printable(ty: &Ty) -> bool {
         | Ty::Struct(_, _)
         | Ty::Simd { .. }
         | Ty::Error
-        | Ty::List(_) => true,
+        | Ty::List(_)
+        | Ty::Set(_)
+        | Ty::Dict(_, _) => true,
         // A tuple prints if every element prints.
         Ty::Tuple(elems) => elems.iter().all(is_printable),
+        Ty::Variant(alternatives) => alternatives.iter().all(is_printable),
         _ => false,
     }
 }
@@ -182,6 +235,14 @@ pub(super) fn coerces(from: &Ty, to: &Ty) -> bool {
         return true;
     }
     match (from, to) {
+        (Ty::Struct(from, from_args), Ty::Struct(to, to_args))
+            if matches!(from.as_str(), "ContiguousSlice" | "StridedSlice")
+                && to == "Slice"
+                && from_args.is_empty()
+                && to_args.is_empty() =>
+        {
+            true
+        }
         (Ty::Param { name: a, .. }, Ty::Param { name: b, .. }) => a == b,
         (Ty::Struct(an, aargs), Ty::Struct(bn, bargs)) => {
             an == bn
@@ -193,7 +254,18 @@ pub(super) fn coerces(from: &Ty, to: &Ty) -> bool {
                 })
         }
         (Ty::List(a), Ty::List(b)) => coerces(a, b),
-        (Ty::Pointer(a), Ty::Pointer(b)) => coerces(a, b),
+        (Ty::Set(a), Ty::Set(b)) => coerces(a, b),
+        (Ty::Dict(ak, av), Ty::Dict(bk, bv)) => coerces(ak, bk) && coerces(av, bv),
+        (
+            Ty::Pointer {
+                element: a,
+                origin: ao,
+            },
+            Ty::Pointer {
+                element: b,
+                origin: bo,
+            },
+        ) => coerces(a, b) && ao == bo,
         (
             Ty::Func {
                 params: from_params,
@@ -239,9 +311,23 @@ pub(super) fn coerces(from: &Ty, to: &Ty) -> bool {
         }
         (Ty::IntLiteral, Ty::Int | Ty::UInt | Ty::Float64 | Ty::FloatLiteral) => true,
         (Ty::FloatLiteral, Ty::Float64) => true,
+        (literal, Ty::Simd { dtype, width: 1 }) if splats_to(literal, *dtype) => true,
+        (
+            Ty::Simd {
+                dtype: from_dtype,
+                width: from_width,
+            },
+            Ty::Simd {
+                dtype: to_dtype,
+                width: -1,
+            },
+        ) => from_dtype == to_dtype && *from_width > 0,
         // A tuple coerces element-wise (same arity) — so a literal element
         // materializes: `(1, 2.0)` fits `Tuple[Float64, Float64]`.
         (Ty::Tuple(a), Ty::Tuple(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| coerces(x, y))
+        }
+        (Ty::Variant(a), Ty::Variant(b)) => {
             a.len() == b.len() && a.iter().zip(b).all(|(x, y)| coerces(x, y))
         }
         _ => false,

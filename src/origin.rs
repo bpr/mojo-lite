@@ -48,6 +48,30 @@ pub enum Mutability {
     Param(OriginParamId),
 }
 
+/// Provenance retained by an origin-bearing unsafe pointer type.  `Legacy`
+/// represents Mojito's one-argument compatibility spelling; all current-Mojo
+/// spellings remain explicit through checked HIR/MIR and are erased only by the
+/// VM value representation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PointerOrigin {
+    Legacy,
+    Place {
+        place: OriginPlace,
+        mutable: bool,
+    },
+    Param {
+        id: OriginParamId,
+        mutability: Mutability,
+    },
+    Static,
+    Untracked {
+        mutable: bool,
+    },
+    UnsafeAny {
+        mutable: bool,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Checked reference type: referent, storage origin, and access permission.
 pub struct RefTy {
@@ -63,6 +87,8 @@ pub struct RefTy {
 pub enum SigOrigin {
     Self_,
     Param(usize),
+    Static,
+    Untracked { mutable: bool },
     Projected(Box<SigOrigin>, Vec<OriginSeg>),
     Union(Vec<SigOrigin>),
     Infer,

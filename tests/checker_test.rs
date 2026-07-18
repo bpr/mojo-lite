@@ -55,7 +55,7 @@ fn accepts_recursion() {
 #[test]
 fn accepts_lexical_capture_downward_funarg() {
     ok(
-        "def adder(n: Int) -> Int:\n    def add_n(x: Int) -> Int:\n        return x + n\n    return add_n(100)\n\nvar c: Int = adder(42)\n",
+        "def adder(n: Int) -> Int:\n    def add_n(x: Int) unified {n} -> Int:\n        return x + n\n    return add_n(100)\n\nvar c: Int = adder(42)\n",
     );
 }
 
@@ -335,6 +335,25 @@ fn var_less_introduction_type_checks_as_implicit_declaration() {
 }
 
 #[test]
+fn nested_implicit_bindings_use_function_scope_with_definite_initialization() {
+    ok(
+        "def initialized() -> Int:\n    if True:\n        value = 7\n    return value\n",
+    );
+    ok(
+        "def joined(condition: Bool) -> Int:\n    if condition:\n        value = 1\n    else:\n        value = 2\n    return value\n",
+    );
+
+    for source in [
+        "def maybe(condition: Bool) -> Int:\n    if condition:\n        value = 1\n    return value\n",
+        "def unreachable_assignment() -> Int:\n    if False:\n        value = 1\n    return value\n",
+    ] {
+        assert!(
+            matches!(err(source), TypeError::Unsupported(message) if message.contains("may be uninitialized"))
+        );
+    }
+}
+
+#[test]
 fn rejects_assignment_of_wrong_type() {
     let e = err("var x: Int = 1\nx = True\n");
     match e {
@@ -382,6 +401,64 @@ fn accepts_range_with_one_two_or_three_args() {
 #[test]
 fn accepts_break_and_continue_inside_loop() {
     ok("for i in range(10):\n    if i == 5:\n        break\n    continue\n");
+}
+
+#[test]
+fn checks_owned_iteration_and_collection_comprehensions() {
+    let move_only = "struct Item:\n    var value: Int\n    def __init__(out self, value: Int):\n        self.value = value\n\n";
+    ok(&format!(
+        "{move_only}def main():\n    var values = [Item(1), Item(2)]\n    for var item in values^:\n        print(item.value)\n"
+    ));
+    assert!(matches!(
+        err(&format!(
+            "{move_only}def main():\n    var values = [Item(1)]\n    for item in values:\n        print(item.value)\n"
+        )),
+        TypeError::NonCopyable { .. }
+    ));
+    assert!(matches!(
+        err("def main():\n    var values = [1, 2]\n    for var item in values:\n        print(item)\n"),
+        TypeError::Unsupported(message) if message.contains("transferred iterable")
+    ));
+    assert!(matches!(
+        err("def main():\n    var values = [1, 2]\n    for item in values^:\n        print(item)\n"),
+        TypeError::Unsupported(message) if message.contains("explicit `var`")
+    ));
+
+    ok("def main():\n    var xs = [x * x for x in range(5) if x % 2 == 0]\n    var s = {x % 3 for x in range(8)}\n    var d = {x: x * x for x in range(4)}\n    print(len(xs), len(s), d[3])\n");
+
+    let linear = "@explicit_destroy(\"close Item\")\nstruct Linear(ImplicitlyDeletable where False):\n    var value: Int\n    def __init__(out self, value: Int):\n        self.value = value\n    def close(deinit self):\n        pass\n\n";
+    ok(&format!(
+        "{linear}def main():\n    var values = [Linear(1), Linear(2)]\n    for var item in values^:\n        item^.close()\n"
+    ));
+    assert!(matches!(
+        err(&format!(
+            "{linear}def main():\n    var values = [Linear(1), Linear(2)]\n    for var item in values^:\n        item^.close()\n        break\n"
+        )),
+        TypeError::Unsupported(message) if message.contains("residual elements")
+    ));
+}
+
+#[test]
+fn comprehension_binders_are_lexical_and_enforce_linear_cleanup() {
+    ok("def main():\n    var x = 100\n    var values = [x for x in range(3)]\n    print(x, values)\n");
+    ok("def main():\n    var values = [x for x in range(2) for x in range(x + 1)]\n    print(values)\n");
+
+    let linear = "@explicit_destroy(\"close Item\")\nstruct Item(ImplicitlyDeletable where False):\n    var value: Int\n    def __init__(out self, value: Int):\n        self.value = value\n    def close(deinit self):\n        pass\n\n";
+    assert!(matches!(
+        err(&format!(
+            "{linear}def main():\n    var values = [Item(1)]\n    var result = [item.value for var item in values^]\n"
+        )),
+        TypeError::ExplicitDestroy { var, .. } if var == "item"
+    ));
+    ok(&format!(
+        "{linear}def main():\n    var values = [Item(1)]\n    var result = [item^.close() for var item in values^]\n"
+    ));
+}
+
+#[test]
+fn collection_displays_use_parameter_and_return_context() {
+    ok("def consume(values: Set[Float64]):\n    pass\n\ndef empty() -> Set[Float64]:\n    return {}\n\ndef numbers() -> Set[Float64]:\n    return {1, 2}\n\ndef main():\n    consume({})\n    consume({1, 2})\n    print(empty(), numbers())\n");
+    ok("def consume(values: Dict[String, Float64]):\n    pass\n\ndef main():\n    consume({})\n    consume({\"one\": 1, \"two\": 2})\n");
 }
 
 #[test]
@@ -690,6 +767,79 @@ fn rejects_struct_with_mismatched_trait_method_signature() {
 }
 
 #[test]
+fn trait_method_requirements_preserve_and_enforce_raises_effects() {
+    let declarations = "trait Fallible:\n    def run(self) raises -> Int: ...\n\n@fieldwise_init\nstruct Failure(Fallible):\n    var code: Int\n    def run(self) raises -> Int:\n        raise \"failed\"\n        return self.code\n";
+
+    ok(&format!(
+        "{declarations}\ndef invoke[T: Fallible](value: T) raises -> Int:\n    return value.run()\n"
+    ));
+    assert!(matches!(
+        err(&format!(
+            "{declarations}\ndef invoke[T: Fallible](value: T) -> Int:\n    return value.run()\n"
+        )),
+        TypeError::UnhandledRaise(_)
+    ));
+}
+
+#[test]
+fn bounded_trait_overloads_select_the_matching_effect_contract() {
+    let declarations = "trait Picks:\n    def pick(self, value: Int) -> Int: ...\n    def pick(self, value: String) raises -> Int: ...\n";
+
+    ok(&format!(
+        "{declarations}\ndef safe[T: Picks](value: T) -> Int:\n    return value.pick(7)\n\ndef fallible[T: Picks](value: T) raises -> Int:\n    return value.pick(\"boom\")\n"
+    ));
+    assert!(matches!(
+        err(&format!(
+            "{declarations}\ndef unsafe[T: Picks](value: T) -> Int:\n    return value.pick(\"boom\")\n"
+        )),
+        TypeError::UnhandledRaise(_)
+    ));
+}
+
+#[test]
+fn trait_method_conformance_may_narrow_but_not_widen_effects() {
+    ok(
+        "trait Fallible:\n    def run(self) raises -> Int: ...\n\n@fieldwise_init\nstruct Safe(Fallible):\n    var value: Int\n    def run(self) -> Int:\n        return self.value\n",
+    );
+
+    let error = err(
+        "trait Infallible:\n    def run(self) -> Int: ...\n\n@fieldwise_init\nstruct Unsafe(Infallible):\n    var value: Int\n    def run(self) raises -> Int:\n        raise \"failed\"\n        return self.value\n",
+    );
+    assert!(matches!(error, TypeError::TraitMethodMismatch { .. }));
+}
+
+#[test]
+fn typed_trait_method_effects_reject_a_wider_error_family() {
+    ok(
+        "@fieldwise_init\nstruct ValidationError:\n    var reason: String\n\ntrait Validates:\n    def validate(self) raises ValidationError -> Int: ...\n\n@fieldwise_init\nstruct Validator(Validates):\n    var value: Int\n    def validate(self) raises ValidationError -> Int:\n        raise ValidationError(\"bad\")\n        return self.value\n",
+    );
+
+    let error = err(
+        "@fieldwise_init\nstruct ValidationError:\n    var reason: String\n\ntrait Validates:\n    def validate(self) raises ValidationError -> Int: ...\n\n@fieldwise_init\nstruct Validator(Validates):\n    var value: Int\n    def validate(self) raises -> Int:\n        raise \"bad\"\n        return self.value\n",
+    );
+    assert!(matches!(error, TypeError::TraitMethodMismatch { .. }));
+
+    let error = err(
+        "@fieldwise_init\nstruct ValidationError:\n    var reason: String\n\ntrait Fallible:\n    def run(self) raises -> Int: ...\n\n@fieldwise_init\nstruct Typed(Fallible):\n    var value: Int\n    def run(self) raises ValidationError -> Int:\n        raise ValidationError(\"bad\")\n        return self.value\n",
+    );
+    assert!(matches!(error, TypeError::TraitMethodMismatch { .. }));
+}
+
+#[test]
+fn typed_call_effects_require_the_same_enclosing_error_type() {
+    let declarations = "@fieldwise_init\nstruct ValidationError:\n    var reason: String\n\ndef validate() raises ValidationError -> Int:\n    raise ValidationError(\"bad\")\n    return 0\n";
+    ok(&format!(
+        "{declarations}\ndef caller() raises ValidationError -> Int:\n    return validate()\n"
+    ));
+    assert!(matches!(
+        err(&format!(
+            "{declarations}\ndef caller() raises -> Int:\n    return validate()\n"
+        )),
+        TypeError::RaiseTypeMismatch { .. }
+    ));
+}
+
+#[test]
 fn accepts_trait_comptime_type_member_conformance() {
     ok(
         "trait HasElement:\n    comptime Element: AnyType\n\n@fieldwise_init\nstruct Box[T: AnyType](HasElement):\n    comptime Element = Self.T\n    var value: Self.T\n",
@@ -746,6 +896,67 @@ fn rejects_associated_value_in_type_position() {
         "got {:?}",
         e
     );
+}
+
+#[test]
+fn composes_inherited_associated_type_bounds() {
+    ok(
+        "trait HasElement:\n    comptime Element: AnyType\n\ntrait HasCopyableElement:\n    comptime Element: Copyable\n\ntrait Collection(HasElement, HasCopyableElement):\n    def size(self) -> Int: ...\n\n@fieldwise_init\nstruct IntCollection(Collection):\n    comptime Element = Int\n    var value: Int\n    def size(self) -> Int:\n        return 1\n",
+    );
+}
+
+#[test]
+fn checks_composed_associated_type_bounds() {
+    ok(
+        "trait Container:\n    comptime Element: Writable & Copyable & ImplicitlyDeletable\n\n@fieldwise_init\nstruct IntContainer(Container):\n    comptime Element = Int\n    var value: Int\n",
+    );
+
+    let e = err(
+        "trait Container:\n    comptime Element: Writable & Copyable\n\n@fieldwise_init\nstruct Opaque:\n    var value: Int\n\n@fieldwise_init\nstruct Bad(Container):\n    comptime Element = Opaque\n    var value: Opaque\n",
+    );
+    assert!(matches!(
+        e,
+        TypeError::TraitComptimeMemberMismatch { member, .. } if member == "Element"
+    ));
+}
+
+#[test]
+fn rejects_conflicting_inherited_associated_member_kinds() {
+    let e = err(
+        "trait TypeMember:\n    comptime Item: AnyType\n\ntrait ValueMember:\n    comptime Item: Int\n\ntrait Invalid(TypeMember, ValueMember):\n    def marker(self): ...\n",
+    );
+    assert!(
+        matches!(e, TypeError::Unsupported(message) if message.contains("conflicting inherited associated member 'Item'"))
+    );
+}
+
+#[test]
+fn applies_conditional_conformance_after_specialization() {
+    ok(
+        "@fieldwise_init\nstruct Wrapper[T: AnyType](Writable where conforms_to(T, Writable)):\n    var value: Self.T\n\ndef accept[T: Writable](value: T):\n    pass\n\ndef main():\n    accept(Wrapper[Int](1))\n",
+    );
+
+    let e = err(
+        "@fieldwise_init\nstruct Opaque:\n    pass\n\n@fieldwise_init\nstruct Wrapper[T: AnyType](Writable where conforms_to(T, Writable)):\n    var value: Self.T\n\ndef accept[T: Writable](value: T):\n    pass\n\ndef main():\n    accept(Wrapper[Opaque](Opaque()))\n",
+    );
+    assert!(
+        matches!(&e, TypeError::TraitNotSatisfied { trait_name, .. } if trait_name == "Writable"),
+        "got {e:?}"
+    );
+}
+
+#[test]
+fn conditional_conformance_accepts_value_predicates() {
+    ok(
+        "@fieldwise_init\nstruct Window[size: Int](Writable where size > 0):\n    var value: Int\n\ndef accept[T: Writable](value: T):\n    pass\n\ndef main():\n    accept(Window[1](4))\n",
+    );
+    let e = err(
+        "@fieldwise_init\nstruct Window[size: Int](Writable where size > 0):\n    var value: Int\n\ndef accept[T: Writable](value: T):\n    pass\n\ndef main():\n    accept(Window[0](4))\n",
+    );
+    assert!(matches!(
+        e,
+        TypeError::TraitNotSatisfied { trait_name, .. } if trait_name == "Writable"
+    ));
 }
 
 #[test]
@@ -852,13 +1063,8 @@ fn rejects_uninferable_value_parameter() {
 }
 
 #[test]
-fn rejects_non_int_value_parameter_type() {
-    let e = err("@fieldwise_init\nstruct Bad[n: Float64]:\n    var tag: Int\n");
-    assert!(
-        matches!(&e, TypeError::BadValueParamType { name, .. } if name == "n"),
-        "got {:?}",
-        e
-    );
+fn accepts_float_value_parameter_type() {
+    ok("@fieldwise_init\nstruct Measurement[value: Float64]:\n    var tag: Int\n");
 }
 
 #[test]
@@ -939,6 +1145,19 @@ fn accepts_literal_splat_in_simd_operator() {
 #[test]
 fn accepts_scalar_alias_types_and_construction() {
     ok("var a: Int8 = Int8(5)\nvar b: UInt32 = UInt32(9)\nvar c: Float32 = Float32(1.5)\n");
+}
+
+#[test]
+fn byte_alias_contextually_materializes_in_range_literals() {
+    ok("var byte: Byte = 255\nvar same: UInt8 = byte\n");
+    assert!(matches!(
+        err("var byte: Byte = 256\n"),
+        TypeError::TypeMismatch { .. }
+    ));
+    assert!(matches!(
+        err("var byte: Byte = -1\n"),
+        TypeError::TypeMismatch { .. }
+    ));
 }
 
 #[test]
@@ -1198,7 +1417,7 @@ fn imported_names_are_not_made_available() {
 #[test]
 fn accepts_print_of_various_values() {
     ok(
-        "@fieldwise_init\nstruct P(Writable):\n    var x: Int\n    def __str__(self) -> String:\n        return String(self.x)\n\nprint(1, \"a\", True, 3.5, None, P(5))\nprint()\n",
+        "@fieldwise_init\nstruct P(Writable):\n    var x: Int\n    def write_to(self, mut writer: Some[Writer]):\n        writer.write(self.x)\n\nprint(1, \"a\", True, 3.5, None, P(5))\nprint()\n",
     );
 }
 
@@ -1655,6 +1874,44 @@ fn tuple_element_coercion_materializes_literals() {
 }
 
 #[test]
+fn accepts_tuple_constructors_and_structural_operations() {
+    ok("var inferred = Tuple(1, \"one\")\nvar typed = Tuple[Float64, String](2, \"two\")\n");
+    ok(
+        "var pair = 1, \"one\"\nvar n: Int = len(pair)\nvar has: Bool = 1 in pair\nvar lacks: Bool = 9 not in pair\n",
+    );
+    ok(
+        "var a = Tuple(1, 2)\nvar b = Tuple(1, 3)\nvar eq: Bool = a == b\nvar lt: Bool = a < b\nvar ge: Bool = b >= a\n",
+    );
+    ok(
+        "var pair = Tuple(1, \"one\")\nvar reversed: Tuple[String, Int] = pair.reverse()\nvar joined: Tuple[Int, String, Bool] = pair.concat(Tuple(True))\n",
+    );
+}
+
+#[test]
+fn tuple_comparison_requires_the_same_tuple_self_type() {
+    assert!(matches!(
+        err("var result = Tuple(1) == Tuple(1, 2)\n"),
+        TypeError::BadOperator { .. }
+    ));
+    assert!(matches!(
+        err("var result = Tuple[Int](1) < Tuple[UInt](1)\n"),
+        TypeError::BadOperator { .. }
+    ));
+}
+
+#[test]
+fn rejects_bad_typed_tuple_construction() {
+    assert!(matches!(
+        err("var t = Tuple[Int, String](1)\n"),
+        TypeError::ArityMismatch { .. }
+    ));
+    assert!(matches!(
+        err("var t = Tuple[Int](\"wrong\")\n"),
+        TypeError::TypeMismatch { .. }
+    ));
+}
+
+#[test]
 fn rejects_tuple_wrong_element_type() {
     let e = err("var t: Tuple[Int, Int] = (1, True)\n");
     assert!(matches!(e, TypeError::TypeMismatch { .. }), "got {:?}", e);
@@ -1708,6 +1965,91 @@ fn kwargs_collect_unknown_keywords_and_check_values() {
     assert!(matches!(
         err("def f(x: Int, **opts: Int):\n    pass\n\nf(x=1, x=2)\n"),
         TypeError::BadCall { .. }
+    ));
+}
+
+#[test]
+fn transferred_string_dict_can_forward_keyword_arguments() {
+    ok(
+        "def target(prefix: Int, **options: Int):\n    pass\n\ndef relay(**options: Int):\n    target(prefix=7, **options^)\n\nrelay(left=20, right=22)\n",
+    );
+    assert!(matches!(
+        err(
+            "def target(**options: String):\n    pass\n\ndef relay(**options: Int):\n    target(**options^)\n"
+        ),
+        TypeError::TypeMismatch { .. }
+    ));
+}
+
+#[test]
+fn generic_and_method_kwargs_share_collection_and_forwarding_checks() {
+    ok(
+        "def generic_size[T: Copyable & Movable](**options: T) -> Int:\n    return 0\n\n@fieldwise_init\nstruct Counter:\n    var bias: Int\n    def size[T: Copyable & Movable](self, **options: T) -> Int:\n        return self.bias\n    def relay(self, **options: Int) -> Int:\n        return self.size(**options^)\n    @staticmethod\n    def static_size[T: Copyable & Movable](**options: T) -> Int:\n        return 0\n\ndef main():\n    var counter = Counter(10)\n    print(generic_size(first=1, second=2))\n    print(counter.size(left=\"a\", right=\"b\"))\n    print(counter.relay(one=1, two=2, three=3))\n    print(Counter.static_size(a=1, b=2, c=3, d=4))\n",
+    );
+    assert!(matches!(
+        err(
+            "def generic_size[T: Copyable & Movable](**options: T) -> Int:\n    return 0\n\nvar value = generic_size(first=1, second=\"wrong\")\n"
+        ),
+        TypeError::TypeMismatch { .. }
+    ));
+    assert!(matches!(
+        err(
+            "@fieldwise_init\nstruct Counter:\n    var bias: Int\n    def size(self, **options: String) -> Int:\n        return self.bias\n\nvar counter = Counter(0)\nvar value = counter.size(first=1)\n"
+        ),
+        TypeError::BadCall { .. } | TypeError::TypeMismatch { .. }
+    ));
+    assert!(matches!(
+        err(
+            "@fieldwise_init\nstruct Counter:\n    var bias: Int\n    def size(self, **options: Int) -> Int:\n        return self.bias\n\nvar counter = Counter(0)\nvar value = counter.size(first=1, first=2)\n"
+        ),
+        TypeError::BadCall { .. }
+    ));
+    assert!(matches!(
+        err(
+            "@fieldwise_init\nstruct Counter:\n    var bias: Int\n    def fail(self, **options: Int) raises -> Int:\n        raise \"failed\"\n\ndef call(counter: Counter) -> Int:\n    return counter.fail(code=1)\n"
+        ),
+        TypeError::UnhandledRaise(_)
+    ));
+    let ownership_error = err(
+        "struct Token:\n    var value: Int\n    def __init__(out self, value: Int):\n        self.value = value\n    def __moveinit__(out self, deinit other: Self):\n        self.value = other.value\n\n@fieldwise_init\nstruct Collector:\n    var marker: Int\n    def take(self, **options: Token):\n        pass\n\nvar collector = Collector(0)\nvar token = Token(1)\ncollector.take(item=token)\n",
+    );
+    assert!(
+        matches!(
+            ownership_error,
+            TypeError::NonCopyable { .. }
+                | TypeError::BadCall { .. }
+                | TypeError::TraitNotSatisfied { .. }
+        ),
+        "got {ownership_error:?}"
+    );
+    let storage_error = err(
+        "struct Token:\n    var value: Int\n    def __init__(out self, value: Int):\n        self.value = value\n    def __moveinit__(out self, deinit other: Self):\n        self.value = other.value\n\n@fieldwise_init\nstruct Collector:\n    var marker: Int\n    def take(self, **options: Token):\n        pass\n",
+    );
+    assert!(
+        matches!(
+            &storage_error,
+            TypeError::TraitNotSatisfied { trait_name, .. } if trait_name == "Copyable"
+        ),
+        "got {storage_error:?}"
+    );
+}
+
+#[test]
+fn bounded_trait_methods_share_generic_keyword_collection_and_effect_checks() {
+    ok(
+        "trait Collects:\n    def count[Element: Copyable & Movable](self, **options: Element) -> Int: ...\n\ndef direct[Target: Collects](target: Target) -> Int:\n    return target.count(first=1, second=2)\n\ndef relay[Target: Collects](target: Target, **options: Int) -> Int:\n    return target.count(**options^)\n",
+    );
+    assert!(matches!(
+        err(
+            "trait Collects:\n    def count[Element: Copyable & Movable](self, **options: Element) -> Int: ...\n\ndef bad[Target: Collects](target: Target) -> Int:\n    return target.count(first=1, second=\"wrong\")\n"
+        ),
+        TypeError::BadCall { .. } | TypeError::TypeMismatch { .. }
+    ));
+    assert!(matches!(
+        err(
+            "trait FallibleCollector:\n    def collect(self, **options: Int) raises -> Int: ...\n\ndef call[Target: FallibleCollector](target: Target) -> Int:\n    return target.collect(code=1)\n"
+        ),
+        TypeError::UnhandledRaise(_)
     ));
 }
 
@@ -1771,11 +2113,135 @@ fn accepts_a_heterogeneous_variadic_type_pack() {
 }
 
 #[test]
+fn accepts_string_compile_time_value_parameters() {
+    ok(
+        "@fieldwise_init\nstruct Named[label: String]:\n    var value: Int\n\nvar item: Named[\"answer\"] = Named[\"answer\"](42)\n",
+    );
+}
+
+#[test]
+fn applies_defaulted_compile_time_value_parameters() {
+    ok(
+        "@fieldwise_init\nstruct Buffer[size: Int = 4]:\n    var value: Int\n\nvar inferred: Buffer = Buffer(1)\nvar explicit: Buffer[8] = Buffer[8](2)\n",
+    );
+}
+
+#[test]
+fn binds_named_and_defaulted_compile_time_parameters() {
+    ok(
+        "@fieldwise_init\nstruct Matrix[rows: Int = 2, columns: Int = 3]:\n    var value: Int\n\nvar a: Matrix[columns=4, rows=1] = Matrix[columns=4, rows=1](7)\nvar b: Matrix = Matrix(8)\n",
+    );
+}
+
+#[test]
+fn evaluates_defaults_that_depend_on_earlier_parameters() {
+    ok(
+        "@fieldwise_init\nstruct Matrix[rows: Int, columns: Int = rows + 1]:\n    var value: Int\n\nvar matrix: Matrix[3] = Matrix[3](7)\n",
+    );
+}
+
+#[test]
+fn applies_defaulted_type_parameters() {
+    ok(
+        "@fieldwise_init\nstruct Box[T: Copyable = Int]:\n    var value: Self.T\n\nvar box: Box = Box(7)\n",
+    );
+}
+
+#[test]
+fn supports_parameterized_aggregate_compile_time_values() {
+    ok(
+        "@fieldwise_init\nstruct Selection[indices: List[Int]]:\n    var value: Int\n\nvar selected: Selection[[0, 2, 4]] = Selection[[0, 2, 4]](9)\n",
+    );
+}
+
+#[test]
+fn rejects_explicit_infer_only_compile_time_parameters() {
+    let error = err(
+        "def identity[T: Copyable, // U: AnyType](value: T) -> T:\n    return value\n\nvar value: Int = identity[Int, Int](1)\n",
+    );
+    assert!(
+        matches!(&error, TypeError::Unsupported(message) if message.contains("infer-only")),
+        "got {error:?}"
+    );
+}
+
+#[test]
+fn infers_generic_static_and_instance_method_parameters() {
+    ok(
+        "@fieldwise_init\nstruct Factory:\n    var marker: Int\n    @staticmethod\n    def make[T: Copyable](value: T) -> T:\n        return value\n    def echo[T: Copyable](self, value: T) -> T:\n        return value\n\nvar factory = Factory(0)\nvar a: Int = Factory.make(1)\nvar b: String = factory.echo(\"ok\")\n",
+    );
+}
+
+#[test]
+fn checks_generic_trait_method_signatures_in_their_parameter_scope() {
+    ok(
+        "trait Echoer:\n    def echo[T: Copyable](self, value: T) -> T:\n        ...\n\n@fieldwise_init\nstruct Echo(Echoer):\n    var marker: Int\n    def echo[T: Copyable](self, value: T) -> T:\n        return value\n\nvar echo = Echo(0)\nvar answer: Int = echo.echo(42)\n",
+    );
+}
+
+#[test]
+fn enforces_trailing_where_constraints_and_type_equality() {
+    ok(
+        "def positive[n: Int]() -> Int where n > 0:\n    return n\n\ndef comparable[T: AnyType](value: T) -> Int where conforms_to(T, Comparable) and T == Int:\n    return 1\n\nvar a = positive[2]()\nvar b = comparable(3)\n",
+    );
+    assert!(matches!(
+        err("def positive[n: Int]() -> Int where n > 0:\n    return n\n\nvar a = positive[0]()\n"),
+        TypeError::BadCall { .. }
+    ));
+    assert!(matches!(
+        err(
+            "def comparable[T: AnyType](value: T) -> Int where conforms_to(T, Comparable):\n    return 1\n\nvar a = comparable(\"no\")\n"
+        ),
+        TypeError::BadCall { .. }
+    ));
+}
+
+#[test]
+fn gates_methods_with_parent_parameter_where_constraints() {
+    ok(
+        "@fieldwise_init\nstruct Wrapper[T: Copyable]:\n    var value: Self.T\n    def compare(self, other: Self.T) -> Bool where conforms_to(Self.T, Comparable):\n        return True\n\nvar wrapped = Wrapper[Int](1)\nvar same = wrapped.compare(1)\n",
+    );
+    assert!(matches!(
+        err(
+            "@fieldwise_init\nstruct Wrapper[T: Copyable]:\n    var value: Self.T\n    def compare(self, other: Self.T) -> Bool where conforms_to(Self.T, Comparable):\n        return False\n\nvar wrapped = Wrapper[String](\"x\")\nvar same = wrapped.compare(\"x\")\n"
+        ),
+        TypeError::NoSuchMethod { .. } | TypeError::BadCall { .. }
+    ));
+}
+
+#[test]
+fn applies_implicit_conversion_to_a_specialized_generic_target() {
+    ok(
+        "struct Box[T: AnyType]:\n    var value: Self.T\n    @implicit\n    def __init__(out self, value: Self.T):\n        self.value = value\n\ndef take(value: Box[Int]) -> Int:\n    return value.value\n\nvar answer: Int = take(42)\n",
+    );
+}
+
+#[test]
 fn checks_each_heterogeneous_pack_element_against_its_bound() {
     let error = err(
         "def count[*ArgTypes: Intable](*args: *ArgTypes) -> Int:\n    return len(args)\n\ndef main():\n    var n: Int = count(1, \"two\")\n",
     );
     assert!(matches!(error, TypeError::TraitNotSatisfied { .. }));
+}
+
+#[test]
+fn nightly_pack_conformance_checks_every_type_value() {
+    ok(
+        "def count[*Ts: AnyType](*args: *Ts) -> Int where conforms_to(Ts.values, Writable):\n    return len(args)\n\ndef main():\n    var n = count(1, \"two\", True)\n",
+    );
+    assert!(matches!(
+        err(
+            "@fieldwise_init\nstruct Opaque:\n    var n: Int\n\ndef count[*Ts: AnyType](*args: *Ts) -> Int where conforms_to(Ts.values, Writable):\n    return len(args)\n\ndef main():\n    var n = count(Opaque(1))\n"
+        ),
+        TypeError::BadCall { .. }
+    ));
+}
+
+#[test]
+fn int_is_scalar_dtype_int_and_simdsize_drives_width_values() {
+    ok(
+        "def width_value[width: SIMDSize]() -> Int where width > 0:\n    return width\n\ndef main():\n    var scalar: Scalar[DType.int] = 41\n    var same: Int = Scalar[DType.int](scalar + 1)\n    var vector: SIMD[DType.int, 4] = SIMD[DType.int, _](1, 2, 3, 4)\n    var width = width_value[4]()\n",
+    );
 }
 
 #[test]
@@ -1887,13 +2353,10 @@ fn plain_signatures_are_unaffected() {
 // --- Expression syntax parsed but semantics deferred (syntax-first phase) ---
 
 #[test]
-fn flags_deferred_expression_syntax_as_unsupported() {
-    // t-strings and the walrus `:=` still parse but defer their semantics.
-    assert!(matches!(
-        err("var s: String = t\"x{1}\"\n"),
-        TypeError::Unsupported(_)
-    ));
-    // Ternary, chained comparison, and slices are now implemented (were deferred).
+fn expression_surface_type_checks() {
+    ok("var s: String = t\"x{1}\"\n");
+    ok("var one: Int = (n := 1)\nprint(n)\n");
+    // Ternary, chained comparison, and slices are implemented too.
     ok("var m: Int = 1 if True else 2\nprint(m)\n");
     ok("var t: Bool = 0 < 1 < 2\nprint(t)\n");
     ok("var xs: List[Int] = [1, 2, 3]\nvar ys: List[Int] = xs[0:2]\nprint(ys)\n");
@@ -2033,17 +2496,20 @@ fn contextually_instantiates_a_generic_callable_value() {
 }
 
 #[test]
-fn accepts_numeric_bases_and_string_forms_but_flags_tstrings() {
+fn contextually_selects_an_overloaded_callable_value() {
+    ok(
+        "def choose(value: Int) -> Int:\n    return value + 1\n\ndef choose(value: String) -> Int:\n    return len(value)\n\ndef main():\n    var callback: def(Int) -> Int = choose\n    var result: Int = callback(41)\n",
+    );
+}
+
+#[test]
+fn accepts_numeric_bases_and_string_forms_and_tstrings() {
     // Based integers, digit separators, and single/triple-quoted strings are fully
     // supported (they are ordinary Int/String values).
     ok(
         "var a: Int = 0xFF\nvar b: Int = 1_000_000\nvar c: String = 'single'\nvar d: String = \"\"\"triple\"\"\"\n",
     );
-    // A t-string parses but its semantics are deferred.
-    assert!(matches!(
-        err("var s: String = t\"x={y}\"\n"),
-        TypeError::Unsupported(_)
-    ));
+    ok("var y: Int = 1\nvar s: String = t\"x={y}\"\n");
 }
 
 #[test]
@@ -2055,6 +2521,33 @@ fn owned_self_and_owned_params_are_accepted() {
         check_source("@fieldwise_init\nstruct R:\n    var x: Int\n    def __del__(deinit self):\n        print(self.x)\n").is_ok()
     );
     assert!(check_source("def f(var a: Int, read b: Int) -> Int:\n    return a + b\n").is_ok());
+}
+
+#[test]
+fn nightly_implicit_deletion_controls_linearity_independently_of_the_decorator() {
+    // The decorator only customizes a diagnostic. Without an explicit false
+    // conformance, the ordinary ASAP destruction path remains available.
+    ok(
+        "@explicit_destroy(\"unused diagnostic\")\n@fieldwise_init\nstruct Ordinary:\n    var id: Int\n\ndef main():\n    var value = Ordinary(1)\n",
+    );
+
+    let error = err(
+        "struct Linear(ImplicitlyDeletable where False):\n    def __init__(out self):\n        pass\n    def close(deinit self):\n        pass\n\ndef main():\n    var value = Linear()\n",
+    );
+    assert!(matches!(
+        error,
+        TypeError::ExplicitDestroy { message, .. }
+            if message.contains("not implicitly deletable")
+    ));
+}
+
+#[test]
+fn explicit_destroy_requires_a_diagnostic_message() {
+    assert!(matches!(
+        err("@explicit_destroy\nstruct Resource:\n    pass\n"),
+        TypeError::Unsupported(message)
+            if message.contains("requires exactly one positional string message")
+    ));
 }
 
 #[test]
@@ -2116,6 +2609,64 @@ fn checks_reference_returns_substitution_and_escapes() {
         "def pair[origin: Origin[mut=False]](ref[origin] left: Int, ref[origin] right: Int):\n    print(left + right)\n\ndef main():\n    var value = 1\n    pair(value, value)\n"
     )
     .is_ok());
+}
+
+#[test]
+fn checks_reference_aggregate_permissions_initialization_and_escape() {
+    let mutable_box = "@fieldwise_init\nstruct RefBox[origin: Origin[mut=True]]:\n    var value: ref[origin] Int\n\n";
+    let immutable_box = "@fieldwise_init\nstruct RefBox[origin: Origin[mut=False]]:\n    var value: ref[origin] Int\n\n";
+
+    assert!(matches!(
+        check_source(&format!(
+            "{immutable_box}def main():\n    var value = 1\n    ref alias = value\n    var box = RefBox(alias)\n    box.value += 1\n"
+        )),
+        Err(TypeError::ImmutableBinding(_))
+    ));
+    assert!(matches!(
+        check_source(&format!(
+            "{mutable_box}def make() -> RefBox:\n    var value = 1\n    ref alias = value\n    return RefBox(alias)\n"
+        )),
+        Err(TypeError::ReturnsReferenceToLocal)
+    ));
+    assert!(check_source(
+        "struct RefBox[origin: Origin[mut=True]]:\n    var value: ref[origin] Int\n    def __init__(out self, ref[origin] value: Int):\n        self.value = value\n"
+    )
+    .is_ok());
+    assert!(check_source("struct Seen:\n    var value: ref[UntrackedOrigin] Int\n").is_ok());
+    assert!(matches!(
+        check_source("struct Hidden:\n    var value: ref[UnsafeAnyOrigin] Int\n"),
+        Err(TypeError::Unsupported(message)) if message.contains("UnsafeAnyOrigin")
+    ));
+    assert!(check_source(
+        "@fieldwise_init\nstruct RefTuple[origin: Origin[mut=True]]:\n    var values: Tuple[ref[origin] Int, ref[origin] Int]\n\ndef main():\n    var left = 1\n    var right = 2\n    ref a = left\n    ref b = right\n    var pair = RefTuple((a, b))\n    print(pair.values[0], pair.values[1])\n"
+    )
+    .is_ok());
+    assert!(check_source(
+        "@fieldwise_init\nstruct RefList[origin: Origin[mut=True]]:\n    var values: List[ref[origin] Int]\n\ndef main():\n    var left = 1\n    var right = 2\n    ref a = left\n    ref b = right\n    var pair = RefList([a, b])\n    pair.values[1] += 1\n    print(right)\n"
+    )
+    .is_ok());
+}
+
+#[test]
+fn checks_current_pointer_origin_aggregate_fields() {
+    assert!(
+        check_source(
+            "struct Holder[origin: Origin]:\n    var ptr: UnsafePointer[Int, Self.origin]\n"
+        )
+        .is_ok()
+    );
+    assert!(check_source(
+        "struct MutableExternal:\n    var ptr: UnsafePointer[Int, MutUntrackedOrigin]\n\nstruct ImmutableExternal:\n    var ptr: UnsafePointer[Int, ImmutUntrackedOrigin]\n\nstruct StaticView:\n    var ptr: UnsafePointer[Int, StaticConstantOrigin]\n"
+    )
+    .is_ok());
+    for origin in ["MutUnsafeAnyOrigin", "ImmutUnsafeAnyOrigin"] {
+        let source = format!("struct Hidden:\n    var ptr: UnsafePointer[Int, {origin}]\n");
+        assert!(matches!(
+            check_source(&source),
+            Err(TypeError::Unsupported(message))
+                if message.contains("cannot hide") && message.contains(origin)
+        ));
+    }
 }
 
 #[test]
@@ -2291,7 +2842,7 @@ fn borrow_check_is_place_sensitive() {
 
 // --- Operator overloading (dunder dispatch) ---
 
-const VEC2: &str = "@fieldwise_init\nstruct Vec2:\n    var x: Int\n    def __add__(self, o: Vec2) -> Vec2:\n        return Vec2(self.x + o.x)\n    def __eq__(self, o: Vec2) -> Bool:\n        return self.x == o.x\n    def __getitem__(self, i: Int) -> Int:\n        return self.x\n    def __len__(self) -> Int:\n        return 1\n    def __str__(self) -> String:\n        return String(self.x)\n    def __contains__(self, v: Int) -> Bool:\n        return self.x == v\n\n";
+const VEC2: &str = "@fieldwise_init\nstruct Vec2(Writable):\n    var x: Int\n    def __add__(self, o: Vec2) -> Vec2:\n        return Vec2(self.x + o.x)\n    def __eq__(self, o: Vec2) -> Bool:\n        return self.x == o.x\n    def __getitem__(self, i: Int) -> Int:\n        return self.x\n    def __len__(self) -> Int:\n        return 1\n    def write_to(self, mut writer: Some[Writer]):\n        writer.write(self.x)\n    def __contains__(self, v: Int) -> Bool:\n        return self.x == v\n\n";
 
 #[test]
 fn dunder_dispatch_type_checks_operators_and_builtins() {
@@ -2342,6 +2893,19 @@ fn setitem_dunder_typing_and_errors() {
     ok(
         "@fieldwise_init\nstruct P:\n    var a: Int\n    def __setitem__(mut self, i: Int, v: Int):\n        self.a = v\n\ndef main():\n    var p: P = P(1)\n    p[0] = 9\n",
     );
+
+    // Slice and mixed-dimensional assignment use the same checked contract.
+    ok(
+        "@fieldwise_init\nstruct Grid:\n    var a: Int\n    def __setitem__(mut self, row: Int, columns: Slice, value: Int):\n        self.a = value\n\ndef main():\n    var grid = Grid(0)\n    grid[3, 1:8:2] = 9\n",
+    );
+    let e = err(
+        "@fieldwise_init\nstruct Grid:\n    var a: Int\n    def __setitem__(mut self, row: Int, columns: Slice, value: Int):\n        self.a = value\n\ndef main():\n    var grid = Grid(0)\n    grid[3, 1:8:2] = \"wrong\"\n",
+    );
+    assert!(matches!(e, TypeError::TypeMismatch { .. }), "got {e:?}");
+    let e = err(
+        "@fieldwise_init\nstruct Grid:\n    var a: Int\n    def __setitem__(self, row: Int, columns: Slice, value: Int):\n        pass\n\ndef main():\n    var grid = Grid(0)\n    grid[3, 1:8:2] = 9\n",
+    );
+    assert!(matches!(e, TypeError::TypeMismatch { .. }), "got {e:?}");
 }
 
 #[test]

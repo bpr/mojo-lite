@@ -42,6 +42,16 @@ pub(super) fn unify(
             }
             Ok(())
         }
+        Ty::Variant(pattern_alternatives) => {
+            if let Ty::Variant(actual_alternatives) = actual
+                && pattern_alternatives.len() == actual_alternatives.len()
+            {
+                for (pattern, actual) in pattern_alternatives.iter().zip(actual_alternatives) {
+                    unify(pattern, actual, subst)?;
+                }
+            }
+            Ok(())
+        }
         Ty::Func {
             params: pattern_params,
             ret: pattern_ret,
@@ -82,8 +92,22 @@ pub(super) fn substitute(ty: &Ty, subst: &HashMap<String, Ty>) -> Ty {
             Ty::Struct(name.clone(), map_tyargs(args, |t| substitute(t, subst)))
         }
         Ty::List(elem) => Ty::List(Box::new(substitute(elem, subst))),
+        Ty::Set(elem) => Ty::Set(Box::new(substitute(elem, subst))),
+        Ty::Dict(key, value) => Ty::Dict(
+            Box::new(substitute(key, subst)),
+            Box::new(substitute(value, subst)),
+        ),
         Ty::Tuple(elems) => Ty::Tuple(elems.iter().map(|t| substitute(t, subst)).collect()),
-        Ty::Pointer(elem) => Ty::Pointer(Box::new(substitute(elem, subst))),
+        Ty::Variant(alternatives) => Ty::Variant(
+            alternatives
+                .iter()
+                .map(|ty| substitute(ty, subst))
+                .collect(),
+        ),
+        Ty::Pointer { element, origin } => Ty::Pointer {
+            element: Box::new(substitute(element, subst)),
+            origin: origin.clone(),
+        },
         Ty::Assoc { base, name } => Ty::Assoc {
             base: Box::new(substitute(base, subst)),
             name: name.clone(),
@@ -94,6 +118,7 @@ pub(super) fn substitute(ty: &Ty, subst: &HashMap<String, Ty>) -> Ty {
             ret,
             required,
             variadic,
+            kw_variadic,
             positional_only,
             keyword_only,
             raises,
@@ -107,6 +132,9 @@ pub(super) fn substitute(ty: &Ty, subst: &HashMap<String, Ty>) -> Ty {
             ret: Box::new(substitute(ret, subst)),
             required: required.clone(),
             variadic: variadic.as_ref().map(|v| Box::new(substitute(v, subst))),
+            kw_variadic: kw_variadic
+                .as_ref()
+                .map(|v| Box::new(substitute(v, subst))),
             positional_only: *positional_only,
             keyword_only: *keyword_only,
             raises: *raises,
@@ -137,13 +165,27 @@ pub(super) fn substitute_self(ty: &Ty, replacement: &Ty) -> Ty {
             map_tyargs(args, |t| substitute_self(t, replacement)),
         ),
         Ty::List(elem) => Ty::List(Box::new(substitute_self(elem, replacement))),
+        Ty::Set(elem) => Ty::Set(Box::new(substitute_self(elem, replacement))),
+        Ty::Dict(key, value) => Ty::Dict(
+            Box::new(substitute_self(key, replacement)),
+            Box::new(substitute_self(value, replacement)),
+        ),
         Ty::Tuple(elems) => Ty::Tuple(
             elems
                 .iter()
                 .map(|t| substitute_self(t, replacement))
                 .collect(),
         ),
-        Ty::Pointer(elem) => Ty::Pointer(Box::new(substitute_self(elem, replacement))),
+        Ty::Variant(alternatives) => Ty::Variant(
+            alternatives
+                .iter()
+                .map(|ty| substitute_self(ty, replacement))
+                .collect(),
+        ),
+        Ty::Pointer { element, origin } => Ty::Pointer {
+            element: Box::new(substitute_self(element, replacement)),
+            origin: origin.clone(),
+        },
         Ty::Assoc { base, name } => Ty::Assoc {
             base: Box::new(substitute_self(base, replacement)),
             name: name.clone(),
@@ -154,6 +196,7 @@ pub(super) fn substitute_self(ty: &Ty, replacement: &Ty) -> Ty {
             ret,
             required,
             variadic,
+            kw_variadic,
             positional_only,
             keyword_only,
             raises,
@@ -170,6 +213,9 @@ pub(super) fn substitute_self(ty: &Ty, replacement: &Ty) -> Ty {
             ret: Box::new(substitute_self(ret, replacement)),
             required: required.clone(),
             variadic: variadic
+                .as_ref()
+                .map(|v| Box::new(substitute_self(v, replacement))),
+            kw_variadic: kw_variadic
                 .as_ref()
                 .map(|v| Box::new(substitute_self(v, replacement))),
             positional_only: *positional_only,

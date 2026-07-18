@@ -68,6 +68,54 @@ fn boolean_and_comparison() {
 }
 
 #[test]
+fn collection_displays_and_comprehensions_execute_in_source_order() {
+    let output = vm(include_str!(
+        "../conformance/fixtures/collection_comprehensions.mojo"
+    ));
+    assert_eq!(
+        output,
+        "3 True False\n2 9 True\n0\n[0, 4, 16]\n[0, 1, 2, 10, 11, 12]\n{0, 1, 2}\n{0: 0, 1: 1, 2: 4, 3: 9}\n"
+    );
+}
+
+#[test]
+fn comprehension_binders_do_not_overwrite_outer_or_shadowed_bindings() {
+    assert_eq!(
+        vm("def main():\n    var x = 100\n    var values = [x for x in range(3)]\n    var nested = [x for x in range(2) for x in range(x + 1)]\n    print(x, values)\n    print(nested)\n"),
+        "100 [0, 1, 2]\n[0, 0, 1]\n"
+    );
+}
+
+#[test]
+fn collection_displays_materialize_contextual_element_types() {
+    assert_eq!(
+        vm("def empty() -> Set[Float64]:\n    return {}\n\ndef numbers() -> Set[Float64]:\n    return {1, 2}\n\ndef show(values: Set[Float64]):\n    print(values)\n\ndef main():\n    show({})\n    show({1, 2})\n    print(empty())\n    print(numbers())\n"),
+        "{}\n{1.0, 2.0}\n{}\n{1.0, 2.0}\n"
+    );
+}
+
+#[test]
+fn discarded_set_elements_and_replaced_dictionary_values_are_destroyed() {
+    let output = vm("struct Token:\n    var id: Int\n    def __init__(out self, id: Int):\n        self.id = id\n    def __del__(deinit self):\n        print(\"drop\", self.id)\n    def __hash__(self) -> UInt:\n        return UInt(self.id)\n\ndef main():\n    var dictionary = {0: Token(1), 0: Token(2)}\n    print(\"built dict\")\n    var values = {Token(3), Token(3)}\n    print(\"built set\")\n");
+    assert_eq!(
+        output,
+        "drop 1\nbuilt dict\ndrop 3\nbuilt set\ndrop 3\ndrop 2\n"
+    );
+}
+
+#[test]
+fn owned_iteration_moves_elements_and_drops_the_residual_on_break() {
+    let output = vm(include_str!("../conformance/fixtures/owned_iteration.mojo"));
+    assert!(output.contains("take 1\n"));
+    assert!(output.contains("take 2\n"));
+    assert!(!output.contains("take 3\n"));
+    assert!(output.contains("drop 1\n"));
+    assert!(output.contains("drop 2\n"));
+    assert!(output.contains("drop 3\n"));
+    assert!(output.ends_with("done\n"));
+}
+
+#[test]
 fn string_concat_and_builtins() {
     assert_eq!(
         parity("var s: String = \"ab\" + \"cd\"\nprint(s)\nprint(len(s))\nprint(String(42))\n"),
@@ -392,22 +440,36 @@ fn value_parameterized_generics_parity() {
 fn nested_def_closures_parity() {
     // Nested `def`s cover a
     // read-capture, a write-capture (reference semantics), and self-recursion.
-    let read = "def adder(n: Int) -> Int:\n    def add_n(x: Int) -> Int:\n        return x + n\n    return add_n(100)\n\ndef main():\n    print(adder(42))\n";
+    let read = "def adder(n: Int) -> Int:\n    def add_n(x: Int) unified {n} -> Int:\n        return x + n\n    return add_n(100)\n\ndef main():\n    print(adder(42))\n";
     assert_eq!(parity(read), "142\n");
-    let write = "def counter() -> Int:\n    var total: Int = 0\n    def add(x: Int):\n        total = total + x\n    add(5)\n    add(3)\n    return total\n\ndef main():\n    print(counter())\n";
+    let write = "def counter() -> Int:\n    var total: Int = 0\n    def add(x: Int) unified {mut total}:\n        total = total + x\n    add(5)\n    add(3)\n    return total\n\ndef main():\n    print(counter())\n";
     assert_eq!(parity(write), "8\n");
-    let rec = "def factorial(base: Int) -> Int:\n    def fact(n: Int) -> Int:\n        if n <= 1:\n            return base\n        return n * fact(n - 1)\n    return fact(5)\n\ndef main():\n    print(factorial(1))\n";
+    let rec = "def factorial(base: Int) -> Int:\n    def fact(n: Int) unified {base} -> Int:\n        if n <= 1:\n            return base\n        return n * fact(n - 1)\n    return fact(5)\n\ndef main():\n    print(factorial(1))\n";
     assert_eq!(parity(rec), "120\n");
 }
 
 #[test]
-fn nested_def_calling_sibling_is_refused_cleanly() {
-    // A nested `def` that calls a sibling is refused cleanly because lowering
-    // cannot forward the sibling's captures — never
-    // a divergence.
-    let src = "def outer() -> Int:\n    var b: Int = 10\n    def helper(x: Int) -> Int:\n        return x + b\n    def caller(y: Int) -> Int:\n        return helper(y) + 1\n    return caller(5)\n\ndef main():\n    print(outer())\n";
-    assert!(checks_ok(src), "the program is statically valid");
-    assert!(run(src).is_err());
+fn nested_def_calling_sibling_forwards_its_closure_environment() {
+    let src = "def outer() -> Int:\n    var b: Int = 10\n    def helper(x: Int) unified {b} -> Int:\n        return x + b\n    def caller(y: Int) unified {helper} -> Int:\n        return helper(y) + 1\n    return caller(5)\n\ndef main():\n    print(outer())\n";
+    assert_eq!(parity(src), "16\n");
+}
+
+#[test]
+fn generic_nested_def_is_type_erased_after_checker_inference() {
+    let src = "def outer() -> Int:\n    def identity[T: Copyable & Movable](value: T) unified {} -> T:\n        return value\n    return identity(42)\n\ndef main():\n    print(outer())\n";
+    assert_eq!(parity(src), "42\n");
+}
+
+#[test]
+fn nominal_callable_struct_requires_and_executes_call_contract() {
+    let src = "@fieldwise_init\nstruct Scale(def(Int) -> Int):\n    var factor: Int\n    def __call__(self, value: Int) -> Int:\n        return value * self.factor\n\ndef apply(callback: def(Int) -> Int, value: Int) -> Int:\n    return callback(value)\n\ndef main():\n    var scale = Scale(3)\n    print(apply(scale, 14))\n";
+    assert_eq!(parity(src), "42\n");
+}
+
+#[test]
+fn overloaded_callable_values_execute_contextual_targets() {
+    let src = include_str!("../conformance/fixtures/overloaded_callable_values.mojo");
+    assert_eq!(parity(src), "42\ncaught\n");
 }
 
 #[test]
@@ -426,14 +488,14 @@ fn overload_symbols_fold_comptime_value_arguments() {
 fn dunder_operator_and_builtin_dispatch() {
     // Operators + `len`/`String`/subscript/`in` on a user struct dispatch to its
     // dunder methods (operator overloading), running on the VM.
-    let src = "@fieldwise_init\nstruct Vec2:\n    var x: Int\n    var y: Int\n    def __add__(self, o: Vec2) -> Vec2:\n        return Vec2(self.x + o.x, self.y + o.y)\n    def __eq__(self, o: Vec2) -> Bool:\n        return self.x == o.x and self.y == o.y\n    def __str__(self) -> String:\n        return \"V(\" + String(self.x) + \",\" + String(self.y) + \")\"\n    def __len__(self) -> Int:\n        return 2\n    def __getitem__(self, i: Int) -> Int:\n        if i == 0:\n            return self.x\n        return self.y\n    def __contains__(self, v: Int) -> Bool:\n        return self.x == v or self.y == v\n\ndef main():\n    var a: Vec2 = Vec2(1, 2)\n    print(String(a + Vec2(3, 4)))\n    print(a == Vec2(1, 2))\n    print(len(a), a[0], a[1])\n    print(2 in a, 9 not in a)\n";
+    let src = "@fieldwise_init\nstruct Vec2(Writable):\n    var x: Int\n    var y: Int\n    def __add__(self, o: Vec2) -> Vec2:\n        return Vec2(self.x + o.x, self.y + o.y)\n    def __eq__(self, o: Vec2) -> Bool:\n        return self.x == o.x and self.y == o.y\n    def write_to(self, mut writer: Some[Writer]):\n        writer.write(\"V(\", self.x, \",\", self.y, \")\")\n    def __len__(self) -> Int:\n        return 2\n    def __getitem__(self, i: Int) -> Int:\n        if i == 0:\n            return self.x\n        return self.y\n    def __contains__(self, v: Int) -> Bool:\n        return self.x == v or self.y == v\n\ndef main():\n    var a: Vec2 = Vec2(1, 2)\n    print(String(a + Vec2(3, 4)))\n    print(a == Vec2(1, 2))\n    print(len(a), a[0], a[1])\n    print(2 in a, 9 not in a)\n";
     assert_eq!(parity(src), "V(4,6)\nTrue\n2 1 2\nTrue True\n");
 }
 
 #[test]
 fn dunder_augmented_assignment_uses_add() {
     // `c += d` expands to `c = c + d`, which dispatches to `__add__`.
-    let src = "@fieldwise_init\nstruct Acc:\n    var n: Int\n    def __add__(self, o: Acc) -> Acc:\n        return Acc(self.n + o.n)\n    def __str__(self) -> String:\n        return String(self.n)\n\ndef main():\n    var c: Acc = Acc(1)\n    c += Acc(10)\n    c += Acc(100)\n    print(String(c))\n";
+    let src = "@fieldwise_init\nstruct Acc(Writable):\n    var n: Int\n    def __add__(self, o: Acc) -> Acc:\n        return Acc(self.n + o.n)\n    def write_to(self, mut writer: Some[Writer]):\n        writer.write(self.n)\n\ndef main():\n    var c: Acc = Acc(1)\n    c += Acc(10)\n    c += Acc(100)\n    print(String(c))\n";
     assert_eq!(parity(src), "111\n");
 }
 
@@ -510,6 +572,15 @@ fn tuple_unpacking_runs() {
 }
 
 #[test]
+fn current_tuple_core_runs() {
+    let src = "def main():\n    var bare = 4, \"four\"\n    var left, right = bare\n    print(bare)\n    print(left, right)\n    print(Tuple())\n    print(Tuple(7))\n    print(Tuple[Float64, String](2, \"two\"))\n    print(Tuple[Float64](2)[0])\n    print(len(bare), 4 in bare, 9 not in bare)\n    print(Tuple(1, 2) == Tuple(1, 2))\n    print(Tuple(1, 2) != Tuple(1, 3))\n    print(Tuple(1, 2) < Tuple(1, 3), Tuple(2, 0) >= Tuple(1, 9))\n    print(bare.reverse())\n    print(bare.concat(Tuple(True)))\n";
+    assert_eq!(
+        parity(src),
+        "(4, four)\n4 four\n()\n(7,)\n(2.0, two)\n2.0\n2 True True\nTrue\nTrue\nTrue True\n(four, 4)\n(4, four, True)\n"
+    );
+}
+
+#[test]
 fn slice_subscript_runs() {
     // List + String slicing with optional bounds, steps, negative indices, reversal.
     let src = "def main():\n    var xs: List[Int] = [0, 1, 2, 3, 4, 5]\n    print(xs[1:4])\n    print(xs[::2])\n    print(xs[::-1])\n    print(xs[-2:])\n    var s: String = \"hello\"\n    print(s[1:4])\n    print(s[::-1])\n";
@@ -517,4 +588,74 @@ fn slice_subscript_runs() {
         parity(src),
         "[1, 2, 3]\n[0, 2, 4]\n[5, 4, 3, 2, 1, 0]\n[4, 5]\nell\nolleh\n"
     );
+}
+
+#[test]
+fn reference_valued_aggregate_preserves_and_writes_through_handle() {
+    let src = "@fieldwise_init\nstruct RefBox[origin: Origin[mut=True]]:\n    var value: ref[origin] Int\n\ndef main():\n    var value = 40\n    ref alias = value\n    var box = RefBox(alias)\n    box.value += 2\n    print(value)\n";
+    assert_eq!(parity(src), "42\n");
+}
+
+#[test]
+fn handwritten_initializer_stores_reference_field_handle() {
+    let src = "struct RefBox[origin: Origin[mut=True]]:\n    var value: ref[origin] Int\n    def __init__(out self, ref[origin] value: Int):\n        self.value = value\n\ndef main():\n    var value = 40\n    var box = RefBox(value)\n    box.value += 2\n    print(value)\n";
+    assert_eq!(parity(src), "42\n");
+}
+
+#[test]
+fn nested_reference_aggregate_preserves_handles() {
+    // Mojito-only executable-ref-field proof; current Mojo uses origin-bearing
+    // pointer aggregates for stored provenance.
+    let tuple = "@fieldwise_init\nstruct RefTuple[origin: Origin[mut=True]]:\n    var values: Tuple[ref[origin] Int, ref[origin] Int]\n\ndef main():\n    var left = 4\n    var right = 8\n    ref a = left\n    ref b = right\n    var pair = RefTuple((a, b))\n    print(pair.values[0], pair.values[1])\n";
+    assert_eq!(vm(tuple), "4 8\n");
+
+    let list = "@fieldwise_init\nstruct RefList[origin: Origin[mut=True]]:\n    var values: List[ref[origin] Int]\n\ndef main():\n    var left = 4\n    var right = 8\n    ref a = left\n    ref b = right\n    var pair = RefList([a, b])\n    pair.values[1] += 2\n    print(left, right)\n";
+    assert_eq!(vm(list), "4 10\n");
+}
+
+#[test]
+fn variant_projection_is_a_tag_checked_place() {
+    let src = "struct Variant:\n    pass\n\ndef main():\n    var value = Variant[Int, String](7)\n    value[Int] += 5\n    print(value[Int])\n";
+    assert_eq!(vm(src), "12\n");
+
+    // Mojito's executable local-ref extension exercises the same place as a
+    // persistent frame/slot handle, rather than a cloned VariantGet payload.
+    let src = "struct Variant:\n    pass\n\ndef main():\n    var value = Variant[Int, String](7)\n    ref payload = value[Int]\n    payload += 5\n    print(value[Int])\n";
+    assert_eq!(vm(src), "12\n");
+}
+
+#[test]
+fn user_slice_dispatches_through_checked_getitem() {
+    let src = "@fieldwise_init\nstruct Window:\n    var size: Int\n\n    def __getitem__(self, part: Slice) -> Int:\n        var normalized = part.indices(self.size)\n        return normalized[0] + normalized[1] + normalized[2]\n\n@fieldwise_init\nstruct Grid:\n    def __getitem__(self, row: Int, columns: Slice) -> Int:\n        var normalized = columns.indices(10)\n        return row * 100 + normalized[0] + normalized[1] + normalized[2]\n\ndef main():\n    var window = Window(10)\n    print(window[:5])\n    print(window[::-1])\n    var grid = Grid()\n    print(grid[3, 1:8:2])\n";
+    assert_eq!(parity(src), "6\n7\n311\n");
+}
+
+#[test]
+fn slice_descriptor_overloads_are_selected_statically() {
+    let src = "@fieldwise_init\nstruct Probe:\n    def __getitem__(self, part: ContiguousSlice) -> Int:\n        return 1\n    def __getitem__(self, part: StridedSlice) -> Int:\n        return 2\n\ndef main():\n    var probe = Probe()\n    print(probe[1:5], probe[1:5:2], probe[::])\n";
+    assert_eq!(parity(src), "1 2 2\n");
+}
+
+#[test]
+fn multi_index_dispatch_supports_variadic_getitem() {
+    let src = "@fieldwise_init\nstruct Cube:\n    def __getitem__(self, *indices: Int) -> Int:\n        return indices[0] * 100 + indices[1] * 10 + indices[2]\n\ndef main():\n    var cube = Cube()\n    print(cube[1, 2, 3])\n";
+    assert_eq!(parity(src), "123\n");
+}
+
+#[test]
+fn mixed_slice_assignment_dispatches_to_fixed_setitem() {
+    let src = "@fieldwise_init\nstruct Grid:\n    var value: Int\n    def __setitem__(mut self, row: Int, columns: Slice, value: Int):\n        var normalized = columns.indices(10)\n        self.value = row * 100 + normalized[0] + normalized[1] + normalized[2] + value\n\ndef main():\n    var grid = Grid(0)\n    grid[3, 1:8:2] = 9\n    print(grid.value)\n";
+    assert_eq!(parity(src), "320\n");
+}
+
+#[test]
+fn multidimensional_assignment_supports_variadic_setitem() {
+    let src = "@fieldwise_init\nstruct Cube:\n    var value: Int\n    def __setitem__(mut self, *indices: Int, *, value: Int):\n        self.value = indices[0] * 1000 + indices[1] * 100 + indices[2] * 10 + value\n\ndef main():\n    var cube = Cube(0)\n    cube[1, 2, 3] = 4\n    print(cube.value)\n";
+    assert_eq!(parity(src), "1234\n");
+}
+
+#[test]
+fn explicit_slice_values_expose_optional_fields_and_indices() {
+    let src = "def main():\n    var span = Slice(None, None, -1)\n    print(span.start.is_some(), span.end.or_else(9), span.step.or_else(1))\n    print(span.indices(4))\n    print(slice(3).indices(10))\n";
+    assert_eq!(parity(src), "False 9 -1\n(3, -1, -1)\n(0, 3, 1)\n");
 }

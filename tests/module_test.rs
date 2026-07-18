@@ -174,6 +174,35 @@ fn importer_directory_precedes_custom_search_roots() {
 }
 
 #[test]
+fn source_package_precedes_same_named_source_module() {
+    let d = TempDir::new();
+    d.write("choice.mojo", "def answer() -> Int:\n    return 1\n");
+    d.write(
+        "choice/__init__.mojo",
+        "def answer() -> Int:\n    return 2\n",
+    );
+    let main = d.write(
+        "main.mojo",
+        "from choice import answer\n\ndef main():\n    print(answer())\n",
+    );
+    assert_eq!(run(&main).unwrap(), "2\n");
+}
+
+#[test]
+fn ordinary_directories_can_form_dotted_import_paths() {
+    let d = TempDir::new();
+    d.write(
+        "plain/nested/tool.mojo",
+        "def answer() -> Int:\n    return 42\n",
+    );
+    let main = d.write(
+        "main.mojo",
+        "import plain.nested.tool\n\ndef main():\n    print(plain.nested.tool.answer())\n",
+    );
+    assert_eq!(run(&main).unwrap(), "42\n");
+}
+
+#[test]
 fn linked_declarations_preserve_module_identity_in_checked_program() {
     let d = TempDir::new();
     let module = d.write("library.mojo", "def answer() -> Int:\n    return 42\n");
@@ -280,6 +309,18 @@ fn unaliased_dotted_import_uses_the_full_qualified_path() {
 }
 
 #[test]
+fn dotted_import_prefix_is_shadowed_as_one_namespace_tree() {
+    let d = TempDir::new();
+    d.write("pkg/__init__.mojo", "");
+    d.write("pkg/tool.mojo", "def answer() -> Int:\n    return 42\n");
+    let main = d.write(
+        "main.mojo",
+        "import pkg.tool\n\ndef echo(pkg: Int) -> Int:\n    return pkg\n\ndef main():\n    print(echo(7))\n",
+    );
+    assert_eq!(run(&main).unwrap(), "7\n");
+}
+
+#[test]
 fn dotted_namespace_resolves_exported_types() {
     let d = TempDir::new();
     d.write("pkg/__init__.mojo", "");
@@ -335,6 +376,52 @@ fn package_init_reexports_members() {
 }
 
 #[test]
+fn package_init_can_reexport_a_submodule_namespace() {
+    let d = TempDir::new();
+    d.write("tools/value.mojo", "def answer() -> Int:\n    return 42\n");
+    d.write("tools/__init__.mojo", "from . import value\n");
+    let main = d.write(
+        "main.mojo",
+        "import tools\n\ndef main():\n    print(tools.value.answer())\n",
+    );
+    assert_eq!(run(&main).unwrap(), "42\n");
+}
+
+#[test]
+fn package_submodule_requires_reexport_or_explicit_import() {
+    let d = TempDir::new();
+    d.write("tools/__init__.mojo", "");
+    d.write("tools/value.mojo", "def answer() -> Int:\n    return 42\n");
+    let direct = d.write(
+        "direct.mojo",
+        "import tools.value\n\ndef main():\n    print(tools.value.answer())\n",
+    );
+    assert_eq!(run(&direct).unwrap(), "42\n");
+
+    let hidden = d.write(
+        "hidden.mojo",
+        "import tools\n\ndef main():\n    print(tools.value.answer())\n",
+    );
+    assert!(run(&hidden).is_err());
+}
+
+#[test]
+fn sibling_modules_are_not_implicitly_visible() {
+    let d = TempDir::new();
+    d.write("pkg/__init__.mojo", "");
+    d.write("pkg/tool.mojo", "def answer() -> Int:\n    return 42\n");
+    d.write(
+        "pkg/use.mojo",
+        "def indirect() -> Int:\n    return tool.answer()\n",
+    );
+    let main = d.write(
+        "main.mojo",
+        "from pkg.use import indirect\n\ndef main():\n    print(indirect())\n",
+    );
+    assert!(run(&main).unwrap_err().contains("tool"));
+}
+
+#[test]
 fn dots_only_relative_import_binds_a_sibling_module_namespace() {
     let d = TempDir::new();
     d.write("pkg/__init__.mojo", "");
@@ -367,4 +454,19 @@ fn wildcard_import_hides_underscore_prefixed_declarations() {
         "from api import *\n\ndef main():\n    print(_hidden())\n",
     );
     assert!(run(&bad).unwrap_err().contains("_hidden"));
+}
+
+#[test]
+fn imported_trait_effect_types_are_rewritten_with_their_module() {
+    let d = TempDir::new();
+    d.write(
+        "validation.mojo",
+        "@fieldwise_init\nstruct ValidationError:\n    var reason: String\n\ntrait Validates:\n    def validate(self) raises ValidationError -> Int: ...\n\n@fieldwise_init\nstruct Validator(Validates):\n    var value: Int\n    def validate(self) raises ValidationError -> Int:\n        if self.value < 0:\n            raise ValidationError(\"negative\")\n        return self.value\n\ndef invoke[T: Validates](value: T) raises ValidationError -> Int:\n    return value.validate()\n",
+    );
+    let main = d.write(
+        "main.mojo",
+        "from validation import ValidationError, Validator, invoke\n\ndef main() raises ValidationError:\n    print(invoke(Validator(7)))\n",
+    );
+
+    assert_eq!(run(&main).unwrap(), "7\n");
 }

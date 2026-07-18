@@ -243,8 +243,12 @@ The lexer supports:
 - single-quoted strings
 - double-quoted strings
 - triple-quoted strings
+- case-insensitive raw (`r`) prefixes
+- interpolated (`t`) prefixes, with raw/interpolated prefixes in either order
+- adjacent components within the ordinary/triple or interpolated family, on the
+  same logical line or an indented following physical line
 - escapes such as `\n`, `\t`, `\\`, `\"`
-- numeric escapes: octal, `\xHH`, `\uHHHH`, `\UHHHHHHHH`
+- numeric escapes: one-to-three-digit octal, `\xHH`, `\uHHHH`, `\UHHHHHHHH`
 
 Single-line strings cannot contain raw newlines. Triple-quoted strings can.
 
@@ -270,9 +274,9 @@ The parser later reparses each interpolation with a fresh lexer/parser:
 fn parse_interpolation(src: &str) -> Result<Expr, ParseError>
 ```
 
-This keeps the main lexer simple. The brace matching is intentionally modest: it
-tracks nested braces, but does not fully lex nested string literals inside an
-interpolation.
+The interpolation scanner tracks nested braces while skipping braces inside
+quoted strings and comments. Nested t-strings recursively use the same boundary
+logic, so their interpolation braces cannot terminate the outer expression.
 
 Escaped `{{` and `}}` become literal braces.
 
@@ -542,8 +546,8 @@ Postfix forms:
 - method call: `expr.method(args)`
 - function call: `name(args)`
 - explicit parameter call: `Name[Int](args)`
-- index: `expr[index]`
-- slice: `expr[lower:upper:step]`
+- index/slice: `expr[index]`, `expr[lower:upper:step]`
+- mixed or multidimensional subscript: `expr[row, lower:upper:step]`
 
 Infix forms:
 

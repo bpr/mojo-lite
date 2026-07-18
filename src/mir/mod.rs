@@ -31,54 +31,12 @@ use std::collections::{HashMap, HashSet};
 
 mod ir;
 pub use ir::*;
+pub mod verify;
 
 /// An expression's source span, stamped by the parser (`ast::Expr.span`). Fed
 /// into the [`SpanTable`] so each temporary can be traced back to its origin.
 fn span(e: &Expr) -> SourceSpan {
     e.source_span()
-}
-
-/// Resolve a `SIMD` dtype parameter argument (`DType.<name>`) to a [`Dtype`].
-fn dtype_from_param_arg(arg: &ParamArg) -> Option<Dtype> {
-    if let ParamArg::Value(Expr {
-        kind: ExprKind::Member { object, field },
-        ..
-    }) = arg
-        && let ExprKind::Identifier(ns) = &object.kind
-        && ns == "DType"
-    {
-        return Dtype::from_name(field);
-    }
-    None
-}
-
-/// Const-fold a compile-time `Int` parameter argument (a SIMD width). Handles the
-/// literal / unary-minus / arithmetic forms; the checker has already validated it.
-fn ct_int(arg: &ParamArg) -> Option<i64> {
-    match arg {
-        ParamArg::Value(e) => ct_int_expr(e),
-        ParamArg::Type(_) => None,
-    }
-}
-
-fn ct_int_expr(e: &Expr) -> Option<i64> {
-    match &e.kind {
-        ExprKind::Int(n) => Some(*n),
-        ExprKind::Prefix(PrefixOp::Neg, inner) => Some(-ct_int_expr(inner)?),
-        ExprKind::Infix(op, a, b) => {
-            let (x, y) = (ct_int_expr(a)?, ct_int_expr(b)?);
-            match op {
-                InfixOp::Add => Some(x + y),
-                InfixOp::Sub => Some(x - y),
-                InfixOp::Mul => Some(x * y),
-                InfixOp::FloorDiv if y != 0 => Some(x.div_euclid(y)),
-                InfixOp::Mod if y != 0 => Some(x.rem_euclid(y)),
-                InfixOp::Pow if y >= 0 => Some(x.pow(y as u32)),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
 }
 
 /// A nested `def` lifted to a top-level function: the mangled name it becomes and
@@ -90,7 +48,158 @@ struct NestedInfo {
     mangled: String,
     /// Captured enclosing-local names, in a deterministic (sorted) order shared by
     /// the lifted function's parameter list and every rewritten call site.
-    captures: Vec<String>,
+    captures: Vec<NestedCapture>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct NestedCapture {
+    name: String,
+    kind: crate::ast::CaptureKind,
+}
+
+#[derive(Clone)]
+struct ExprFacts {
+    ty: Option<Ty>,
+    place_ty: Option<Ty>,
+    owner: Option<crate::origin::OwnerId>,
+    raises: Option<Ty>,
+    adjustments: Vec<crate::SemanticAdjustment>,
+    comprehension_bindings: Vec<crate::checked::CheckedComprehensionBinding>,
+}
+
+fn expression_children(expression: &Expr) -> Vec<&Expr> {
+    match &expression.kind {
+        ExprKind::Prefix(_, value)
+        | ExprKind::Transfer(value)
+        | ExprKind::Spread(value)
+        | ExprKind::Named { value, .. } => {
+            vec![value]
+        }
+        ExprKind::Infix(_, left, right)
+        | ExprKind::Index {
+            object: left,
+            index: right,
+        } => {
+            vec![left, right]
+        }
+        ExprKind::Call { args, kwargs, .. } => args
+            .iter()
+            .chain(kwargs.iter().map(|argument| &argument.value))
+            .collect(),
+        ExprKind::Invoke {
+            callee,
+            args,
+            kwargs,
+            ..
+        } => std::iter::once(callee.as_ref())
+            .chain(args.iter())
+            .chain(kwargs.iter().map(|argument| &argument.value))
+            .collect(),
+        ExprKind::Member { object, .. } => vec![object],
+        ExprKind::MethodCall {
+            object,
+            args,
+            kwargs,
+            ..
+        } => std::iter::once(object.as_ref())
+            .chain(args.iter())
+            .chain(kwargs.iter().map(|argument| &argument.value))
+            .collect(),
+        ExprKind::ListLit(values) | ExprKind::TupleLit(values) => values.iter().collect(),
+        ExprKind::BraceLit(values) => values
+            .iter()
+            .flat_map(|(key, value)| std::iter::once(key).chain(value.iter()))
+            .collect(),
+        ExprKind::IfExpr {
+            cond,
+            then_branch,
+            else_branch,
+        } => vec![cond, then_branch, else_branch],
+        ExprKind::Compare { first, rest } => std::iter::once(first.as_ref())
+            .chain(rest.iter().map(|(_, value)| value))
+            .collect(),
+        ExprKind::Slice {
+            object,
+            lower,
+            upper,
+            step,
+            ..
+        } => std::iter::once(object.as_ref())
+            .chain(
+                [lower, upper, step]
+                    .into_iter()
+                    .filter_map(|value| value.as_deref()),
+            )
+            .collect(),
+        ExprKind::MultiIndex { object, args } => {
+            let mut children = vec![object.as_ref()];
+            for argument in args {
+                match argument {
+                    crate::ast::SubscriptArg::Index(value) => children.push(value),
+                    crate::ast::SubscriptArg::Slice {
+                        lower, upper, step, ..
+                    } => {
+                        children.extend([lower, upper, step].into_iter().flatten().map(Box::as_ref))
+                    }
+                }
+            }
+            children
+        }
+        ExprKind::TString { parts, .. } => parts
+            .iter()
+            .filter_map(|part| match part {
+                TStringPart::Expr(value) => Some(value.as_ref()),
+                TStringPart::Literal(_) => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn statement_expression_roots(statement: &Stmt) -> Vec<&Expr> {
+    match &statement.kind {
+        StmtKind::VarDecl { value, .. }
+        | StmtKind::RefDecl { value, .. }
+        | StmtKind::Assign { value, .. }
+        | StmtKind::Comptime { value, .. }
+        | StmtKind::Raise(value)
+        | StmtKind::Expr(value) => vec![value],
+        StmtKind::SetPlace { place, value } | StmtKind::AugAssign { place, value, .. } => {
+            vec![place, value]
+        }
+        StmtKind::Unpack { targets, value } => {
+            let mut roots: Vec<&Expr> = targets.iter().collect();
+            roots.push(value);
+            roots
+        }
+        StmtKind::Return(Some(value)) => vec![value],
+        StmtKind::With { items, .. } => items.iter().map(|item| &item.context).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn index_hir_expression(
+    syntax: &Expr,
+    expression: &crate::hir::HirExpr,
+    index: &mut HashMap<usize, ExprFacts>,
+) {
+    index.insert(
+        syntax as *const Expr as usize,
+        ExprFacts {
+            ty: expression.ty.clone(),
+            place_ty: expression.place.as_ref().map(|place| place.ty.clone()),
+            owner: expression.place.as_ref().map(|place| place.owner),
+            raises: expression.effects.raises.clone(),
+            adjustments: expression.adjustments.clone(),
+            comprehension_bindings: expression.comprehension_bindings.clone(),
+        },
+    );
+    for (child_syntax, child) in expression_children(syntax)
+        .into_iter()
+        .zip(&expression.children)
+    {
+        index_hir_expression(child_syntax, child, index);
+    }
 }
 
 /// Flattens nested `Expr`s into a block's instruction list. `cur` is the block
@@ -101,28 +210,207 @@ struct Flatten<'a> {
     next_reg: u32,
     /// Interner: a variable name's first appearance assigns its `VarId`.
     vars: Vec<String>,
+    /// Checked storage type for each interned variable. This is populated from
+    /// checked parameters/uses and `HirInstr::Bind` before places are emitted.
+    var_types: HashMap<VarId, Ty>,
+    /// Runtime slots assigned to checked binding identities that do not have a
+    /// statement-level HIR declaration, notably comprehension generators.
+    owner_vars: HashMap<crate::origin::OwnerId, VarId>,
     /// Nested `def`s in scope (name → lifted target + captures); a call to one is
     /// rewritten to the mangled function with its captures prepended, and the
     /// nested `def` statement itself lowers to nothing.
     nested: HashMap<String, NestedInfo>,
-    /// The program's overloaded declarations. Kept as a fallback for
-    /// unannotated lowering; normally overload_targets gives the exact callee.
+    /// The program's overloaded declarations. Kept only for unchecked HIR tests;
+    /// production lowering consumes `ResolveCallable` checked adjustments.
     overloads: crate::symbol::OverloadSets,
-    /// Checker-selected lowered callee names for overloaded call expressions.
-    overload_targets: HashMap<SourceSpan, String>,
-    implicit_conversions: HashMap<SourceSpan, String>,
-    explicit_destroy_calls: std::collections::HashSet<SourceSpan>,
+    checked_expressions: HashMap<crate::CheckedNodeId, crate::CheckedExpr>,
+    /// Semantic facts indexed by the in-memory identity of the active HIR syntax
+    /// tree. Maps are installed only while lowering that expression/statement;
+    /// source spans are never used as semantic keys.
+    active_semantics: Vec<HashMap<usize, ExprFacts>>,
     /// Local reference slot to its frozen owner place and permission.
     aliases: HashMap<VarId, (MirPlace, bool)>,
     runtime_aliases: std::collections::HashSet<VarId>,
+    /// Persistent owner loans carried by reference-bearing aggregate variables.
+    /// The runtime value contains the handles; this map transfers their static
+    /// loans when an aggregate is moved or forwarded into a new binding.
+    aggregate_loans: HashMap<VarId, Vec<(MirPlace, bool)>>,
     returns_reference: bool,
 }
 
 impl Flatten<'_> {
+    fn facts(&self, expression: &Expr) -> Option<&ExprFacts> {
+        let key = expression as *const Expr as usize;
+        self.active_semantics
+            .iter()
+            .rev()
+            .find_map(|index| index.get(&key))
+    }
+
+    fn checked_ty(&self, expression: &Expr) -> Option<Ty> {
+        self.facts(expression).and_then(|facts| facts.ty.clone())
+    }
+
+    fn checked_place_ty(&self, expression: &Expr) -> Option<Ty> {
+        self.facts(expression)
+            .and_then(|facts| facts.place_ty.clone())
+    }
+
+    fn checked_raises(&self, expression: &Expr) -> Option<Ty> {
+        self.facts(expression)
+            .and_then(|facts| facts.raises.clone())
+    }
+
+    fn checked_owner(&self, expression: &Expr) -> Option<crate::origin::OwnerId> {
+        self.facts(expression).and_then(|facts| facts.owner)
+    }
+
+    fn comprehension_bindings(
+        &self,
+        expression: &Expr,
+    ) -> Vec<crate::checked::CheckedComprehensionBinding> {
+        self.facts(expression)
+            .map(|facts| facts.comprehension_bindings.clone())
+            .unwrap_or_default()
+    }
+
+    fn expression_var(&mut self, name: &str, expression: &Expr) -> VarId {
+        let checked = self
+            .checked_owner(expression)
+            .and_then(|owner| self.owner_vars.get(&owner).copied());
+        checked.unwrap_or_else(|| self.var(name))
+    }
+    /// Every owner loan carried into an aggregate expression.  An aggregate may
+    /// contain more than one reference-valued field, so this must remain plural:
+    /// keeping only the first borrow makes later fields dangling-capable.
+    fn aggregate_borrows(&mut self, expression: &Expr) -> Vec<(MirPlace, bool)> {
+        let borrow = self
+            .checked_adjustments(expression)
+            .into_iter()
+            .find_map(|adjustment| match adjustment {
+                crate::SemanticAdjustment::BorrowShared => Some(false),
+                crate::SemanticAdjustment::BorrowMutable => Some(true),
+                _ => None,
+            });
+        if let Some(mutable) = borrow
+            && let ExprKind::Identifier(name) = &expression.kind
+        {
+            let var = self.expression_var(name, expression);
+            return self
+                .aliases
+                .get(&var)
+                .cloned()
+                .map(|(place, _)| vec![(place, mutable)])
+                .unwrap_or_default();
+        }
+        if let ExprKind::Identifier(name) = &expression.kind {
+            let var = self.expression_var(name, expression);
+            if let Some(loans) = self.aggregate_loans.get(&var) {
+                return loans.clone();
+            }
+        }
+        match &expression.kind {
+            ExprKind::Call { args, kwargs, .. } => args
+                .iter()
+                .chain(kwargs.iter().map(|argument| &argument.value))
+                .flat_map(|argument| self.aggregate_borrows(argument))
+                .collect(),
+            ExprKind::Transfer(inner) => self.aggregate_borrows(inner),
+            ExprKind::ListLit(values) | ExprKind::TupleLit(values) => values
+                .iter()
+                .flat_map(|value| self.aggregate_borrows(value))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn checked_adjustments(&self, expression: &Expr) -> Vec<crate::SemanticAdjustment> {
+        self.facts(expression)
+            .map(|facts| facts.adjustments.clone())
+            .unwrap_or_default()
+    }
+
+    fn resolved_callable(&self, expression: &Expr) -> Option<String> {
+        self.checked_adjustments(expression)
+            .into_iter()
+            .find_map(|adjustment| match adjustment {
+                crate::SemanticAdjustment::ResolveCallable(target) => Some(target),
+                _ => None,
+            })
+    }
+
+    fn implicit_conversion(&self, expression: &Expr) -> Option<String> {
+        self.checked_adjustments(expression)
+            .into_iter()
+            .find_map(|adjustment| match adjustment {
+                crate::SemanticAdjustment::ImplicitConversion(target) => Some(target),
+                _ => None,
+            })
+    }
+
+    fn is_slice_descriptor(&self, expression: &Expr) -> bool {
+        matches!(
+            self.checked_ty(expression),
+            Some(Ty::Struct(name, args))
+                if matches!(name.as_str(), "Slice" | "ContiguousSlice" | "StridedSlice")
+                    && args.is_empty()
+        )
+    }
+
+    fn reference_handle(&mut self, expression: &Expr) -> Reg {
+        if let ExprKind::Identifier(name) = &expression.kind {
+            let var = self.expression_var(name, expression);
+            if let Some((place, _)) = self.aliases.get(&var).cloned() {
+                let dest = self.fresh(expression.source_span(), Some(place.root));
+                self.emit(MirInstr::MakeRef { dest, place });
+                return dest;
+            }
+            if self.runtime_aliases.contains(&var) {
+                let dest = self.fresh(expression.source_span(), Some(var));
+                let mut place = MirPlace::root(var, self.var_types.get(&var).cloned());
+                place.through = Some(var);
+                self.emit(MirInstr::MakeRef { dest, place });
+                return dest;
+            }
+        }
+        if matches!(expression.kind, ExprKind::TypeApply { .. })
+            && self
+                .checked_adjustments(expression)
+                .iter()
+                .any(|adjustment| {
+                    matches!(adjustment, crate::SemanticAdjustment::VariantProject { .. })
+                })
+        {
+            let place = self.place(expression);
+            let dest = self.fresh(expression.source_span(), Some(place.root));
+            self.emit(MirInstr::MakeRef { dest, place });
+            return dest;
+        }
+        if matches!(
+            expression.kind,
+            ExprKind::Member { .. } | ExprKind::Index { .. }
+        ) {
+            let place = self.place(expression);
+            let storage = self.fresh(expression.source_span(), Some(place.root));
+            self.emit(MirInstr::MakeRef {
+                dest: storage,
+                place,
+            });
+            let dest = self.fresh(expression.source_span(), None);
+            self.emit(MirInstr::ReadRef {
+                dest,
+                reference: storage,
+            });
+            return dest;
+        }
+        // A reference-valued field load produces the stored frame/slot handle.
+        self.expr_unconverted(expression)
+    }
+
     fn fresh(&mut self, span: SourceSpan, origin: Option<VarId>) -> Reg {
         let r = self.next_reg;
         self.next_reg += 1;
-        self.f.spans.0.insert(r, (span, origin));
+        self.f.spans.0.insert(r, (span.clone(), origin));
         Reg(r)
     }
 
@@ -160,11 +448,39 @@ impl Flatten<'_> {
                 place.through = Some(var);
                 place
             })
-            .unwrap_or(MirPlace {
-                root: var,
-                proj: Vec::new(),
-                through: None,
+            .unwrap_or_else(|| {
+                let ty = self.var_types.get(&var).cloned();
+                MirPlace::root(var, ty)
             })
+    }
+
+    fn expression_place_root(&mut self, name: &str, expression: &Expr) -> MirPlace {
+        let checked_var = self
+            .checked_owner(expression)
+            .and_then(|owner| self.owner_vars.get(&owner).copied());
+        let mut place = if let Some(var) = checked_var {
+            self.aliases
+                .get(&var)
+                .map(|(place, _)| {
+                    let mut place = place.clone();
+                    place.through = Some(var);
+                    place
+                })
+                .unwrap_or_else(|| MirPlace::root(var, self.var_types.get(&var).cloned()))
+        } else {
+            self.resolved_place(name)
+        };
+        if place.root_ty.is_none() {
+            let ty = self
+                .checked_place_ty(expression)
+                .or_else(|| self.checked_ty(expression));
+            place.root_ty = ty.clone();
+            place.ty = ty.clone();
+            if let Some(ty) = ty {
+                self.var_types.insert(place.root, ty);
+            }
+        }
+        place
     }
 
     /// Flatten one or more argument expressions to their result registers.
@@ -203,7 +519,7 @@ impl Flatten<'_> {
         self.emit(MirInstr::DefVar {
             var: result,
             src: ra,
-            source_annotation: None,
+            binding_ty: None,
         });
 
         let rhs_blk = self.new_block();
@@ -224,7 +540,7 @@ impl Flatten<'_> {
         self.emit(MirInstr::DefVar {
             var: result,
             src: rb,
-            source_annotation: None,
+            binding_ty: None,
         });
         self.f.blocks[self.cur].term = MirTerm::Jump(merge_blk);
 
@@ -256,7 +572,7 @@ impl Flatten<'_> {
         self.emit(MirInstr::DefVar {
             var: result,
             src: rt,
-            source_annotation: None,
+            binding_ty: None,
         });
         self.f.blocks[self.cur].term = MirTerm::Jump(merge_blk);
         self.cur = else_blk;
@@ -264,7 +580,7 @@ impl Flatten<'_> {
         self.emit(MirInstr::DefVar {
             var: result,
             src: re,
-            source_annotation: None,
+            binding_ty: None,
         });
         self.f.blocks[self.cur].term = MirTerm::Jump(merge_blk);
         self.cur = merge_blk;
@@ -297,7 +613,7 @@ impl Flatten<'_> {
             self.emit(MirInstr::DefVar {
                 var: result,
                 src: cmp,
-                source_annotation: None,
+                binding_ty: None,
             });
             if i + 1 == rest.len() {
                 self.f.blocks[self.cur].term = MirTerm::Jump(merge_blk);
@@ -324,15 +640,253 @@ impl Flatten<'_> {
         d
     }
 
+    /// Lower comprehension clauses directly into MIR control flow. This is the
+    /// same left-to-right nesting as an explicit series of `for`/`if` blocks;
+    /// the final leaf performs the collection family's insertion protocol.
+    fn comprehension_clauses(
+        &mut self,
+        clauses: &[crate::ast::ComprehensionClause],
+        bindings: &[crate::checked::CheckedComprehensionBinding],
+        index: usize,
+        collection: VarId,
+        key: Option<&Expr>,
+        value: &Expr,
+    ) {
+        if index == clauses.len() {
+            // Dictionary evaluation is key-before-value, matching an ordinary
+            // display and indexed assignment. List/set leaves evaluate one item.
+            let key = key.map(|expression| self.expr(expression));
+            let value = self.expr(value);
+            self.emit(MirInstr::CollectionInsert {
+                collection,
+                key,
+                value,
+            });
+            return;
+        }
+
+        match &clauses[index] {
+            crate::ast::ComprehensionClause::If(condition) => {
+                let condition = self.expr(condition);
+                let body = self.new_block();
+                let continuation = self.new_block();
+                self.f.blocks[self.cur].term = MirTerm::Branch {
+                    cond: condition,
+                    then_b: body,
+                    else_b: continuation,
+                };
+                self.cur = body;
+                self.comprehension_clauses(
+                    clauses,
+                    bindings,
+                    index + 1,
+                    collection,
+                    key,
+                    value,
+                );
+                self.f.blocks[self.cur].term = MirTerm::Jump(continuation);
+                self.cur = continuation;
+            }
+            crate::ast::ComprehensionClause::For {
+                var, owned, iter, ..
+            } => {
+                let iterator_name = format!("$compiter{}", self.vars.len());
+                let iterator = self.var(&iterator_name);
+                let iterator_value = self.expr(iter);
+                let iterator_ty = self.checked_ty(iter);
+                if let Some(ty) = iterator_ty.clone() {
+                    self.var_types.insert(iterator, ty);
+                }
+                self.emit(MirInstr::DefVar {
+                    var: iterator,
+                    src: iterator_value,
+                    binding_ty: iterator_ty,
+                });
+                let protocol = self
+                    .checked_adjustments(iter)
+                    .into_iter()
+                    .find_map(|adjustment| match adjustment {
+                        crate::SemanticAdjustment::Iterate(protocol) => Some(protocol),
+                        _ => None,
+                    })
+                    .unwrap_or(crate::IterationProtocol {
+                        mode: if *owned {
+                            crate::IterationMode::Owned
+                        } else {
+                            crate::IterationMode::Borrowed
+                        },
+                        prepare: Vec::new(),
+                        has_next: None,
+                        next: None,
+                    });
+                self.emit(MirInstr::GetIter {
+                    iter: iterator,
+                    mode: protocol.mode,
+                    prepare: protocol.prepare.clone(),
+                });
+
+                let header = self.new_block();
+                let body = self.new_block();
+                let exit = self.new_block();
+                self.f.blocks[self.cur].term = MirTerm::Jump(header);
+                self.cur = header;
+                let has_next = self.fresh(iter.source_span(), Some(iterator));
+                self.emit(MirInstr::HasNext {
+                    dest: has_next,
+                    iter: iterator,
+                    method: protocol.has_next.clone(),
+                });
+                self.f.blocks[self.cur].term = MirTerm::Branch {
+                    cond: has_next,
+                    then_b: body,
+                    else_b: exit,
+                };
+
+                self.cur = body;
+                let element_value = self.fresh(iter.source_span(), Some(iterator));
+                self.emit(MirInstr::Next {
+                    dest: element_value,
+                    iter: iterator,
+                    method: protocol.next.clone(),
+                });
+                let binding_index = clauses[..index]
+                    .iter()
+                    .filter(|clause| {
+                        matches!(clause, crate::ast::ComprehensionClause::For { .. })
+                    })
+                    .count();
+                let binding = bindings
+                    .get(binding_index)
+                    .expect("checked comprehension binder metadata");
+                let target = self.var(&format!("$comp{}${}", var, binding.owner.0));
+                self.owner_vars.insert(binding.owner, target);
+                let element_ty = Some(binding.ty.clone());
+                if let Some(ty) = element_ty.clone() {
+                    self.var_types.insert(target, ty);
+                }
+                self.emit(MirInstr::DefVar {
+                    var: target,
+                    src: element_value,
+                    binding_ty: element_ty,
+                });
+                self.comprehension_clauses(
+                    clauses,
+                    bindings,
+                    index + 1,
+                    collection,
+                    key,
+                    value,
+                );
+                self.f.blocks[self.cur].term = MirTerm::Jump(header);
+                self.cur = exit;
+            }
+        }
+    }
+
+    fn comprehension(
+        &mut self,
+        expression: &Expr,
+        kind: crate::ast::CollectionKind,
+        key: Option<&Expr>,
+        value: &Expr,
+        clauses: &[crate::ast::ComprehensionClause],
+    ) -> Reg {
+        let empty = self.fresh(expression.source_span(), None);
+        let result_ty = self.checked_ty(expression);
+        match kind {
+            crate::ast::CollectionKind::List => self.emit(MirInstr::MakeList {
+                dest: empty,
+                elems: Vec::new(),
+                element_type: match &result_ty {
+                    Some(Ty::List(element)) => Some((**element).clone()),
+                    _ => None,
+                },
+            }),
+            crate::ast::CollectionKind::Set => self.emit(MirInstr::MakeSet {
+                dest: empty,
+                elems: Vec::new(),
+                element_type: match &result_ty {
+                    Some(Ty::Set(element)) => Some((**element).clone()),
+                    _ => None,
+                },
+            }),
+            crate::ast::CollectionKind::Dict => self.emit(MirInstr::MakeDict {
+                dest: empty,
+                entries: Vec::new(),
+                key_type: match &result_ty {
+                    Some(Ty::Dict(key, _)) => Some((**key).clone()),
+                    _ => None,
+                },
+                value_type: match &result_ty {
+                    Some(Ty::Dict(_, value)) => Some((**value).clone()),
+                    _ => None,
+                },
+            }),
+        }
+        let collection = self.fresh_var();
+        if let Some(ty) = result_ty.clone() {
+            self.var_types.insert(collection, ty);
+        }
+        self.emit(MirInstr::DefVar {
+            var: collection,
+            src: empty,
+            binding_ty: result_ty,
+        });
+        let bindings = self.comprehension_bindings(expression);
+        self.comprehension_clauses(clauses, &bindings, 0, collection, key, value);
+        let result = self.fresh(expression.source_span(), Some(collection));
+        self.emit(MirInstr::UseVar {
+            dest: result,
+            var: collection,
+            mode: UseMode::Move,
+        });
+        result
+    }
+
     /// Post-order: each subexpression emits one instruction and yields its result
     /// `Reg`, so `foo(bar(x))` → `t0 = bar(x); t1 = foo(t0)`. Total over `Expr`.
+    fn expr_hir(&mut self, expression: &crate::hir::HirExpr) -> Reg {
+        let mut index = HashMap::new();
+        index_hir_expression(&expression.syntax, expression, &mut index);
+        self.active_semantics.push(index);
+        let result = self.expr(&expression.syntax);
+        self.active_semantics.pop();
+        result
+    }
+
+    fn place_hir(&mut self, expression: &crate::hir::HirExpr) -> MirPlace {
+        let mut index = HashMap::new();
+        index_hir_expression(&expression.syntax, expression, &mut index);
+        self.active_semantics.push(index);
+        let result = self.place(&expression.syntax);
+        self.active_semantics.pop();
+        result
+    }
+
     fn expr(&mut self, e: &Expr) -> Reg {
-        if let Some(target) = self.implicit_conversions.get(&span(e)).cloned() {
+        let result = self.expr_with_adjustments(e);
+        if let Some(ty) = self.checked_ty(e) {
+            self.f.reg_types.insert(result.0, ty);
+        }
+        result
+    }
+
+    fn expr_with_adjustments(&mut self, e: &Expr) -> Reg {
+        if self.checked_adjustments(e).iter().any(|adjustment| {
+            matches!(
+                adjustment,
+                crate::SemanticAdjustment::BorrowShared | crate::SemanticAdjustment::BorrowMutable
+            )
+        }) {
+            return self.reference_handle(e);
+        }
+        if let Some(target) = self.implicit_conversion(e) {
             let argument = self.expr_unconverted(e);
             let dest = self.fresh(span(e), None);
             self.emit(MirInstr::Call {
                 dest,
                 func: FuncRef::named(&target),
+                raises: None,
                 args: vec![argument],
                 kwargs: Vec::new(),
                 arg_places: vec![None],
@@ -351,21 +905,67 @@ impl Flatten<'_> {
             ExprKind::Bool(b) => self.constant(e, Const::Bool(*b)),
             ExprKind::Str(s) => self.constant(e, Const::Str(s.clone())),
             ExprKind::None => self.constant(e, Const::None),
+            ExprKind::Uninitialized => self.constant(e, Const::None),
+            ExprKind::Spread(_) => {
+                let dest = self.fresh(span(e), None);
+                self.emit(MirInstr::Unsupported(
+                    "unexpanded call spread reached MIR lowering".to_string(),
+                ));
+                self.emit(MirInstr::Const {
+                    dest,
+                    k: Const::None,
+                });
+                dest
+            }
 
             // --- Variable reads ------------------------------------------------
             // A bare read defaults to `Copy`; a call site refines it to
             // `Borrow*`/`Move` per the callee's convention (Stage 6).
             ExprKind::Identifier(name) => {
+                if let Some(target) = self.resolved_callable(e) {
+                    return self.constant(e, Const::Function(target));
+                }
+                if let Some(info) = self.nested.get(name).cloned() {
+                    let captures = info
+                        .captures
+                        .iter()
+                        .map(|capture| MirClosureCapture {
+                            place: self.resolved_place(&capture.name),
+                            moved: capture.kind == crate::ast::CaptureKind::Move,
+                        })
+                        .collect();
+                    let dest = self.fresh(span(e), None);
+                    self.emit(MirInstr::MakeClosure {
+                        dest,
+                        function: info.mangled,
+                        captures,
+                    });
+                    return dest;
+                }
                 if !self.vars.iter().any(|candidate| candidate == name)
                     && self.overloads.is_function(name)
                 {
                     return self.constant(e, Const::Function(name.clone()));
                 }
-                let var = self.var(name);
+                let var = self.expression_var(name, e);
                 let d = self.fresh(span(e), Some(var));
                 if let Some((mut place, _)) = self.aliases.get(&var).cloned() {
                     place.through = Some(var);
                     self.emit(MirInstr::LoadPlace { dest: d, place });
+                } else if self.runtime_aliases.contains(&var) {
+                    let handle = self.fresh(e.source_span(), Some(var));
+                    self.emit(MirInstr::MakeRef {
+                        dest: handle,
+                        place: {
+                            let mut place = MirPlace::root(var, self.var_types.get(&var).cloned());
+                            place.through = Some(var);
+                            place
+                        },
+                    });
+                    self.emit(MirInstr::ReadRef {
+                        dest: d,
+                        reference: handle,
+                    });
                 } else {
                     self.emit(MirInstr::UseVar {
                         dest: d,
@@ -380,7 +980,7 @@ impl Flatten<'_> {
             // identity for now (conservative — Stage 6 does not model it).
             ExprKind::Transfer(inner) => {
                 if let ExprKind::Identifier(name) = &inner.kind {
-                    let var = self.var(name);
+                    let var = self.expression_var(name, inner);
                     let d = self.fresh(span(e), Some(var));
                     self.emit(MirInstr::UseVar {
                         dest: d,
@@ -435,9 +1035,31 @@ impl Flatten<'_> {
                 args,
                 kwargs,
             } => {
+                if let Some(crate::SemanticAdjustment::ConstructVariant {
+                    alternatives,
+                    index,
+                }) = self.checked_adjustments(e).into_iter().find(|adjustment| {
+                    matches!(
+                        adjustment,
+                        crate::SemanticAdjustment::ConstructVariant { .. }
+                    )
+                }) {
+                    let value = self.expr(
+                        args.first()
+                            .expect("checked Variant construction has one payload"),
+                    );
+                    let dest = self.fresh(span(e), None);
+                    self.emit(MirInstr::MakeVariant {
+                        dest,
+                        alternatives,
+                        index,
+                        value,
+                    });
+                    return dest;
+                }
                 // SIMD construction resolves its `[DType.<dt>, width]` parameters
                 // here (the MIR is otherwise untyped about them).
-                if let Some(r) = self.try_simd_call(e, name, param_args, args) {
+                if let Some(r) = self.try_simd_call(e, args) {
                     return r;
                 }
                 // A call to a nested `def` (a closure, called by name in scope):
@@ -464,8 +1086,27 @@ impl Flatten<'_> {
                     self.emit(MirInstr::CallIndirect {
                         dest,
                         callee,
+                        raises: self.checked_raises(e),
                         args: regs,
                         kwargs: kw,
+                    });
+                    return dest;
+                }
+                // Tuple is compiler-shaped in this bounded runtime. Lower both
+                // inferred `Tuple(...)` and typed `Tuple[T, ...](...)` directly
+                // to aggregate construction, retaining resolved element types so
+                // literal arguments materialize to an explicitly requested type.
+                if name == "Tuple" && kwargs.is_empty() && !self.overloads.is_function(name) {
+                    let regs = self.args(args);
+                    let element_types = match self.checked_ty(e) {
+                        Some(Ty::Tuple(elements)) => Some(elements),
+                        _ => None,
+                    };
+                    let dest = self.fresh(span(e), None);
+                    self.emit(MirInstr::MakeTuple {
+                        dest,
+                        elems: regs,
+                        element_types,
                     });
                     return dest;
                 }
@@ -478,6 +1119,11 @@ impl Flatten<'_> {
                     .map(|pa| match pa {
                         ParamArg::Value(e) => Some(self.expr(e)),
                         ParamArg::Type(_) => None,
+                        ParamArg::Named { value, .. } => match &**value {
+                            ParamArg::Value(e) => Some(self.expr(e)),
+                            ParamArg::Type(_) => None,
+                            ParamArg::Named { .. } => unreachable!(),
+                        },
                     })
                     .collect();
                 let regs = self.args(args);
@@ -490,14 +1136,13 @@ impl Flatten<'_> {
                     .map(|k| (k.name.clone(), self.expr(&k.value)))
                     .collect();
                 let target = self
-                    .overload_targets
-                    .get(&span(e))
-                    .cloned()
+                    .resolved_callable(e)
                     .unwrap_or_else(|| self.overloaded_name(name, args.len()));
                 let d = self.fresh(span(e), None);
                 self.emit(MirInstr::Call {
                     dest: d,
                     func: FuncRef::named(&target),
+                    raises: self.checked_raises(e),
                     args: regs,
                     kwargs: kw,
                     arg_places,
@@ -511,6 +1156,100 @@ impl Flatten<'_> {
                 args,
                 kwargs,
             } => {
+                if let Some(operation) =
+                    self.checked_adjustments(e).into_iter().find(|adjustment| {
+                        matches!(
+                            adjustment,
+                            crate::SemanticAdjustment::VariantIs { .. }
+                                | crate::SemanticAdjustment::VariantTypeSupported { .. }
+                                | crate::SemanticAdjustment::VariantSet { .. }
+                                | crate::SemanticAdjustment::VariantTake { .. }
+                                | crate::SemanticAdjustment::VariantReplace { .. }
+                        )
+                    })
+                {
+                    let ExprKind::Member { object, .. } = &callee.kind else {
+                        unreachable!("checked Variant operation has a member callee")
+                    };
+                    match operation {
+                        crate::SemanticAdjustment::VariantIs { index, .. } => {
+                            let variant = self.expr(object);
+                            let dest = self.fresh(span(e), None);
+                            self.emit(MirInstr::VariantIs {
+                                dest,
+                                variant,
+                                index,
+                            });
+                            return dest;
+                        }
+                        crate::SemanticAdjustment::VariantTypeSupported { supported } => {
+                            let dest = self.fresh(span(e), None);
+                            self.emit(MirInstr::Const {
+                                dest,
+                                k: Const::Bool(supported),
+                            });
+                            return dest;
+                        }
+                        crate::SemanticAdjustment::VariantSet { index, .. } => {
+                            let place = self
+                                .try_place(object)
+                                .expect("checked Variant.set receiver is a writable place");
+                            let value = self
+                                .expr(args.first().expect("checked Variant.set has one payload"));
+                            let dest = self.fresh(span(e), None);
+                            self.emit(MirInstr::VariantSet {
+                                dest,
+                                place,
+                                index,
+                                value,
+                            });
+                            return dest;
+                        }
+                        crate::SemanticAdjustment::VariantTake { index, checked, .. } => {
+                            let place = self
+                                .try_place(object)
+                                .expect("checked Variant.take receiver is an owned place");
+                            let variant = self.fresh(span(object), None);
+                            self.emit(MirInstr::MovePlace {
+                                dest: variant,
+                                place,
+                            });
+                            let dest = self.fresh(span(e), None);
+                            self.emit(MirInstr::VariantTake {
+                                dest,
+                                variant,
+                                index,
+                                checked,
+                            });
+                            return dest;
+                        }
+                        crate::SemanticAdjustment::VariantReplace {
+                            input_index,
+                            output_index,
+                            checked,
+                            ..
+                        } => {
+                            let place = self
+                                .try_place(object)
+                                .expect("checked Variant.replace receiver is writable");
+                            let value = self.expr(
+                                args.first()
+                                    .expect("checked Variant.replace has one payload"),
+                            );
+                            let dest = self.fresh(span(e), None);
+                            self.emit(MirInstr::VariantReplace {
+                                dest,
+                                place,
+                                input_index,
+                                output_index,
+                                value,
+                                checked,
+                            });
+                            return dest;
+                        }
+                        _ => unreachable!("filtered Variant operation"),
+                    }
+                }
                 let callee = self.expr(callee);
                 let args = self.args(args);
                 let kwargs = kwargs
@@ -521,6 +1260,7 @@ impl Flatten<'_> {
                 self.emit(MirInstr::CallIndirect {
                     dest,
                     callee,
+                    raises: self.checked_raises(e),
                     args,
                     kwargs,
                 });
@@ -532,7 +1272,9 @@ impl Flatten<'_> {
                 args,
                 kwargs,
             } => {
-                let explicit_destroy = self.explicit_destroy_calls.contains(&span(e));
+                let explicit_destroy = self.checked_adjustments(e).iter().any(|adjustment| {
+                    matches!(adjustment, crate::SemanticAdjustment::ExplicitDestroy)
+                });
                 if let ExprKind::Identifier(type_name) = &object.kind
                     && !self.vars.iter().any(|name| name == type_name)
                 {
@@ -543,14 +1285,13 @@ impl Flatten<'_> {
                         .collect();
                     let d = self.fresh(span(e), None);
                     let target = self
-                        .overload_targets
-                        .get(&span(e))
-                        .cloned()
+                        .resolved_callable(e)
                         .unwrap_or_else(|| format!("{type_name}.{method}"));
                     let arg_places = args.iter().map(|arg| self.simple_place(arg)).collect();
                     self.emit(MirInstr::Call {
                         dest: d,
                         func: FuncRef::named(&target),
+                        raises: self.checked_raises(e),
                         args: regs,
                         kwargs: kw,
                         arg_places,
@@ -571,6 +1312,7 @@ impl Flatten<'_> {
                     self.emit(MirInstr::Call {
                         dest: d,
                         func: FuncRef::named(&format!("{name}.{method}")),
+                        raises: self.checked_raises(e),
                         args: regs,
                         kwargs: kw,
                         arg_places: vec![None; args.len()],
@@ -614,14 +1356,22 @@ impl Flatten<'_> {
                     dest: d,
                     recv,
                     method: method.clone(),
-                    resolved: self.overload_targets.get(&span(e)).cloned(),
+                    resolved: self.resolved_callable(e),
+                    raises: self.checked_raises(e),
                     args: regs,
                     kwargs: kw,
                     recv_place: if explicit_destroy { None } else { recv_place },
                     arg_places,
                 });
                 if explicit_destroy && let Some(place) = self.try_place(receiver_expr) {
-                    self.emit(MirInstr::ConsumeVar { var: place.root });
+                    if place.proj.is_empty() {
+                        self.emit(MirInstr::ConsumeVar { var: place.root });
+                    } else {
+                        self.emit(MirInstr::ConsumePlace {
+                            place,
+                            marker: recv,
+                        });
+                    }
                 }
                 d
             }
@@ -631,7 +1381,13 @@ impl Flatten<'_> {
                 // field is read — enabling field-sensitive partial-move checking
                 // (reading `p.b` after `p.a^` stays legal). A member of a temporary
                 // or an indexed base keeps the register-based `GetField`.
-                if let Some(place) = self.pure_field_place(e) {
+                let descriptor_field = matches!(
+                    self.checked_ty(object),
+                    Some(Ty::Struct(name, args))
+                        if matches!(name.as_str(), "Slice" | "ContiguousSlice" | "StridedSlice")
+                            && args.is_empty()
+                );
+                if !descriptor_field && let Some(place) = self.pure_field_place(e) {
                     let d = self.fresh(span(e), Some(place.root));
                     self.emit(MirInstr::LoadPlace { dest: d, place });
                     d
@@ -647,6 +1403,17 @@ impl Flatten<'_> {
                 }
             }
             ExprKind::Index { object, index } => {
+                // An indexed reference-bearing aggregate element is a storage
+                // place whose checked type is `ref T`; load through the stored
+                // handle exactly like a direct reference field.  Ordinary
+                // indexing remains the register-based operation below.
+                if matches!(self.checked_place_ty(e), Some(Ty::Ref(_)))
+                    && let Some(place) = self.try_place(e)
+                {
+                    let d = self.fresh(span(e), Some(place.root));
+                    self.emit(MirInstr::LoadPlace { dest: d, place });
+                    return d;
+                }
                 let base = self.expr(object);
                 let idx = self.expr(index);
                 let d = self.fresh(span(e), None);
@@ -661,29 +1428,91 @@ impl Flatten<'_> {
             // --- Aggregates ----------------------------------------------------
             ExprKind::ListLit(elems) => {
                 let regs = self.args(elems);
+                let element_type = match self.checked_ty(e) {
+                    Some(Ty::List(element)) => Some(*element),
+                    _ => None,
+                };
                 let d = self.fresh(span(e), None);
                 self.emit(MirInstr::MakeList {
                     dest: d,
                     elems: regs,
+                    element_type,
                 });
                 d
             }
+            ExprKind::BraceLit(entries) => {
+                let dictionary = entries.first().is_none_or(|(_, value)| value.is_some())
+                    && !matches!(self.checked_ty(e), Some(Ty::Set(_)));
+                let d = self.fresh(span(e), None);
+                if dictionary {
+                    let entries = entries
+                        .iter()
+                        .map(|(key, value)| {
+                            let key = self.expr(key);
+                            let value = self.expr(
+                                value
+                                    .as_ref()
+                                    .expect("checked dictionary display has paired values"),
+                            );
+                            (key, value)
+                        })
+                        .collect();
+                    let (key_type, value_type) = match self.checked_ty(e) {
+                        Some(Ty::Dict(key, value)) => (Some(*key), Some(*value)),
+                        _ => (None, None),
+                    };
+                    self.emit(MirInstr::MakeDict {
+                        dest: d,
+                        entries,
+                        key_type,
+                        value_type,
+                    });
+                } else {
+                    let elems = entries.iter().map(|(key, _)| self.expr(key)).collect();
+                    let element_type = match self.checked_ty(e) {
+                        Some(Ty::Set(element)) => Some(*element),
+                        _ => None,
+                    };
+                    self.emit(MirInstr::MakeSet {
+                        dest: d,
+                        elems,
+                        element_type,
+                    });
+                }
+                d
+            }
+            ExprKind::Comprehension {
+                kind,
+                key,
+                value,
+                clauses,
+            } => self.comprehension(e, *kind, key.as_deref(), value, clauses),
             ExprKind::TupleLit(elems) => {
                 let regs = self.args(elems);
+                let element_types = match self.checked_ty(e) {
+                    Some(Ty::Tuple(elements)) => Some(elements),
+                    _ => None,
+                };
                 let d = self.fresh(span(e), None);
                 self.emit(MirInstr::MakeTuple {
                     dest: d,
                     elems: regs,
+                    element_types,
                 });
                 d
             }
 
             // Walrus `:=` reaches MIR after type checking. Preserve an explicit
             // unsupported boundary rather than assigning accidental semantics.
-            ExprKind::Named { .. } => {
-                let d = self.fresh(span(e), None);
-                self.emit(MirInstr::Unsupported("the walrus operator ':='".into()));
-                d
+            ExprKind::Named { name, value } => {
+                let value = self.expr(value);
+                let var = self.var(name);
+                self.emit(MirInstr::DefVar {
+                    var,
+                    src: value,
+                    binding_ty: None,
+                });
+                value
             }
             // Ternary `a if cond else b` — a value-producing branch (like the
             // short-circuit lowering, but both arms assign the result).
@@ -701,29 +1530,156 @@ impl Flatten<'_> {
                 lower,
                 upper,
                 step,
+                ..
             } => {
                 let obj = self.expr(object);
                 let lower = lower.as_ref().map(|b| self.expr(b));
                 let upper = upper.as_ref().map(|b| self.expr(b));
                 let step = step.as_ref().map(|b| self.expr(b));
+                let kind = self
+                    .checked_adjustments(e)
+                    .into_iter()
+                    .find_map(|adjustment| match adjustment {
+                        crate::SemanticAdjustment::SliceDescriptors { descriptors, .. } => {
+                            descriptors.first().copied().flatten()
+                        }
+                        _ => None,
+                    })
+                    .expect("checked slice has a selected descriptor");
                 let d = self.fresh(span(e), None);
                 self.emit(MirInstr::Slice {
                     dest: d,
                     object: obj,
+                    kind,
                     lower,
                     upper,
                     step,
+                    resolved: self.resolved_callable(e),
                 });
                 d
+            }
+            ExprKind::MultiIndex { object, args } => {
+                let object = self.expr(object);
+                let descriptors = self
+                    .checked_adjustments(e)
+                    .into_iter()
+                    .find_map(|adjustment| match adjustment {
+                        crate::SemanticAdjustment::SliceDescriptors { descriptors, .. } => {
+                            Some(descriptors)
+                        }
+                        _ => None,
+                    })
+                    .expect("checked multi-subscript has descriptor metadata");
+                let args = args
+                    .iter()
+                    .zip(descriptors)
+                    .map(|(argument, descriptor)| match argument {
+                        crate::ast::SubscriptArg::Index(value) => {
+                            debug_assert!(descriptor.is_none());
+                            MirSubscriptArg::Index(self.expr(value))
+                        }
+                        crate::ast::SubscriptArg::Slice {
+                            lower, upper, step, ..
+                        } => MirSubscriptArg::Slice {
+                            kind: descriptor.expect("slice argument has descriptor kind"),
+                            lower: lower.as_ref().map(|value| self.expr(value)),
+                            upper: upper.as_ref().map(|value| self.expr(value)),
+                            step: step.as_ref().map(|value| self.expr(value)),
+                        },
+                    })
+                    .collect();
+                let dest = self.fresh(span(e), None);
+                self.emit(MirInstr::MultiIndex {
+                    dest,
+                    object,
+                    args,
+                    resolved: self.resolved_callable(e),
+                });
+                dest
             }
             // These are flagged `Unsupported`/rejected by the *checker*, so a checked
             // program never reaches MIR lowering with them. A bare `TypeApply` is a
             // type used as a value (only valid as a static-method receiver, handled
             // in the `MethodCall` arm above).
-            ExprKind::TypeValue(_)
-            | ExprKind::BraceLit(_)
-            | ExprKind::TypeApply { .. }
-            | ExprKind::TString { .. } => {
+            ExprKind::TString { parts, .. } => {
+                let mut result = self.fresh(span(e), None);
+                self.emit(MirInstr::Const {
+                    dest: result,
+                    k: Const::Str(String::new()),
+                });
+                for part in parts {
+                    let piece = match part {
+                        TStringPart::Literal(text) => {
+                            let register = self.fresh(span(e), None);
+                            self.emit(MirInstr::Const {
+                                dest: register,
+                                k: Const::Str(text.clone()),
+                            });
+                            register
+                        }
+                        TStringPart::Expr(value) => {
+                            let argument = self.expr(value);
+                            let register = self.fresh(span(value), None);
+                            self.emit(MirInstr::Call {
+                                dest: register,
+                                func: FuncRef::named("String"),
+                                raises: None,
+                                args: vec![argument],
+                                kwargs: Vec::new(),
+                                arg_places: vec![None],
+                                param_arg_regs: Vec::new(),
+                            });
+                            register
+                        }
+                    };
+                    let joined = self.fresh(span(e), None);
+                    self.emit(MirInstr::BinOp {
+                        op: InfixOp::Add,
+                        dest: joined,
+                        a: result,
+                        b: piece,
+                    });
+                    result = joined;
+                }
+                result
+            }
+            ExprKind::TypeApply { name, .. }
+                if self.checked_adjustments(e).iter().any(|adjustment| {
+                    matches!(adjustment, crate::SemanticAdjustment::VariantProject { .. })
+                }) =>
+            {
+                let index = self
+                    .checked_adjustments(e)
+                    .into_iter()
+                    .find_map(|adjustment| match adjustment {
+                        crate::SemanticAdjustment::VariantProject { index, .. } => Some(index),
+                        _ => None,
+                    })
+                    .expect("checked Variant projection carries a tag");
+                let mut place = self.resolved_place(name);
+                if place.root_ty.is_none() {
+                    place.root_ty = Some(Ty::Variant(
+                        self.checked_adjustments(e)
+                            .into_iter()
+                            .find_map(|adjustment| match adjustment {
+                                crate::SemanticAdjustment::VariantProject {
+                                    alternatives, ..
+                                } => Some(alternatives),
+                                _ => None,
+                            })
+                            .unwrap_or_default(),
+                    ));
+                }
+                let ty = self
+                    .checked_place_ty(e)
+                    .or_else(|| self.checked_ty(e))
+                    .expect("checked Variant projection has a payload type");
+                place.project(Proj::Variant(index), ty);
+                let dest = self.fresh(span(e), Some(place.root));
+                self.emit(MirInstr::LoadPlace { dest, place });
+                dest
+            }
+            ExprKind::TypeValue(_) | ExprKind::TypeApply { .. } => {
                 let dest = self.fresh(span(e), None);
                 self.emit(MirInstr::Unsupported(format!(
                     "unchecked expression reached MIR lowering: {:?}",
@@ -742,20 +1698,16 @@ impl Flatten<'_> {
     /// a scalar alias (`Int32(x)`, `Float32(x)`, …) — resolve its dtype/width and
     /// emit a [`MirInstr::MakeSimd`], returning its result register. Otherwise
     /// `None`, and the caller lowers it as an ordinary call.
-    fn try_simd_call(
-        &mut self,
-        e: &Expr,
-        name: &str,
-        param_args: &[ParamArg],
-        args: &[Expr],
-    ) -> Option<Reg> {
-        let (dtype, width) = if name == "SIMD" {
-            let dtype = dtype_from_param_arg(param_args.first()?)?;
-            let width = ct_int(param_args.get(1)?)? as usize;
-            (dtype, width)
-        } else {
-            (Dtype::from_scalar_alias(name)?, 1)
-        };
+    fn try_simd_call(&mut self, e: &Expr, args: &[Expr]) -> Option<Reg> {
+        let (dtype, width) = self
+            .checked_adjustments(e)
+            .into_iter()
+            .find_map(|adjustment| match adjustment {
+                crate::SemanticAdjustment::ConstructSimd { dtype, width } => {
+                    usize::try_from(width).ok().map(|width| (dtype, width))
+                }
+                _ => None,
+            })?;
         let elems = self.args(args);
         let d = self.fresh(span(e), None);
         self.emit(MirInstr::MakeSimd {
@@ -767,42 +1719,39 @@ impl Flatten<'_> {
         Some(d)
     }
 
-    /// Lower a call to a nested `def` (`info`), prepending the captured enclosing
-    /// locals as leading arguments — each read as a value **and** kept as a place,
-    /// so the lifted function's `mut` capture parameters write back (reference
-    /// semantics). The declared `args` follow. Captures come first so they align
-    /// with the lifted function's parameter order.
+    /// Lower a call to a nested `def` through the same closure-environment path as
+    /// a first-class closure value. This preserves reference handles across sibling
+    /// calls and recursion; it does not rely on call-return write-back.
     fn lower_nested_call(&mut self, e: &Expr, info: &NestedInfo, args: &[Expr]) -> Reg {
-        let mut arg_regs: Vec<Reg> = Vec::new();
-        let mut arg_places: Vec<Option<MirPlace>> = Vec::new();
-        for cap in &info.captures {
-            let var = self.var(cap);
-            let r = self.fresh(span(e), Some(var));
-            self.emit(MirInstr::UseVar {
-                dest: r,
-                var,
-                mode: UseMode::Copy,
-            });
-            arg_regs.push(r);
-            arg_places.push(Some(MirPlace {
-                root: var,
-                proj: Vec::new(),
-                through: None,
-            }));
-        }
-        for a in args {
-            arg_regs.push(self.expr(a));
-            arg_places.push(self.simple_place(a));
-        }
+        let captures = info
+            .captures
+            .iter()
+            .map(|capture| MirClosureCapture {
+                place: self.resolved_place(&capture.name),
+                moved: capture.kind == crate::ast::CaptureKind::Move,
+            })
+            .collect();
+        let callee = self.fresh(span(e), None);
+        self.emit(MirInstr::MakeClosure {
+            dest: callee,
+            function: info.mangled.clone(),
+            captures,
+        });
+        let arg_regs = self.args(args);
         let d = self.fresh(span(e), None);
-        self.emit(MirInstr::Call {
+        self.emit(MirInstr::CallIndirect {
             dest: d,
-            func: FuncRef::named(&info.mangled),
+            callee,
+            raises: self.checked_raises(e),
             args: arg_regs,
             kwargs: Vec::new(),
-            arg_places,
-            param_arg_regs: Vec::new(),
         });
+        for capture in &info.captures {
+            if capture.kind != crate::ast::CaptureKind::Move {
+                let var = self.var(&capture.name);
+                self.emit(MirInstr::KeepAlive { var });
+            }
+        }
         d
     }
 
@@ -823,9 +1772,15 @@ impl Flatten<'_> {
             HirInstr::Bind {
                 dest,
                 expr,
-                source_annotation,
+                binding_ty,
             } => {
-                let src = self.expr(expr);
+                let mut index = HashMap::new();
+                index_hir_expression(&expr.syntax, expr, &mut index);
+                self.active_semantics.push(index);
+                let src = self.expr(&expr.syntax);
+                if let Some(ty) = expr.ty.clone().or_else(|| binding_ty.clone()) {
+                    self.var_types.insert(*dest, ty);
+                }
                 if let Some((mut place, _)) = self.aliases.get(dest).cloned() {
                     place.through = Some(*dest);
                     self.emit(MirInstr::Store { place, src });
@@ -833,10 +1788,10 @@ impl Flatten<'_> {
                     let handle = self.fresh(expr.source_span(), Some(*dest));
                     self.emit(MirInstr::MakeRef {
                         dest: handle,
-                        place: MirPlace {
-                            root: *dest,
-                            proj: Vec::new(),
-                            through: Some(*dest),
+                        place: {
+                            let mut place = MirPlace::root(*dest, expr.ty.clone());
+                            place.through = Some(*dest);
+                            place
                         },
                     });
                     self.emit(MirInstr::WriteRef {
@@ -847,25 +1802,49 @@ impl Flatten<'_> {
                     self.emit(MirInstr::DefVar {
                         var: *dest,
                         src,
-                        source_annotation: source_annotation.clone(),
+                        binding_ty: binding_ty.clone(),
                     });
+                    let aggregate_loans = self.aggregate_borrows(expr);
+                    for (place, mutable) in &aggregate_loans {
+                        let marker = self.fresh(expr.source_span(), Some(place.root));
+                        self.emit(MirInstr::BeginLoan {
+                            reference: *dest,
+                            place: place.clone(),
+                            mutable: *mutable,
+                            marker,
+                        });
+                    }
+                    if aggregate_loans.is_empty() {
+                        self.aggregate_loans.remove(dest);
+                    } else {
+                        self.aggregate_loans.insert(*dest, aggregate_loans);
+                    }
                 }
+                self.active_semantics.pop();
             }
             HirInstr::Eval(e) => {
-                let _ = self.expr(e); // evaluated for its effect; result discarded
+                let _ = self.expr_hir(e); // evaluated for its effect; result discarded
             }
-            HirInstr::Stmt(s) => self.lower_stmt(s, outer_map),
+            HirInstr::Stmt(s) => self.lower_hir_stmt(s, outer_map),
             // A `try` whose enclosing loops are function-level: lower each sub-region
             // seeded with those loops (`loop_targets`, HIR function block ids), so an
             // outward `break`/`continue` becomes an `EscapeJump` resolved via
             // `outer_map`.
             HirInstr::Try { stmt, loop_targets } => {
+                let mut index = HashMap::new();
+                for (syntax, expression) in statement_expression_roots(&stmt.syntax)
+                    .into_iter()
+                    .zip(&stmt.expressions)
+                {
+                    index_hir_expression(syntax, expression, &mut index);
+                }
+                self.active_semantics.push(index);
                 if let StmtKind::Try {
                     body,
                     except,
                     orelse,
                     finalbody,
-                } = &stmt.kind
+                } = &stmt.syntax.kind
                 {
                     self.emit_try(body, except, orelse, finalbody, loop_targets, outer_map);
                 } else {
@@ -873,6 +1852,7 @@ impl Flatten<'_> {
                         "malformed HIR try instruction".to_string(),
                     ));
                 }
+                self.active_semantics.pop();
             }
             HirInstr::Drop(var) => {
                 self.emit(MirInstr::DropVar { var: *var });
@@ -880,31 +1860,37 @@ impl Flatten<'_> {
             // Iterator protocol: compute into a register, then store to the target
             // variable (so the header's branch can read `has_next` as a `UseVar`,
             // and the body binds the loop variable).
-            HirInstr::GetIter { iter } => {
-                self.emit(MirInstr::GetIter { iter: *iter });
+            HirInstr::GetIter { iter, protocol } => {
+                self.emit(MirInstr::GetIter {
+                    iter: *iter,
+                    mode: protocol.mode,
+                    prepare: protocol.prepare.clone(),
+                });
             }
-            HirInstr::HasNext { iter, dest } => {
+            HirInstr::HasNext { iter, dest, method } => {
                 let r = self.fresh(SourceSpan::new(None, DUMMY_SPAN), None);
                 self.emit(MirInstr::HasNext {
                     dest: r,
                     iter: *iter,
+                    method: method.clone(),
                 });
                 self.emit(MirInstr::DefVar {
                     var: *dest,
                     src: r,
-                    source_annotation: None,
+                    binding_ty: None,
                 });
             }
-            HirInstr::Next { iter, dest } => {
+            HirInstr::Next { iter, dest, method } => {
                 let r = self.fresh(SourceSpan::new(None, DUMMY_SPAN), Some(*iter));
                 self.emit(MirInstr::Next {
                     dest: r,
                     iter: *iter,
+                    method: method.clone(),
                 });
                 self.emit(MirInstr::DefVar {
                     var: *dest,
                     src: r,
-                    source_annotation: None,
+                    binding_ty: None,
                 });
             }
         }
@@ -916,29 +1902,126 @@ impl Flatten<'_> {
     /// is a variable (or `self`), so a non-variable root is unreachable.
     fn place(&mut self, e: &Expr) -> MirPlace {
         match &e.kind {
-            ExprKind::Identifier(name) => self.resolved_place(name),
+            ExprKind::Identifier(name) => self.expression_place_root(name, e),
             ExprKind::Member { object, field } => {
                 let mut p = self.place(object);
-                p.proj.push(Proj::Field(field.clone()));
+                if let Some(ty) = self.checked_place_ty(e).or_else(|| self.checked_ty(e)) {
+                    p.project(Proj::Field(field.clone()), ty);
+                } else {
+                    p.proj.push(Proj::Field(field.clone()));
+                }
                 p
             }
             ExprKind::Index { object, index } => {
                 let mut p = self.place(object);
                 let idx = self.expr(index); // evaluated once, before the store
-                p.proj.push(Proj::Index(idx));
+                if let Some(ty) = self.checked_place_ty(e).or_else(|| self.checked_ty(e)) {
+                    p.project(Proj::Index(idx), ty);
+                } else {
+                    p.proj.push(Proj::Index(idx));
+                }
+                p
+            }
+            ExprKind::TypeApply { name, .. } => {
+                let index = self
+                    .checked_adjustments(e)
+                    .into_iter()
+                    .find_map(|adjustment| match adjustment {
+                        crate::SemanticAdjustment::VariantProject { index, .. } => Some(index),
+                        _ => None,
+                    })
+                    .expect("only checked Variant projection is a place TypeApply");
+                let mut p = self.resolved_place(name);
+                let ty = self
+                    .checked_place_ty(e)
+                    .or_else(|| self.checked_ty(e))
+                    .expect("checked Variant projection has a payload type");
+                p.project(Proj::Variant(index), ty);
                 p
             }
             other => {
                 self.emit(MirInstr::Unsupported(format!(
                     "invalid assignment place reached MIR lowering: {other:?}"
                 )));
-                MirPlace {
-                    root: self.var("$invalid_place"),
-                    proj: Vec::new(),
-                    through: None,
-                }
+                MirPlace::root(self.var("$invalid_place"), None)
             }
         }
+    }
+
+    /// Lower a slice or multidimensional assignment through the checker-selected
+    /// `__setitem__` implementation. Unlike an ordinary `MirPlace` projection,
+    /// every slice remains a first-class descriptor argument and the receiver
+    /// place is retained for `mut self` write-back.
+    fn lower_subscript_set(&mut self, target: &Expr, value: Reg) -> bool {
+        let (object, source_arguments): (&Expr, Option<&[crate::ast::SubscriptArg]>) =
+            match &target.kind {
+                ExprKind::Slice { object, .. } => (object, None),
+                ExprKind::MultiIndex { object, args } => (object, Some(args)),
+                _ => return false,
+            };
+        let Some((descriptors, value_keyword)) = self
+            .checked_adjustments(target)
+            .into_iter()
+            .find_map(|adjustment| match adjustment {
+                crate::SemanticAdjustment::SliceDescriptors {
+                    descriptors,
+                    set_value_keyword,
+                } => Some((descriptors, set_value_keyword)),
+                _ => None,
+            })
+        else {
+            self.emit(MirInstr::Unsupported(
+                "checked subscript assignment lacks descriptor metadata".to_string(),
+            ));
+            return true;
+        };
+
+        let args = if let Some(arguments) = source_arguments {
+            arguments
+                .iter()
+                .zip(descriptors)
+                .map(|(argument, descriptor)| match argument {
+                    crate::ast::SubscriptArg::Index(value) => {
+                        debug_assert!(descriptor.is_none());
+                        MirSubscriptArg::Index(self.expr(value))
+                    }
+                    crate::ast::SubscriptArg::Slice {
+                        lower, upper, step, ..
+                    } => MirSubscriptArg::Slice {
+                        kind: descriptor.expect("slice assignment argument has descriptor kind"),
+                        lower: lower.as_ref().map(|bound| self.expr(bound)),
+                        upper: upper.as_ref().map(|bound| self.expr(bound)),
+                        step: step.as_ref().map(|bound| self.expr(bound)),
+                    },
+                })
+                .collect()
+        } else {
+            let ExprKind::Slice {
+                lower, upper, step, ..
+            } = &target.kind
+            else {
+                unreachable!("single descriptor assignment is a Slice")
+            };
+            vec![MirSubscriptArg::Slice {
+                kind: descriptors
+                    .first()
+                    .copied()
+                    .flatten()
+                    .expect("slice assignment has descriptor kind"),
+                lower: lower.as_ref().map(|bound| self.expr(bound)),
+                upper: upper.as_ref().map(|bound| self.expr(bound)),
+                step: step.as_ref().map(|bound| self.expr(bound)),
+            }]
+        };
+        let receiver_place = self.place(object);
+        self.emit(MirInstr::MultiSet {
+            receiver_place,
+            args,
+            value,
+            value_keyword,
+            resolved: self.resolved_callable(target),
+        });
+        true
     }
 
     /// Like [`place`](Self::place), but returns `None` for a non-place expression
@@ -956,18 +2039,21 @@ impl Flatten<'_> {
         ext_loops: &[(hir::BlockId, hir::BlockId)],
         outer_map: &HashMap<hir::BlockId, MirBlockId>,
     ) -> Vec<MirBlock> {
-        let region_cfg = hir::Cfg::build_seeded_with_loops(self.vars.clone(), body, ext_loops);
+        let checked: Vec<_> = self.checked_expressions.values().cloned().collect();
+        let region_cfg =
+            hir::Cfg::build_seeded_checked_with_loops(self.vars.clone(), body, ext_loops, &checked);
         let mut region = MirFunction {
             blocks: Vec::new(),
             n_regs: 0,
             n_vars: 0,
             var_names: Vec::new(),
             n_params: 0,
-            param_annotations: Vec::new(),
+            param_types: Vec::new(),
             owned_params: Vec::new(),
             ref_params: Vec::new(),
             returns_reference: self.returns_reference,
             spans: std::mem::take(&mut self.f.spans), // accumulate into the shared table
+            reg_types: std::mem::take(&mut self.f.reg_types),
         };
         let mut map: HashMap<hir::BlockId, MirBlockId> = HashMap::new();
         for hb in region_cfg.g.node_indices() {
@@ -983,13 +2069,15 @@ impl Flatten<'_> {
                 cur: 0,
                 next_reg: self.next_reg,
                 vars: region_cfg.vars.clone(),
+                var_types: region_cfg.var_types.clone(),
+                owner_vars: self.owner_vars.clone(),
                 nested: self.nested.clone(), // a `try` region may call a nested `def`
                 overloads: self.overloads.clone(),
-                overload_targets: self.overload_targets.clone(),
-                implicit_conversions: self.implicit_conversions.clone(),
-                explicit_destroy_calls: self.explicit_destroy_calls.clone(),
+                checked_expressions: self.checked_expressions.clone(),
+                active_semantics: Vec::new(),
                 aliases: self.aliases.clone(),
                 runtime_aliases: self.runtime_aliases.clone(),
+                aggregate_loans: self.aggregate_loans.clone(),
                 returns_reference: self.returns_reference,
             };
             for hb in region_cfg.g.node_indices() {
@@ -1006,8 +2094,11 @@ impl Flatten<'_> {
             }
             self.next_reg = fl.next_reg;
             self.vars = fl.vars.clone();
+            self.var_types = fl.var_types.clone();
+            self.owner_vars = fl.owner_vars.clone();
         }
         self.f.spans = std::mem::take(&mut region.spans);
+        self.f.reg_types = std::mem::take(&mut region.reg_types);
         region.blocks
     }
 
@@ -1056,10 +2147,30 @@ impl Flatten<'_> {
     /// the VM). Distinct from [`Self::try_place`], which emits index evaluations.
     fn simple_place(&mut self, e: &Expr) -> Option<MirPlace> {
         match &e.kind {
-            ExprKind::Identifier(name) => Some(self.resolved_place(name)),
+            ExprKind::Identifier(name) => Some(self.expression_place_root(name, e)),
             ExprKind::Member { object, field } => {
+                if self.is_slice_descriptor(object) {
+                    return None;
+                }
                 let mut p = self.simple_place(object)?;
-                p.proj.push(Proj::Field(field.clone()));
+                if let Some(ty) = self.checked_place_ty(e).or_else(|| self.checked_ty(e)) {
+                    p.project(Proj::Field(field.clone()), ty);
+                } else {
+                    p.proj.push(Proj::Field(field.clone()));
+                }
+                Some(p)
+            }
+            ExprKind::TypeApply { name, .. } => {
+                let index = self
+                    .checked_adjustments(e)
+                    .into_iter()
+                    .find_map(|adjustment| match adjustment {
+                        crate::SemanticAdjustment::VariantProject { index, .. } => Some(index),
+                        _ => None,
+                    })?;
+                let mut p = self.resolved_place(name);
+                let ty = self.checked_place_ty(e).or_else(|| self.checked_ty(e))?;
+                p.project(Proj::Variant(index), ty);
                 Some(p)
             }
             _ => None,
@@ -1079,11 +2190,18 @@ impl Flatten<'_> {
                 // searches a struct's `value_params`. `Self` never appears bare in an
                 // expression (only `Self.field`), so this alias is safe.
                 let root = if name == "Self" { "self" } else { name };
-                Some(self.resolved_place(root))
+                Some(self.expression_place_root(root, e))
             }
             ExprKind::Member { object, field } => {
+                if self.is_slice_descriptor(object) {
+                    return None;
+                }
                 let mut p = self.pure_field_place(object)?;
-                p.proj.push(Proj::Field(field.clone()));
+                if let Some(ty) = self.checked_place_ty(e).or_else(|| self.checked_ty(e)) {
+                    p.project(Proj::Field(field.clone()), ty);
+                } else {
+                    p.proj.push(Proj::Field(field.clone()));
+                }
                 Some(p)
             }
             _ => None,
@@ -1092,16 +2210,40 @@ impl Flatten<'_> {
 
     fn try_place(&mut self, e: &Expr) -> Option<MirPlace> {
         match &e.kind {
-            ExprKind::Identifier(name) => Some(self.resolved_place(name)),
+            ExprKind::Identifier(name) => Some(self.expression_place_root(name, e)),
             ExprKind::Member { object, field } => {
+                if self.is_slice_descriptor(object) {
+                    return None;
+                }
                 let mut p = self.try_place(object)?;
-                p.proj.push(Proj::Field(field.clone()));
+                if let Some(ty) = self.checked_place_ty(e).or_else(|| self.checked_ty(e)) {
+                    p.project(Proj::Field(field.clone()), ty);
+                } else {
+                    p.proj.push(Proj::Field(field.clone()));
+                }
                 Some(p)
             }
             ExprKind::Index { object, index } => {
                 let mut p = self.try_place(object)?;
                 let idx = self.expr(index);
-                p.proj.push(Proj::Index(idx));
+                if let Some(ty) = self.checked_place_ty(e).or_else(|| self.checked_ty(e)) {
+                    p.project(Proj::Index(idx), ty);
+                } else {
+                    p.proj.push(Proj::Index(idx));
+                }
+                Some(p)
+            }
+            ExprKind::TypeApply { name, .. } => {
+                let index = self
+                    .checked_adjustments(e)
+                    .into_iter()
+                    .find_map(|adjustment| match adjustment {
+                        crate::SemanticAdjustment::VariantProject { index, .. } => Some(index),
+                        _ => None,
+                    })?;
+                let mut p = self.resolved_place(name);
+                let ty = self.checked_place_ty(e).or_else(|| self.checked_ty(e))?;
+                p.project(Proj::Variant(index), ty);
                 Some(p)
             }
             _ => None,
@@ -1117,14 +2259,17 @@ impl Flatten<'_> {
                 let reference = self.var(name);
                 if !matches!(
                     value.kind,
-                    ExprKind::Identifier(_) | ExprKind::Member { .. } | ExprKind::Index { .. }
+                    ExprKind::Identifier(_)
+                        | ExprKind::Member { .. }
+                        | ExprKind::Index { .. }
+                        | ExprKind::TypeApply { .. }
                 ) {
                     let source = self.expr(value);
                     self.runtime_aliases.insert(reference);
                     self.emit(MirInstr::DefVar {
                         var: reference,
                         src: source,
-                        source_annotation: None,
+                        binding_ty: None,
                     });
                     let candidates: Vec<&Expr> = match &value.kind {
                         ExprKind::Call { args, kwargs, .. } => args
@@ -1169,8 +2314,26 @@ impl Flatten<'_> {
             // --- Writes through a place (any nesting) --------------------------
             StmtKind::SetPlace { place, value } => {
                 let src = self.expr(value);
+                if self.lower_subscript_set(place, src) {
+                    return;
+                }
                 let p = self.place(place);
-                self.emit(MirInstr::Store { place: p, src });
+                let stores_reference = matches!(p.ty, Some(Ty::Ref(_)))
+                    && self.checked_adjustments(value).iter().any(|adjustment| {
+                        matches!(
+                            adjustment,
+                            crate::SemanticAdjustment::BorrowShared
+                                | crate::SemanticAdjustment::BorrowMutable
+                        )
+                    });
+                if stores_reference {
+                    self.emit(MirInstr::StoreRef {
+                        place: p,
+                        reference: src,
+                    });
+                } else {
+                    self.emit(MirInstr::Store { place: p, src });
+                }
             }
             StmtKind::AugAssign { place, op, value } => {
                 // `place OP= e` — read the place, apply the op, write it back. A bare
@@ -1179,12 +2342,7 @@ impl Flatten<'_> {
                 // the place flattened once so its indices are evaluated once.
                 if let ExprKind::Identifier(name) = &place.kind {
                     let var = self.var(name);
-                    let cur = self.fresh(span(place), Some(var));
-                    self.emit(MirInstr::UseVar {
-                        dest: cur,
-                        var,
-                        mode: UseMode::Copy,
-                    });
+                    let cur = self.expr(place);
                     let rhs = self.expr(value);
                     let res = self.fresh(span(place), None);
                     self.emit(MirInstr::BinOp {
@@ -1193,11 +2351,34 @@ impl Flatten<'_> {
                         a: cur,
                         b: rhs,
                     });
-                    self.emit(MirInstr::DefVar {
-                        var,
-                        src: res,
-                        source_annotation: None,
-                    });
+                    if self.runtime_aliases.contains(&var) {
+                        let handle = self.fresh(place.source_span(), Some(var));
+                        self.emit(MirInstr::MakeRef {
+                            dest: handle,
+                            place: {
+                                let mut place =
+                                    MirPlace::root(var, self.var_types.get(&var).cloned());
+                                place.through = Some(var);
+                                place
+                            },
+                        });
+                        self.emit(MirInstr::WriteRef {
+                            reference: handle,
+                            value: res,
+                        });
+                    } else if let Some((mut target, _)) = self.aliases.get(&var).cloned() {
+                        target.through = Some(var);
+                        self.emit(MirInstr::Store {
+                            place: target,
+                            src: res,
+                        });
+                    } else {
+                        self.emit(MirInstr::DefVar {
+                            var,
+                            src: res,
+                            binding_ty: None,
+                        });
+                    }
                 } else {
                     let p = self.place(place);
                     let cur = self.fresh(span(place), None);
@@ -1229,7 +2410,7 @@ impl Flatten<'_> {
                 self.emit(MirInstr::DefVar {
                     var,
                     src,
-                    source_annotation: None,
+                    binding_ty: None,
                 });
             }
             // `pass` has no runtime effect. Imports were consumed by linking and
@@ -1272,8 +2453,8 @@ impl Flatten<'_> {
             // A nested `def` that was lifted (registered in `nested`) is a no-op
             // here — its body is a separate function and calls are rewritten to it.
             StmtKind::Def { name, .. } if self.nested.contains_key(name) => {}
-            // A nested `def` we couldn't lift (generic, calls a sibling, or nests
-            // deeper), or a nested `struct`/`trait`, stays a clean `Unsupported`.
+            // A nested `def` we couldn't lift because it nests another declaration,
+            // or a nested `struct`/`trait`, stays a clean `Unsupported`.
             StmtKind::Def { .. } | StmtKind::Struct { .. } | StmtKind::Trait { .. } => self.emit(
                 MirInstr::Unsupported("nested def/struct/trait declaration".into()),
             ),
@@ -1300,7 +2481,7 @@ impl Flatten<'_> {
                             self.emit(MirInstr::DefVar {
                                 var,
                                 src: elem,
-                                source_annotation: None,
+                                binding_ty: None,
                             });
                         }
                         _ => {
@@ -1339,6 +2520,23 @@ impl Flatten<'_> {
         }
     }
 
+    fn lower_hir_stmt(
+        &mut self,
+        statement: &crate::hir::HirStmt,
+        outer_map: &HashMap<hir::BlockId, MirBlockId>,
+    ) {
+        let mut index = HashMap::new();
+        for (syntax, expression) in statement_expression_roots(&statement.syntax)
+            .into_iter()
+            .zip(&statement.expressions)
+        {
+            index_hir_expression(syntax, expression, &mut index);
+        }
+        self.active_semantics.push(index);
+        self.lower_stmt(&statement.syntax, outer_map);
+        self.active_semantics.pop();
+    }
+
     /// Lower a HIR block terminator; the branch/return operands are flattened into
     /// `self.cur` first, then the `MirTerm` references their result registers.
     fn lower_term(
@@ -1354,7 +2552,7 @@ impl Flatten<'_> {
                 then_b,
                 else_b,
             } => {
-                let c = self.expr(cond); // the condition is evaluated at the end of this block
+                let c = self.expr_hir(cond); // evaluated at the end of this block
                 MirTerm::Branch {
                     cond: c,
                     then_b: map[then_b],
@@ -1363,12 +2561,12 @@ impl Flatten<'_> {
             }
             Terminator::Return(e) => MirTerm::Return(e.as_ref().map(|e| {
                 if self.returns_reference {
-                    let place = self.place(e);
+                    let place = self.place_hir(e);
                     let dest = self.fresh(e.source_span(), Some(place.root));
                     self.emit(MirInstr::MakeRef { dest, place });
                     dest
                 } else {
-                    self.expr(e)
+                    self.expr_hir(e)
                 }
             })),
             Terminator::FallOff => MirTerm::FallOff,
@@ -1391,10 +2589,8 @@ pub fn lower_cfg(cfg: &Cfg) -> MirFunction {
         cfg,
         &HashMap::new(),
         &crate::symbol::OverloadSets::default(),
-        &HashMap::new(),
-        &HashMap::new(),
-        &std::collections::HashSet::new(),
         false,
+        &[],
     )
 }
 
@@ -1405,10 +2601,8 @@ fn lower_cfg_nested(
     cfg: &Cfg,
     nested: &HashMap<String, NestedInfo>,
     overloads: &crate::symbol::OverloadSets,
-    overload_targets: &HashMap<SourceSpan, String>,
-    implicit_conversions: &HashMap<SourceSpan, String>,
-    explicit_destroy_calls: &std::collections::HashSet<SourceSpan>,
     returns_reference: bool,
+    reference_parameters: &[bool],
 ) -> MirFunction {
     let mut mir = MirFunction {
         blocks: Vec::new(),
@@ -1416,11 +2610,12 @@ fn lower_cfg_nested(
         n_vars: cfg.vars.len(),
         var_names: cfg.vars.clone(),
         n_params: cfg.n_params,
-        param_annotations: Vec::new(),
+        param_types: Vec::new(),
         owned_params: Vec::new(),
         ref_params: Vec::new(),
         returns_reference,
         spans: SpanTable::default(),
+        reg_types: HashMap::new(),
     };
 
     // One empty MIR block per HIR block; record the HIR→MIR index mapping so
@@ -1440,13 +2635,20 @@ fn lower_cfg_nested(
             cur: 0,
             next_reg: 0,
             vars: cfg.vars.clone(),
+            var_types: cfg.var_types.clone(),
+            owner_vars: HashMap::new(),
             nested: nested.clone(),
             overloads: overloads.clone(),
-            overload_targets: overload_targets.clone(),
-            implicit_conversions: implicit_conversions.clone(),
-            explicit_destroy_calls: explicit_destroy_calls.clone(),
+            checked_expressions: cfg.checked_expressions.clone(),
+            active_semantics: Vec::new(),
             aliases: HashMap::new(),
-            runtime_aliases: std::collections::HashSet::new(),
+            runtime_aliases: reference_parameters
+                .iter()
+                .take(cfg.n_params)
+                .enumerate()
+                .filter_map(|(slot, reference)| reference.then_some(slot as VarId))
+                .collect(),
+            aggregate_loans: HashMap::new(),
             returns_reference,
         };
         for hb in cfg.g.node_indices() {
@@ -1534,6 +2736,36 @@ pub struct MirFunctionDeclaration {
     pub param_decls: Vec<(String, bool)>,
 }
 
+/// Translate a source parameter marker into the runtime frame layout. Named
+/// `out` results are callee-local slots, so they do not consume an incoming
+/// argument position; variadic collectors do consume one frame position.
+fn runtime_parameter_index(params: &[FnParam], marker: Option<usize>) -> Option<usize> {
+    marker.map(|index| {
+        params[..index]
+            .iter()
+            .filter(|parameter| {
+                !matches!(parameter.convention, Some(ArgConvention::Out))
+                    && parameter.kind != ParamKind::KwVariadic
+            })
+            .count()
+    })
+}
+
+/// `*args` is inserted among regular incoming arguments before the collector is
+/// materialized, so only preceding non-`out` regular parameters determine its
+/// insertion point.
+fn runtime_variadic_index(params: &[FnParam], marker: Option<usize>) -> Option<usize> {
+    marker.map(|index| {
+        params[..index]
+            .iter()
+            .filter(|parameter| {
+                parameter.kind == ParamKind::Regular
+                    && !matches!(parameter.convention, Some(ArgConvention::Out))
+            })
+            .count()
+    })
+}
+
 mod nested;
 use nested::*;
 
@@ -1557,9 +2789,6 @@ pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
     let mut invariant_errors = Vec::new();
     let mut toplevel: Vec<Stmt> = Vec::new();
     let overloads = crate::symbol::OverloadSets::scan(program);
-    let overload_targets = checked.overload_targets().clone();
-    let implicit_conversions = checked.implicit_conversions().clone();
-    let explicit_destroy_calls = checked.explicit_destroy_calls().clone();
 
     for s in program {
         match &s.kind {
@@ -1586,7 +2815,25 @@ pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
                 if let Some(result) = named_result {
                     names.push(result.name.clone());
                 }
-                let ptys = caller_params.iter().map(|p| p.ty.clone()).collect();
+                let ptys = caller_params
+                    .iter()
+                    .map(|p| {
+                        let param = params
+                            .iter()
+                            .position(|candidate| std::ptr::eq(candidate, *p))
+                            .expect("caller parameter belongs to declaration");
+                        checked_type_or_record(
+                            checked,
+                            AnnotationSite::FunctionParam {
+                                module: s.module.clone(),
+                                declaration: s.span,
+                                param,
+                            },
+                            &format!("parameter '{}' of function '{name}'", p.name),
+                            &mut invariant_errors,
+                        )
+                    })
+                    .collect();
                 let owned = caller_params
                     .iter()
                     .map(|p| is_owned(&p.convention))
@@ -1644,7 +2891,7 @@ pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
                             &mut invariant_errors,
                         )
                     }),
-                    variadic_index: regular_marker_index(params, variadic_idx),
+                    variadic_index: runtime_variadic_index(params, variadic_idx),
                     kw_variadic: kw_variadic_idx.map(|i| {
                         checked_type_or_record(
                             checked,
@@ -1657,25 +2904,23 @@ pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
                             &mut invariant_errors,
                         )
                     }),
-                    kw_variadic_index: kw_variadic_idx,
+                    kw_variadic_index: runtime_parameter_index(params, kw_variadic_idx),
                     positional_only: regular_marker_index(params, *positional_only),
                     keyword_only: effective_keyword_only_index(params, *keyword_only, variadic_idx),
                     param_decls: crate::runtime::classify_param_decls(type_params),
                 });
                 lower_fn_nested(
                     FunctionLowering {
+                        checked,
                         name: &lowered_name,
                         parameter_names: &names,
-                        parameter_annotations: ptys,
+                        parameter_types: ptys,
                         owned_parameters: owned,
                         reference_parameters: refp,
                         returns_reference: matches!(ret, Some(SourceType::Ref { .. })),
                         named_result: named_result.map(|p| p.name.as_str()),
                         body,
                         overloads: &overloads,
-                        overload_targets: &overload_targets,
-                        implicit_conversions: &implicit_conversions,
-                        explicit_destroy_calls: &explicit_destroy_calls,
                     },
                     &mut functions,
                 );
@@ -1703,6 +2948,7 @@ pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
                             &source,
                             type_params,
                             &m.params,
+                            m.self_convention,
                             &overloads,
                         );
                         if lowered == source {
@@ -1753,16 +2999,24 @@ pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
                         &source_mangled,
                         type_params,
                         &m.params,
+                        m.self_convention,
                         &overloads,
                     );
                     let variadic_idx = m
                         .params
                         .iter()
                         .position(|param| param.kind == ParamKind::Variadic);
+                    let kw_variadic_idx = m
+                        .params
+                        .iter()
+                        .position(|param| param.kind == ParamKind::KwVariadic);
                     let regular: Vec<_> = m
                         .params
                         .iter()
-                        .filter(|param| param.kind == ParamKind::Regular)
+                        .filter(|param| {
+                            param.kind == ParamKind::Regular
+                                && !matches!(param.convention, Some(ArgConvention::Out))
+                        })
                         .collect();
                     declarations.functions.push(MirFunctionDeclaration {
                         lowered_name: mangled.clone(),
@@ -1811,9 +3065,26 @@ pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
                                 &mut invariant_errors,
                             )
                         }),
-                        variadic_index: regular_marker_index(&m.params, variadic_idx),
-                        kw_variadic: None,
-                        kw_variadic_index: None,
+                        variadic_index: runtime_variadic_index(&m.params, variadic_idx),
+                        kw_variadic: kw_variadic_idx.map(|index| {
+                            checked_type_or_record(
+                                checked,
+                                AnnotationSite::MethodParam {
+                                    module: s.module.clone(),
+                                    declaration: s.span,
+                                    method: method_index,
+                                    param: index,
+                                },
+                                &format!(
+                                    "keyword variadic parameter of method '{source_mangled}'"
+                                ),
+                                &mut invariant_errors,
+                            )
+                        }),
+                        kw_variadic_index: runtime_parameter_index(
+                            &m.params,
+                            kw_variadic_idx,
+                        ),
                         positional_only: regular_marker_index(&m.params, m.positional_only),
                         keyword_only: effective_keyword_only_index(
                             &m.params,
@@ -1825,35 +3096,43 @@ pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
                     // A method's receiver `self` is the implicit first parameter,
                     // followed by the declared params.
                     let mut names: Vec<String> = Vec::new();
-                    let mut ptys: Vec<SourceType> = Vec::new();
+                    let mut ptys: Vec<Ty> = Vec::new();
                     let mut owned: Vec<bool> = Vec::new();
                     let mut refp: Vec<bool> = Vec::new();
                     if m.has_self {
                         names.push("self".to_string());
-                        // `self` is the struct type; `coerce` is identity on it, so
-                        // the exact type only needs to be non-numeric.
-                        ptys.push(SourceType::Named(name.clone(), Vec::new()));
+                        ptys.push(Ty::Struct(name.clone(), Vec::new()));
                         owned.push(is_owned(&m.self_convention));
                         refp.push(is_ref(&m.self_convention));
                     }
                     names.extend(m.params.iter().map(|p| p.name.clone()));
-                    ptys.extend(m.params.iter().map(|p| p.ty.clone()));
+                    ptys.extend(m.params.iter().enumerate().map(|(param, p)| {
+                        checked_type_or_record(
+                            checked,
+                            AnnotationSite::MethodParam {
+                                module: s.module.clone(),
+                                declaration: s.span,
+                                method: method_index,
+                                param,
+                            },
+                            &format!("parameter '{}' of method '{source_mangled}'", p.name),
+                            &mut invariant_errors,
+                        )
+                    }));
                     owned.extend(m.params.iter().map(|p| is_owned(&p.convention)));
                     refp.extend(m.params.iter().map(|p| is_ref(&p.convention)));
                     lower_fn_nested(
                         FunctionLowering {
+                            checked,
                             name: &mangled,
                             parameter_names: &names,
-                            parameter_annotations: ptys,
+                            parameter_types: ptys,
                             owned_parameters: owned,
                             reference_parameters: refp,
                             returns_reference: matches!(m.ret, Some(SourceType::Ref { .. })),
                             named_result: None,
                             body: &m.body,
                             overloads: &overloads,
-                            overload_targets: &overload_targets,
-                            implicit_conversions: &implicit_conversions,
-                            explicit_destroy_calls: &explicit_destroy_calls,
                         },
                         &mut functions,
                     );
@@ -1868,18 +3147,18 @@ pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
     functions.push((
         "__toplevel__".to_string(),
         lower_cfg_nested(
-            &Cfg::build(&toplevel),
+            &Cfg::build_checked_fn(checked, &[], &toplevel),
             &HashMap::new(),
             &overloads,
-            &overload_targets,
-            &implicit_conversions,
-            &explicit_destroy_calls,
             false,
+            &[],
         ),
     ));
-    MirProgram {
+    let mut result = MirProgram {
         functions,
         declarations,
         invariant_errors,
-    }
+    };
+    result.invariant_errors.extend(verify::verify(&result));
+    result
 }

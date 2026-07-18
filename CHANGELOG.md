@@ -8,22 +8,119 @@ to evolve under the `0.x` compatibility rules.
 
 ### Added
 
+- Source imports now follow the current source-side namespace rules: source
+  packages beat same-named source modules, ordinary directories can form dotted
+  namespace paths, every dotted prefix binds, and submodules require explicit
+  import or package-initializer re-export. Compiled `.mojoc`/`.mojopkg` lookup is
+  reserved for the versioned artifact work.
+
+- Homogeneous `**kwargs` collectors now use the self-hosted, insertion-ordered
+  `StringDict[T]`. A final `**kwargs^` consumes and forwards its entries through
+  the shared call binder with duplicate and element-type checking.
+
+- Slice syntax now distinguishes `ContiguousSlice` and `StridedSlice`, preserves
+  optional/negative bounds, implements `indices(length)`, and dispatches checked
+  mixed or variadic `__getitem__` and `__setitem__` arguments, including slice
+  assignment. Built-in collection view/API parity remains standard-library work.
+
+- `std.utils.Variant` now supports compile-time type-membership queries,
+  checked and unchecked consuming extraction, and checked and unchecked
+  ownership-returning replacement. Unsupported arms reject statically, checked
+  operations validate runtime tags, and `take` participates in use-after-move
+  analysis.
+
+- Current Mojo literal spellings now include leading/trailing-point floats,
+  exponent forms, repeated/trailing digit separators, raw and case-insensitive
+  string prefixes, one-to-three-digit octal escapes, triple-string line
+  suppression, adjacent ordinary and t-string forms, nested interpolation
+  boundaries, and the `Byte == UInt8` alias. Mojo does not define a distinct
+  byte-string literal family.
+
+- `CheckedProgram` now exposes stable checked expression and declaration arenas
+  with child identities, resolved types, value/place/type categories, binding
+  owners, extensible effect facts, and explicit semantic adjustments. Call,
+  conversion, move, and explicit-destruction decisions are canonical node data.
+  VM CTFE now passes rewritten fragments through the authoritative checker, and
+  MIR retains checked types for source-derived registers.
+
+- Checked HIR now retains stable checked-node identity, resolved type, value
+  category, and semantic adjustments through function and exception-region CFGs.
+  MIR consumes checked call/conversion/destruction decisions directly. Stored
+  origin-parametric reference fields preserve frame/slot handles and owner loans,
+  and user-defined slicing dispatches a checked `Slice` through `__getitem__`.
+
+- Checked HIR and MIR places now retain root, per-projection, and final storage
+  types. Production lowering verifies complete typed-place metadata before VM
+  execution, and reference field reads/writes use the checked storage type rather
+  than rediscovering reference semantics from runtime values.
+
+- Unsafe pointers now retain allocation provenance and typed offsets, support
+  arithmetic, same-allocation subtraction, equality, aligned allocation and
+  non-null dangling placeholders, and diagnose out-of-bounds access, invalid
+  frees, double frees, and use after free. Static, untracked, and unsafe-any
+  reference origins now lower into checked contracts, and local reborrows retain
+  executable reference handles.
+
+- CPU-language surface work now includes definite late initialization,
+  function-scoped implicit and walrus bindings, context-manager elaboration,
+  loop `else`, list `for ref`, declaration destructuring, Writable-backed
+  t-strings, integer bitwise/shift operators, and `__matmul__` dispatch.
+
+- Callable and closure semantics now include contextually selected overloaded
+  function values with effects, generic callable specialization, explicit
+  unified capture conventions, sibling and generic nested calls, reference-backed
+  closure environments, and nominal `def(...)` callable structs. Escaping
+  closures remain statically rejected.
+
+- A versioned Mojo nightly audit now tracks 1.0.0b3.dev2026071705 and records
+  breaking drift affecting immutable conventions, linear deletion, constraints,
+  closures, reflection, scalar/SIMD types, origins, imports, and keyword
+  variadics.
+
+- Compile-time parameters support typed scalar and aggregate values, type/value
+  defaults, named arguments, infer-only parameters, dependent defaults and
+  predicates, and heterogeneous type/value packs with per-index types.
+- Generic constraints cover parameter and trailing `where` clauses, boolean and
+  comparison predicates, `conforms_to`, conditional methods, and conditional
+  conformance.
+- Specialization uses structural cache keys, a deduplicated shared-fuel worklist,
+  and source-located quota diagnostics.
+- Current `reflect[T]` handles expose compile-time struct detection, field
+  counts, names, types, named field indexes, and chainable `.field[name]` /
+  `.field_at[index]` reflected handles whose selected type is `.T`. The removed
+  `field_type` spelling is rejected, and reflection can drive
+  declaration-producing compile-time branches.
+- Generic-target `@implicit` conversions substitute concrete target parameters
+  before constructor matching.
+
+- Trait associated-type requirements compose bounds across refinements, and
+  conditional conformance predicates are evaluated after type/value specialization.
+- Current Indexer normalization, incremental caller-provided hashing, UTF-8 Writer
+  buffering, Writable display/repr hooks, reflective formatting defaults, and
+  String replacement fields replace the former direct `__str__` formatter path.
+
 - Current Mojo consuming parameters use `var`; the removed `owned` spelling is
   rejected, and the convention is represented as `Var` throughout the compiler.
 - Unified `__init__(out self, *, copy: Self)` and
   `__init__(out self, *, move: Self)` lifecycle declarations drive copy and move
   construction through the existing checked MIR and VM lifecycle machinery.
-- Calls materialize Copyable read arguments before overlapping `mut`/`ref`
+- Calls materialize Copyable `imm` arguments before overlapping `mut`/`ref`
   access, allowing calls such as `f(mut x, x)` while retaining alias errors for
   non-Copyable values and multiple exclusive accesses.
-- Current `ImplicitlyDestructible` lifecycle vocabulary replaces the obsolete
-  `ImplicitlyDeletable` spelling in bundled sources and generic checking.
+- Current `ImplicitlyDeletable` lifecycle vocabulary replaces the superseded
+  `ImplicitlyDestructible` spelling in bundled sources and generic checking.
 - Validated, nonraising `@implicit` constructors now provide explicit MIR-lowered
   conversions for typed bindings, arguments, returns, and overload selection.
-- `@explicit_destroy` retains its diagnostic and named destructors in checked/MIR
-  metadata. Path-sensitive obligations reject abandonment, overwrite, partial,
-  double, and conditional destruction; raising destructors preserve the value
+- `ImplicitlyDeletable where False`, rather than `@explicit_destroy`, now makes
+  a type linear. The decorator requires a string and only supplies its
+  diagnostic. Field-sensitive obligations preserve partial moves and projected
+  destruction while rejecting whole destruction of incomplete aggregates,
+  double and conditional destruction; raising destructors preserve the value
   for an `except` fallback, and automatic VM destruction is suppressed.
+- Generic constraints now use only trailing `where`, compare types with
+  `==`/`!=`, and accept pack-wide `conforms_to(Ts.values, Trait)`. `Int` is the
+  canonical VM representation of `Scalar[DType.int]`; `SIMDSize` width values
+  and `_` construction-width inference follow the pinned nightly vocabulary.
 
 ## [0.1.0] - 2026-07-15
 

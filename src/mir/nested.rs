@@ -176,10 +176,26 @@ fn refs_expr(e: &Expr, out: &mut HashSet<String>) {
             lower,
             upper,
             step,
+            ..
         } => {
             refs_expr(object, out);
             for x in [lower, upper, step].into_iter().flatten() {
                 refs_expr(x, out);
+            }
+        }
+        ExprKind::MultiIndex { object, args } => {
+            refs_expr(object, out);
+            for argument in args {
+                match argument {
+                    crate::ast::SubscriptArg::Index(value) => refs_expr(value, out),
+                    crate::ast::SubscriptArg::Slice {
+                        lower, upper, step, ..
+                    } => {
+                        for value in [lower, upper, step].into_iter().flatten() {
+                            refs_expr(value, out);
+                        }
+                    }
+                }
             }
         }
         ExprKind::TString { parts, .. } => {
@@ -225,7 +241,7 @@ fn refs_stmts(body: &[Stmt], out: &mut HashSet<String>) -> bool {
                     ok &= refs_stmts(e, out);
                 }
             }
-            StmtKind::While { cond, body } => {
+            StmtKind::While { cond, body, .. } => {
                 refs_expr(cond, out);
                 ok &= refs_stmts(body, out);
             }
@@ -264,8 +280,8 @@ fn refs_stmts(body: &[Stmt], out: &mut HashSet<String>) -> bool {
 }
 
 /// Compute a nested `def`'s captures (the enclosing-frame locals it references),
-/// or `None` if it can't be lifted: it declares its own nested `def`/`struct`/
-/// `trait`, or it calls a *sibling* nested `def` (whose captures we can't forward).
+/// or `None` if it can't be lifted because it declares its own nested
+/// `def`/`struct`/`trait`.
 /// A self-reference is fine (self-recursion via the registry, not a capture).
 fn analyze_captures(
     dparams: &[FnParam],
@@ -273,62 +289,76 @@ fn analyze_captures(
     f_bound: &HashSet<String>,
     nested_names: &HashSet<String>,
     self_name: &str,
-) -> Option<Vec<String>> {
+    declared: Option<&crate::ast::CaptureList>,
+) -> Option<Vec<NestedCapture>> {
     let mut d_bound: HashSet<String> = dparams.iter().map(|p| p.name.clone()).collect();
     binds(dbody, &mut d_bound);
     let mut used = HashSet::new();
     if !refs_stmts(dbody, &mut used) {
         return None; // contains a deeper nested declaration
     }
-    let mut captures: Vec<String> = used
+    let mut inferred: Vec<String> = used
         .into_iter()
         .filter(|n| !d_bound.contains(n) && f_bound.contains(n))
         .collect();
-    if captures
+    inferred.retain(|n| !nested_names.contains(n) || n != self_name);
+    inferred.sort();
+    let Some(declared) = declared else {
+        return Some(Vec::new());
+    };
+    let mut captures: Vec<NestedCapture> = declared
+        .entries
         .iter()
-        .any(|n| nested_names.contains(n) && n != self_name)
-    {
-        return None; // references a sibling nested `def`
+        .map(|capture| NestedCapture {
+            name: capture.name.clone(),
+            kind: capture.kind,
+        })
+        .collect();
+    if declared.default_read {
+        for name in inferred {
+            if !nested_names.contains(&name) && !captures.iter().any(|capture| capture.name == name)
+            {
+                captures.push(NestedCapture {
+                    name,
+                    kind: crate::ast::CaptureKind::Read,
+                });
+            }
+        }
     }
-    captures.retain(|n| !nested_names.contains(n)); // drop a self-reference
-    captures.sort();
     Some(captures)
 }
 
 /// Lower a function body (`name` its registered/mangled name) plus every nested
 /// `def` it defines, pushing the function and each lifted nested function into
 /// `out`. A liftable nested `def` becomes `name$inner` with its captured enclosing
-/// locals as leading `mut` parameters (pass-through-typed so `coerce` is identity);
+/// locals as leading `mut` parameters (checker-typed where declared and opaque
+/// for captured storage);
 /// a nested `def` we can't lift stays a clean `Unsupported` at execution.
 pub(super) struct FunctionLowering<'a> {
+    pub(super) checked: &'a crate::CheckedProgram,
     pub(super) name: &'a str,
     pub(super) parameter_names: &'a [String],
-    pub(super) parameter_annotations: Vec<SourceType>,
+    pub(super) parameter_types: Vec<Ty>,
     pub(super) owned_parameters: Vec<bool>,
     pub(super) reference_parameters: Vec<bool>,
     pub(super) returns_reference: bool,
     pub(super) named_result: Option<&'a str>,
     pub(super) body: &'a [Stmt],
     pub(super) overloads: &'a crate::symbol::OverloadSets,
-    pub(super) overload_targets: &'a HashMap<SourceSpan, String>,
-    pub(super) implicit_conversions: &'a HashMap<SourceSpan, String>,
-    pub(super) explicit_destroy_calls: &'a HashSet<SourceSpan>,
 }
 
 pub(super) fn lower_fn_nested(request: FunctionLowering<'_>, out: &mut Vec<(String, MirFunction)>) {
     let FunctionLowering {
+        checked,
         name,
         parameter_names: param_names,
-        parameter_annotations: param_annotations,
+        parameter_types: param_types,
         owned_parameters: owned_params,
         reference_parameters: ref_params,
         returns_reference,
         named_result,
         body,
         overloads,
-        overload_targets,
-        implicit_conversions,
-        explicit_destroy_calls,
     } = request;
     let mut f_bound: HashSet<String> = param_names.iter().cloned().collect();
     binds(body, &mut f_bound);
@@ -344,46 +374,81 @@ pub(super) fn lower_fn_nested(request: FunctionLowering<'_>, out: &mut Vec<(Stri
         .collect();
 
     let mut registry: HashMap<String, NestedInfo> = HashMap::new();
-    let mut liftable: Vec<(&Stmt, Vec<String>, String)> = Vec::new();
+    let mut liftable: Vec<(&Stmt, Vec<NestedCapture>, String)> = Vec::new();
     for ds in &nested_defs {
         if let StmtKind::Def {
             name: dname,
-            type_params,
+            type_params: _,
             params: dparams,
             body: dbody,
+            captures: declared_captures,
             ..
         } = &ds.kind
+            && let Some(captures) = analyze_captures(
+                dparams,
+                dbody,
+                &f_bound,
+                &nested_names,
+                dname,
+                declared_captures.as_ref(),
+            )
         {
-            if !type_params.is_empty() {
-                continue; // a generic nested `def` is refused (stays Unsupported)
-            }
-            if let Some(captures) = analyze_captures(dparams, dbody, &f_bound, &nested_names, dname)
-            {
-                let mangled = crate::symbol::nested_lifted_name(name, dname);
-                registry.insert(
-                    dname.clone(),
-                    NestedInfo {
-                        mangled: mangled.clone(),
-                        captures: captures.clone(),
-                    },
-                );
-                liftable.push((ds, captures, mangled));
-            }
+            let mangled = crate::symbol::nested_lifted_name(name, dname);
+            registry.insert(
+                dname.clone(),
+                NestedInfo {
+                    mangled: mangled.clone(),
+                    captures: captures.clone(),
+                },
+            );
+            liftable.push((ds, captures, mangled));
         }
     }
 
-    let cfg = Cfg::build_fn(param_names, body);
-    let mut f = lower_cfg_nested(
-        &cfg,
-        &registry,
-        overloads,
-        overload_targets,
-        implicit_conversions,
-        explicit_destroy_calls,
-        returns_reference,
-    );
-    f.n_params = param_annotations.len();
-    f.param_annotations = param_annotations;
+    // A lifted sibling is itself a closure. Forward the sibling's environment,
+    // rather than trying to capture its (non-materialized) source-level name.
+    // Iterate to a fixed point so forward declarations and longer sibling chains
+    // work equally well. Cycles converge because an unresolved sibling edge is
+    // retained until another pass can replace it.
+    for _ in 0..registry.len() {
+        let snapshot = registry.clone();
+        let mut changed = false;
+        for info in registry.values_mut() {
+            let mut expanded = Vec::new();
+            for capture in &info.captures {
+                if let Some(sibling) = snapshot.get(&capture.name) {
+                    for forwarded in &sibling.captures {
+                        if !expanded
+                            .iter()
+                            .any(|existing: &NestedCapture| existing.name == forwarded.name)
+                        {
+                            expanded.push(forwarded.clone());
+                        }
+                    }
+                } else if !expanded
+                    .iter()
+                    .any(|existing: &NestedCapture| existing.name == capture.name)
+                {
+                    expanded.push(capture.clone());
+                }
+            }
+            changed |= expanded != info.captures;
+            info.captures = expanded;
+        }
+        if !changed {
+            break;
+        }
+    }
+    for (_, captures, mangled) in &mut liftable {
+        if let Some(info) = registry.values().find(|info| &info.mangled == mangled) {
+            *captures = info.captures.clone();
+        }
+    }
+
+    let cfg = Cfg::build_checked_fn(checked, param_names, body);
+    let mut f = lower_cfg_nested(&cfg, &registry, overloads, returns_reference, &ref_params);
+    f.n_params = param_types.len();
+    f.param_types = param_types;
     f.owned_params = owned_params;
     f.ref_params = ref_params;
     f.returns_reference = returns_reference;
@@ -408,7 +473,10 @@ pub(super) fn lower_fn_nested(request: FunctionLowering<'_>, out: &mut Vec<(Stri
     }
     out.push((name.to_string(), f));
 
-    let cap_ty = SourceType::Named("$capture".to_string(), Vec::new());
+    let cap_ty = Ty::Param {
+        name: "$capture".to_string(),
+        bounds: Vec::new(),
+    };
     for (ds, captures, mangled) in liftable {
         if let StmtKind::Def {
             params: dparams,
@@ -416,39 +484,48 @@ pub(super) fn lower_fn_nested(request: FunctionLowering<'_>, out: &mut Vec<(Stri
             ..
         } = &ds.kind
         {
-            let mut names: Vec<String> = captures.clone();
+            let mut names: Vec<String> = captures
+                .iter()
+                .map(|capture| capture.name.clone())
+                .collect();
             names.extend(dparams.iter().map(|p| p.name.clone()));
-            let mut ptys: Vec<SourceType> = vec![cap_ty.clone(); captures.len()];
-            ptys.extend(dparams.iter().map(|p| p.ty.clone()));
-            let mut owned2 = vec![false; captures.len()];
+            let mut ptys: Vec<Ty> = vec![cap_ty.clone(); captures.len()];
+            ptys.extend(dparams.iter().enumerate().map(|(param, p)| {
+                checked
+                    .checked_type_at(&AnnotationSite::FunctionParam {
+                        module: ds.module.clone(),
+                        declaration: ds.span,
+                        param,
+                    })
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "checked type missing for parameter '{}' of nested function",
+                            p.name
+                        )
+                    })
+            }));
+            let mut owned2: Vec<bool> = captures
+                .iter()
+                .map(|capture| capture.kind == crate::ast::CaptureKind::Move)
+                .collect();
             owned2.extend(dparams.iter().map(|p| is_owned(&p.convention)));
             // Captures are `mut` (their final value is written back to the enclosing
             // variable — reference-capture semantics).
-            let mut refp2 = vec![true; captures.len()];
+            let mut refp2: Vec<bool> = captures
+                .iter()
+                .map(|capture| capture.kind != crate::ast::CaptureKind::Move)
+                .collect();
             refp2.extend(dparams.iter().map(|p| is_ref(&p.convention)));
             let immutable_captures: HashSet<String> = captures
                 .iter()
-                .filter(|capture| {
-                    body.iter().any(|stmt| {
-                        matches!(
-                            &stmt.kind,
-                            StmtKind::Comptime { name, .. } if name == *capture
-                        )
-                    })
-                })
-                .cloned()
+                .filter(|capture| capture.kind == crate::ast::CaptureKind::Read)
+                .map(|capture| capture.name.clone())
                 .collect();
-            let ncfg = Cfg::build_fn_with_captures(&names, immutable_captures, dbody);
-            let mut nf = lower_cfg_nested(
-                &ncfg,
-                &registry,
-                overloads,
-                overload_targets,
-                implicit_conversions,
-                explicit_destroy_calls,
-                false,
-            );
-            nf.param_annotations = ptys;
+            let ncfg =
+                Cfg::build_checked_fn_with_captures(checked, &names, immutable_captures, dbody);
+            let mut nf = lower_cfg_nested(&ncfg, &registry, overloads, false, &refp2);
+            nf.param_types = ptys;
             nf.owned_params = owned2;
             nf.ref_params = refp2;
             out.push((mangled, nf));

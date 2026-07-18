@@ -160,6 +160,39 @@ fn member_write_lowers_to_a_store_through_a_place() {
 }
 
 #[test]
+fn checked_mir_places_carry_root_projection_and_storage_types() {
+    let program = parse(
+        "@fieldwise_init\nstruct Cell:\n    var value: Int\n\ndef main():\n    var cell = Cell(1)\n    cell.value = 2\n",
+    )
+    .expect("parse");
+    let mir = lower_program(&program).expect("checked lowering");
+    assert!(
+        mir.invariant_errors.is_empty(),
+        "{:?}",
+        mir.invariant_errors
+    );
+    let function = mir
+        .functions
+        .iter()
+        .find(|(name, _)| name == "main")
+        .unwrap();
+    let place = function
+        .1
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instrs)
+        .find_map(|instruction| match instruction {
+            MirInstr::Store { place, .. } => Some(place),
+            _ => None,
+        })
+        .expect("typed store place");
+    assert!(place.is_typed());
+    assert!(matches!(place.root_ty, Some(mojito::Ty::Struct(ref name, _)) if name == "Cell"));
+    assert_eq!(place.projection_tys, vec![mojito::Ty::Int]);
+    assert_eq!(place.ty, Some(mojito::Ty::Int));
+}
+
+#[test]
 fn index_write_lowers_to_a_store_with_an_index_projection() {
     // `xs[0] = 1` ⇒ the place is `xs[<reg>]`.
     let is = instrs("xs[0] = 1\n");
@@ -274,6 +307,62 @@ fn checked_lowering_owns_typed_declarations_and_normalized_defaults() {
 }
 
 #[test]
+fn executable_mir_carries_checked_binding_and_parameter_types() {
+    let program =
+        parse("def widen(x: UInt):\n    var y: Float64 = 3\n    print(x, y)\n").expect("parse");
+    let checked = mojito::check_program(&program).expect("check");
+    let mir = mojito::mir::lower_checked_program(&checked);
+    let function = mir
+        .functions
+        .iter()
+        .find(|(name, _)| name == "widen")
+        .expect("lowered function");
+
+    assert_eq!(function.1.param_types, vec![mojito::Ty::UInt]);
+    assert!(
+        function
+            .1
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instrs)
+            .any(|instruction| matches!(
+                instruction,
+                MirInstr::DefVar {
+                    binding_ty: Some(mojito::Ty::Float64),
+                    ..
+                }
+            ))
+    );
+}
+
+#[test]
+fn bounded_trait_calls_carry_the_requirement_error_contract_into_mir() {
+    let program = parse(
+        "trait Fallible:\n    def run(self) raises -> Int: ...\n\ndef invoke[T: Fallible](value: T) raises -> Int:\n    return value.run()\n",
+    )
+    .expect("parse");
+    let checked = mojito::check_program(&program).expect("check");
+    let mir = mojito::mir::lower_checked_program(&checked);
+    let invoke = &mir
+        .functions
+        .iter()
+        .find(|(name, _)| name == "invoke")
+        .expect("invoke function")
+        .1;
+
+    assert!(invoke.blocks.iter().flat_map(|block| &block.instrs).any(
+        |instruction| matches!(
+            instruction,
+            MirInstr::MethodCall {
+                method,
+                raises: Some(mojito::Ty::Error),
+                ..
+            } if method == "run"
+        )
+    ));
+}
+
+#[test]
 fn checked_declaration_types_are_keyed_by_source_site_not_type_syntax() {
     let program = parse(
         "def keep_any[T: AnyType](x: T):\n    pass\n\
@@ -306,6 +395,34 @@ fn checked_declaration_types_are_keyed_by_source_site_not_type_syntax() {
             bounds: vec!["Hashable".into()],
         }
     );
+}
+
+#[test]
+fn mir_declarations_carry_generic_free_and_method_keyword_collectors() {
+    let program = parse(
+        "def collect[T: Copyable & Movable](**options: T):\n    pass\n\nstruct Relay:\n    def collect[T: Copyable & Movable](self, **options: T):\n        pass\n",
+    )
+    .expect("parse");
+    let checked = mojito::check_program(&program).expect("check");
+    let mir = mojito::mir::lower_checked_program(&checked);
+    let collector = |name: &str| {
+        mir.declarations
+            .functions
+            .iter()
+            .find(|declaration| declaration.lowered_name == name)
+            .expect("keyword collector declaration")
+    };
+
+    for declaration in [collector("collect"), collector("Relay.collect")] {
+        assert_eq!(declaration.kw_variadic_index, Some(0));
+        assert_eq!(
+            declaration.kw_variadic,
+            Some(mojito::Ty::Param {
+                name: "T".into(),
+                bounds: vec!["Copyable".into(), "Movable".into()],
+            })
+        );
+    }
 }
 
 #[test]

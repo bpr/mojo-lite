@@ -37,7 +37,7 @@ use crate::ast::{
     WithItem,
 };
 use crate::backend::VmBackend;
-use crate::ct::CtValue;
+use crate::ct::{CtExpr, CtValue};
 use crate::runtime::Value;
 use crate::token::Span;
 use crate::types::{ParamDecl, Ty, TyArg};
@@ -123,6 +123,7 @@ struct CtFn<'a> {
 struct CtStruct<'a> {
     decls: Vec<ParamDecl>,
     associated: &'a [StructComptime],
+    fields: &'a [crate::ast::Param],
 }
 
 /// The compile-time elaboration engine: the CTFE-callable functions and a shared
@@ -196,6 +197,7 @@ fn collect_structs(program: &[Stmt]) -> HashMap<String, CtStruct<'_>> {
             name,
             type_params,
             associated,
+            fields,
             ..
         } = &s.kind
         {
@@ -204,6 +206,7 @@ fn collect_structs(program: &[Stmt]) -> HashMap<String, CtStruct<'_>> {
                 CtStruct {
                     decls: classify_ct_params(type_params),
                     associated,
+                    fields,
                 },
             );
         }
@@ -214,7 +217,8 @@ fn collect_structs(program: &[Stmt]) -> HashMap<String, CtStruct<'_>> {
 /// Collect the top-level generic `def`s that must be monomorphized (roadmap
 /// milestones 6/7): a
 /// generic `def` (type and/or value parameters) whose body contains a
-/// `comptime if`/`comptime for`. Such a construct may depend on the parameters
+/// `comptime if`/`comptime for`, plus every heterogeneous type-pack function.
+/// Such a construct may depend on the parameters
 /// (e.g. `comptime if is_same_type[T, Int]()`), so it can only be resolved per call
 /// site — each specialization binds the concrete arguments and resolves the
 /// comptime construct, so only the *selected* branch is type-checked. Because the
@@ -230,7 +234,10 @@ fn collect_specializable(program: &[Stmt]) -> HashMap<String, &Stmt> {
             ..
         } = &s.kind
             && !type_params.is_empty()
-            && block_has_comptime(body)
+            && (block_has_comptime(body)
+                || type_params
+                    .iter()
+                    .any(|parameter| parameter.name.starts_with('*')))
         {
             m.insert(name.clone(), s);
         }
@@ -272,19 +279,127 @@ fn classify_ct_params(tps: &[TypeParam]) -> Vec<ParamDecl> {
     tps.iter()
         .filter(|tp| tp.bounds.as_slice() != ["Origin"])
         .map(|tp| {
-            if let [only] = tp.bounds.as_slice()
-                && matches!(only.as_str(), "Int" | "Bool")
+            if let Some(source_type) = &tp.value_type
+                && let Some(ty) = ct_param_source_type(source_type)
             {
                 return ParamDecl::Value {
                     name: tp.name.clone(),
+                    ty: Box::new(ty),
+                    default: tp.default.as_ref().and_then(ct_expr_from_ast),
+                    infer_only: tp.infer_only,
+                    variadic: tp.name.starts_with('*'),
+                    constraints: Vec::new(),
+                };
+            }
+            if let [only] = tp.bounds.as_slice()
+                && let Some(ty) = ct_value_param_type(only)
+            {
+                return ParamDecl::Value {
+                    name: tp.name.clone(),
+                    ty: Box::new(ty),
+                    default: tp.default.as_ref().and_then(ct_expr_from_ast),
+                    infer_only: tp.infer_only,
+                    variadic: tp.name.starts_with('*'),
+                    constraints: Vec::new(),
                 };
             }
             ParamDecl::Type {
                 name: tp.name.clone(),
                 bounds: tp.bounds.clone(),
+                default: tp.default.as_ref().and_then(|value| match &value.kind {
+                    ExprKind::Identifier(name) => scalar_type_name(name).map(Box::new),
+                    ExprKind::TypeValue(ty) => ct_param_source_type(ty).map(Box::new),
+                    _ => None,
+                }),
+                infer_only: tp.infer_only,
+                variadic: tp.name.starts_with('*'),
+                constraints: Vec::new(),
             }
         })
         .collect()
+}
+
+fn literal_ct_value(expr: &Expr) -> Option<CtValue> {
+    match &expr.kind {
+        ExprKind::Int(value) => Some(CtValue::Int(*value)),
+        ExprKind::Float(value) => Some(CtValue::Float(value.to_bits())),
+        ExprKind::Bool(value) => Some(CtValue::Bool(*value)),
+        ExprKind::Str(value) => Some(CtValue::Str(value.clone())),
+        ExprKind::TupleLit(values) => values
+            .iter()
+            .map(literal_ct_value)
+            .collect::<Option<Vec<_>>>()
+            .map(CtValue::Tuple),
+        ExprKind::ListLit(values) => values
+            .iter()
+            .map(literal_ct_value)
+            .collect::<Option<Vec<_>>>()
+            .map(CtValue::List),
+        _ => None,
+    }
+}
+
+fn ct_expr_from_ast(expr: &Expr) -> Option<CtExpr> {
+    let pair = |left: &Expr, right: &Expr| {
+        Some((
+            Box::new(ct_expr_from_ast(left)?),
+            Box::new(ct_expr_from_ast(right)?),
+        ))
+    };
+    Some(match &expr.kind {
+        ExprKind::Identifier(name) => CtExpr::Param(name.clone()),
+        ExprKind::Prefix(PrefixOp::Neg, value) => CtExpr::Neg(Box::new(ct_expr_from_ast(value)?)),
+        ExprKind::Infix(op, left, right) => {
+            let (left, right) = pair(left, right)?;
+            match op {
+                InfixOp::Add => CtExpr::Add(left, right),
+                InfixOp::Sub => CtExpr::Sub(left, right),
+                InfixOp::Mul => CtExpr::Mul(left, right),
+                InfixOp::FloorDiv => CtExpr::FloorDiv(left, right),
+                InfixOp::Mod => CtExpr::Mod(left, right),
+                InfixOp::Pow => CtExpr::Pow(left, right),
+                _ => return None,
+            }
+        }
+        _ => CtExpr::Value(literal_ct_value(expr)?),
+    })
+}
+
+fn ct_value_param_type(name: &str) -> Option<Ty> {
+    Some(match name {
+        "Int" => Ty::Int,
+        "Bool" => Ty::Bool,
+        "String" => Ty::String,
+        "UInt" => Ty::UInt,
+        "Float64" => Ty::Float64,
+        _ => return None,
+    })
+}
+
+fn ct_param_source_type(source: &Type) -> Option<Ty> {
+    match source {
+        Type::Int => Some(Ty::Int),
+        Type::UInt => Some(Ty::UInt),
+        Type::Bool => Some(Ty::Bool),
+        Type::String => Some(Ty::String),
+        Type::Float64 => Some(Ty::Float64),
+        Type::None => Some(Ty::None),
+        Type::Named(name, args) if name == "List" && args.len() == 1 => {
+            let ParamArg::Type(element) = &args[0] else {
+                return None;
+            };
+            Some(Ty::List(Box::new(ct_param_source_type(element)?)))
+        }
+        Type::Named(name, args) if name == "Tuple" => args
+            .iter()
+            .map(|argument| match argument {
+                ParamArg::Type(ty) => ct_param_source_type(ty),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(Ty::Tuple),
+        _ => None,
+    }
 }
 
 impl<'a> Elab<'a> {
@@ -335,15 +450,19 @@ impl<'a> Elab<'a> {
                 // runtime see a constant (and a CTFE-computed `Int`, which the
                 // checker's own folder can't evaluate, becomes usable as a value
                 // parameter and materializes cleanly).
-                let folded = mk(
-                    StmtKind::Comptime {
-                        name: name.clone(),
-                        value: lit_result(&v, span)?,
-                    },
-                    span,
-                );
                 env.insert(name.clone(), v);
-                out.push(folded);
+                // Type and reflection handles have no runtime representation.
+                // Keep them only in the elaboration environment; subsequent
+                // comptime expressions consume them before checking/lowering.
+                if let Some(value) = env[name].materialize(span) {
+                    out.push(mk(
+                        StmtKind::Comptime {
+                            name: name.clone(),
+                            value,
+                        },
+                        span,
+                    ));
+                }
             }
             StmtKind::ComptimeIf { branches, orelse } => {
                 for (cond, body) in branches {
@@ -367,6 +486,20 @@ impl<'a> Elab<'a> {
                     out.extend(self.block(&substituted, env, in_fn)?);
                 }
             }
+            StmtKind::VarDecl { name, ty, value } => {
+                let ty = ty
+                    .as_ref()
+                    .map(|ty| self.resolve_reflected_type(ty, env))
+                    .transpose()?;
+                out.push(mk(
+                    StmtKind::VarDecl {
+                        name: name.clone(),
+                        ty,
+                        value: value.clone(),
+                    },
+                    span,
+                ));
+            }
             StmtKind::If { branches, orelse } => {
                 let branches = branches
                     .iter()
@@ -375,23 +508,36 @@ impl<'a> Elab<'a> {
                 let orelse = self.opt_block(orelse, env, in_fn)?;
                 out.push(mk(StmtKind::If { branches, orelse }, span));
             }
-            StmtKind::While { cond, body } => {
+            StmtKind::While { cond, body, orelse } => {
                 let body = self.block(body, env, in_fn)?;
+                let orelse = self.opt_block(orelse, env, in_fn)?;
                 out.push(mk(
                     StmtKind::While {
                         cond: cond.clone(),
                         body,
+                        orelse,
                     },
                     span,
                 ));
             }
-            StmtKind::For { var, iter, body } => {
+            StmtKind::For {
+                var,
+                reference,
+                owned,
+                iter,
+                body,
+                orelse,
+            } => {
                 let body = self.block(body, env, in_fn)?;
+                let orelse = self.opt_block(orelse, env, in_fn)?;
                 out.push(mk(
                     StmtKind::For {
                         var: var.clone(),
+                        reference: *reference,
+                        owned: *owned,
                         iter: iter.clone(),
                         body,
+                        orelse,
                     },
                     span,
                 ));
@@ -420,14 +566,61 @@ impl<'a> Elab<'a> {
                 ));
             }
             StmtKind::With { items, body } => {
-                let body = self.block(body, env, in_fn)?;
-                out.push(mk(
-                    StmtKind::With {
-                        items: items.clone(),
-                        body,
-                    },
-                    span,
-                ));
+                let mut nested = self.block(body, env, in_fn)?;
+                for (index, item) in items.iter().enumerate().rev() {
+                    let manager = format!("$with{}_{}", span.0, index);
+                    let manager_expr = Expr::new(ExprKind::Identifier(manager.clone()), span);
+                    let enter = Expr::new(
+                        ExprKind::MethodCall {
+                            object: Box::new(manager_expr.clone()),
+                            method: "__enter__".to_string(),
+                            args: Vec::new(),
+                            kwargs: Vec::new(),
+                        },
+                        span,
+                    );
+                    let enter_statement = match &item.var {
+                        Some(name) => mk(
+                            StmtKind::VarDecl {
+                                name: name.clone(),
+                                ty: None,
+                                value: enter,
+                            },
+                            span,
+                        ),
+                        None => mk(StmtKind::Expr(enter), span),
+                    };
+                    let exit = Expr::new(
+                        ExprKind::MethodCall {
+                            object: Box::new(manager_expr),
+                            method: "__exit__".to_string(),
+                            args: Vec::new(),
+                            kwargs: Vec::new(),
+                        },
+                        span,
+                    );
+                    nested = vec![
+                        mk(
+                            StmtKind::VarDecl {
+                                name: manager,
+                                ty: None,
+                                value: item.context.clone(),
+                            },
+                            span,
+                        ),
+                        enter_statement,
+                        mk(
+                            StmtKind::Try {
+                                body: nested,
+                                except: None,
+                                orelse: None,
+                                finalbody: Some(vec![mk(StmtKind::Expr(exit), span)]),
+                            },
+                            span,
+                        ),
+                    ];
+                }
+                out.extend(nested);
             }
             StmtKind::Def {
                 name,
@@ -436,9 +629,11 @@ impl<'a> Elab<'a> {
                 params,
                 positional_only,
                 keyword_only,
+                captures,
                 raises,
                 raises_type,
                 ret,
+                where_clause,
                 body,
             } => {
                 // A comptime-dependent generic template can't be elaborated now (its
@@ -456,9 +651,11 @@ impl<'a> Elab<'a> {
                         params: params.clone(),
                         positional_only: *positional_only,
                         keyword_only: *keyword_only,
+                        captures: captures.clone(),
                         raises: *raises,
                         raises_type: raises_type.clone(),
                         ret: ret.clone(),
+                        where_clause: where_clause.clone(),
                         body,
                     },
                     span,
@@ -469,6 +666,8 @@ impl<'a> Elab<'a> {
                 decorators,
                 type_params,
                 conforms,
+                callable_conformance,
+                conformance_conditions,
                 fields,
                 associated,
                 methods,
@@ -488,6 +687,8 @@ impl<'a> Elab<'a> {
                         decorators: decorators.clone(),
                         type_params: type_params.clone(),
                         conforms: conforms.clone(),
+                        callable_conformance: callable_conformance.clone(),
+                        conformance_conditions: conformance_conditions.clone(),
                         fields: fields.clone(),
                         associated: associated.clone(),
                         methods,
@@ -520,6 +721,7 @@ impl<'a> Elab<'a> {
     fn eval(&self, e: &Expr, scope: &HashMap<String, CtValue>) -> Result<CtValue, ComptimeError> {
         match &e.kind {
             ExprKind::Int(n) => Ok(CtValue::Int(*n)),
+            ExprKind::Float(value) => Ok(CtValue::Float(value.to_bits())),
             ExprKind::Bool(b) => Ok(CtValue::Bool(*b)),
             ExprKind::Str(s) => Ok(CtValue::Str(s.clone())),
             ExprKind::Identifier(name) => {
@@ -527,6 +729,16 @@ impl<'a> Elab<'a> {
                     return Ok(value.clone());
                 }
                 self.type_value(name, &[], scope)
+            }
+            ExprKind::TypeApply { name, args } if name == "reflect" => {
+                if args.len() != 1 {
+                    return Err(ComptimeError::Arity(
+                        "reflect[T] takes exactly one type parameter".to_string(),
+                    ));
+                }
+                Ok(CtValue::Reflected(Box::new(
+                    self.param_arg_type(&args[0], scope)?,
+                )))
             }
             ExprKind::TypeApply { name, args } => self.type_value(name, args, scope),
             ExprKind::TupleLit(elems) => Ok(CtValue::Tuple(self.eval_all(elems, scope)?)),
@@ -540,12 +752,32 @@ impl<'a> Elab<'a> {
                 }
                 match self.eval(object, scope)? {
                     CtValue::Type(ty) => self.associated_value(&ty, field),
+                    CtValue::Reflected(ty) if field == "T" => Ok(CtValue::Type(ty)),
                     _ => Err(ComptimeError::NotComptime(format!(
                         "compile-time member access '.{field}' needs a type value"
                     ))),
                 }
             }
             ExprKind::Index { object, index } => {
+                if let ExprKind::Member {
+                    object: reflected,
+                    field,
+                } = &object.kind
+                    && matches!(field.as_str(), "field" | "field_at" | "field_type")
+                {
+                    if field == "field_type" {
+                        return Err(ComptimeError::NotComptime(
+                            "Reflected.field_type was removed; use Reflected.field[name]"
+                                .to_string(),
+                        ));
+                    }
+                    let CtValue::Reflected(ty) = self.eval(reflected, scope)? else {
+                        return Err(ComptimeError::NotComptime(format!(
+                            "compile-time reflection selector '{field}' needs a reflect[T] handle"
+                        )));
+                    };
+                    return self.eval_reflected_field_handle(&ty, field, index, scope);
+                }
                 let seq = self
                     .eval(object, scope)?
                     .as_sequence("indexing a comptime collection")?;
@@ -564,6 +796,37 @@ impl<'a> Elab<'a> {
                     .eval(object, scope)?
                     .as_sequence("__len__() of a compile-time collection")?;
                 Ok(CtValue::Int(sequence.len() as i64))
+            }
+            ExprKind::MethodCall {
+                object,
+                method,
+                args,
+                kwargs,
+            } if args.is_empty() && kwargs.is_empty() => {
+                let CtValue::Reflected(ty) = self.eval(object, scope)? else {
+                    return Err(ComptimeError::NotComptime(format!(
+                        "compile-time reflection method '{method}' needs a reflect[T] handle"
+                    )));
+                };
+                self.eval_reflection_method(&ty, method, scope)
+            }
+            ExprKind::Invoke {
+                callee,
+                param_args,
+                args,
+                kwargs,
+            } if args.is_empty() && kwargs.is_empty() => {
+                let ExprKind::Member { object, field } = &callee.kind else {
+                    return Err(ComptimeError::NotComptime(
+                        "unsupported parameterized compile-time callable".to_string(),
+                    ));
+                };
+                let CtValue::Reflected(ty) = self.eval(object, scope)? else {
+                    return Err(ComptimeError::NotComptime(format!(
+                        "compile-time reflection method '{field}' needs a reflect[T] handle"
+                    )));
+                };
+                self.eval_parameterized_reflection_method(&ty, field, param_args, scope)
             }
             ExprKind::Prefix(PrefixOp::Neg, inner) => {
                 Ok(CtValue::Int(-self.eval(inner, scope)?.as_int("unary '-'")?))
@@ -591,6 +854,21 @@ impl<'a> Elab<'a> {
                 args,
                 ..
             } if name == "is_same_type" => self.eval_is_same_type(param_args, args, scope),
+            ExprKind::Call {
+                name,
+                param_args,
+                args,
+                kwargs,
+            } if name == "reflect" && args.is_empty() && kwargs.is_empty() => {
+                if param_args.len() != 1 {
+                    return Err(ComptimeError::Arity(
+                        "reflect[T]() takes exactly one type parameter".to_string(),
+                    ));
+                }
+                Ok(CtValue::Reflected(Box::new(
+                    self.param_arg_type(&param_args[0], scope)?,
+                )))
+            }
             ExprKind::Call { name, args, .. } if name == "len" && args.len() == 1 => {
                 let sequence = self
                     .eval(&args[0], scope)?
@@ -619,6 +897,279 @@ impl<'a> Elab<'a> {
         scope: &HashMap<String, CtValue>,
     ) -> Result<Vec<CtValue>, ComptimeError> {
         exprs.iter().map(|e| self.eval(e, scope)).collect()
+    }
+
+    fn eval_reflection_method(
+        &self,
+        ty: &Ty,
+        method: &str,
+        outer_scope: &HashMap<String, CtValue>,
+    ) -> Result<CtValue, ComptimeError> {
+        if method == "is_struct" {
+            return Ok(CtValue::Bool(matches!(ty, Ty::Struct(_, _))));
+        }
+        let Ty::Struct(name, arguments) = ty else {
+            return Err(ComptimeError::NotComptime(format!(
+                "reflect[{ty}].{method}() requires a struct type"
+            )));
+        };
+        let info = self.structs.get(name).ok_or_else(|| {
+            ComptimeError::NotComptime(format!("cannot reflect unknown struct '{name}'"))
+        })?;
+        match method {
+            "field_count" => Ok(CtValue::Int(info.fields.len() as i64)),
+            "field_names" => Ok(CtValue::Tuple(
+                info.fields
+                    .iter()
+                    .map(|field| CtValue::Str(field.name.clone()))
+                    .collect(),
+            )),
+            "field_types" => {
+                let mut scope = outer_scope.clone();
+                for (decl, argument) in info.decls.iter().zip(arguments) {
+                    let value = match argument {
+                        TyArg::Ty(ty) => CtValue::Type(Box::new(ty.clone())),
+                        TyArg::Val(value) => value.clone(),
+                    };
+                    scope.insert(decl.name().trim_start_matches('*').to_string(), value);
+                }
+                info.fields
+                    .iter()
+                    .map(|field| {
+                        self.type_from_anno(&field.ty, &scope)
+                            .map(|ty| CtValue::Type(Box::new(ty)))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(CtValue::Tuple)
+            }
+            _ => Err(ComptimeError::NotComptime(format!(
+                "unsupported reflect[T] method '{method}'"
+            ))),
+        }
+    }
+
+    fn eval_parameterized_reflection_method(
+        &self,
+        ty: &Ty,
+        method: &str,
+        parameters: &[ParamArg],
+        scope: &HashMap<String, CtValue>,
+    ) -> Result<CtValue, ComptimeError> {
+        if method == "field_type" {
+            return Err(ComptimeError::NotComptime(
+                "Reflected.field_type was removed; use Reflected.field[name]".to_string(),
+            ));
+        }
+        let Ty::Struct(name, _arguments) = ty else {
+            return Err(ComptimeError::NotComptime(format!(
+                "reflect[{ty}].{method} requires a struct type"
+            )));
+        };
+        let info = self.structs.get(name).ok_or_else(|| {
+            ComptimeError::NotComptime(format!("cannot reflect unknown struct '{name}'"))
+        })?;
+        let field_name = match parameters {
+            [ParamArg::Value(expr)] => match self.eval(expr, scope)? {
+                CtValue::Str(name) => name,
+                other => {
+                    return Err(ComptimeError::NotComptime(format!(
+                        "reflection field name must be String, got {other}"
+                    )));
+                }
+            },
+            [
+                ParamArg::Named {
+                    name: parameter,
+                    value,
+                },
+            ] if parameter == "name" => match self.resolve_ct_arg(
+                &ParamDecl::Value {
+                    name: "name".to_string(),
+                    ty: Box::new(Ty::String),
+                    default: None,
+                    infer_only: false,
+                    variadic: false,
+                    constraints: Vec::new(),
+                },
+                value,
+                scope,
+            )? {
+                CtValue::Str(name) => name,
+                _ => unreachable!(),
+            },
+            _ => {
+                return Err(ComptimeError::Arity(format!(
+                    "reflect[T].{method}[name]() takes one String parameter"
+                )));
+            }
+        };
+        let index = info
+            .fields
+            .iter()
+            .position(|field| field.name == field_name)
+            .ok_or_else(|| {
+                ComptimeError::NotComptime(format!(
+                    "struct '{name}' has no field named '{field_name}'"
+                ))
+            })?;
+        match method {
+            "field_index" => Ok(CtValue::Int(index as i64)),
+            _ => Err(ComptimeError::NotComptime(format!(
+                "unsupported parameterized reflect[T] method '{method}'"
+            ))),
+        }
+    }
+
+    /// Resolve the current type-valued reflected-field aliases.  Both selectors
+    /// return another `Reflected` value, rather than the bare type, which makes
+    /// nested selection (`reflect[Outer].field["inner"].field_at[0]`) and the
+    /// terminal `.T` member use the same representation as the root handle.
+    fn eval_reflected_field_handle(
+        &self,
+        ty: &Ty,
+        selector: &str,
+        argument: &Expr,
+        scope: &HashMap<String, CtValue>,
+    ) -> Result<CtValue, ComptimeError> {
+        let Ty::Struct(name, arguments) = ty else {
+            return Err(ComptimeError::NotComptime(format!(
+                "reflect[{ty}].{selector}[...] requires a struct type"
+            )));
+        };
+        let info = self.structs.get(name).ok_or_else(|| {
+            ComptimeError::NotComptime(format!("cannot reflect unknown struct '{name}'"))
+        })?;
+        let selected = self.eval(argument, scope)?;
+        let index = match (selector, selected) {
+            ("field", CtValue::Str(field_name)) => info
+                .fields
+                .iter()
+                .position(|field| field.name == field_name)
+                .ok_or_else(|| {
+                    ComptimeError::NotComptime(format!(
+                        "struct '{name}' has no field named '{field_name}'"
+                    ))
+                })?,
+            ("field", other) => {
+                return Err(ComptimeError::NotComptime(format!(
+                    "Reflected.field expects a String field name, got {other}"
+                )));
+            }
+            ("field_at", CtValue::Int(index)) if index >= 0 => {
+                let index = usize::try_from(index).map_err(|_| {
+                    ComptimeError::NotComptime(format!(
+                        "reflection field index {index} is out of range for struct '{name}'"
+                    ))
+                })?;
+                if index >= info.fields.len() {
+                    return Err(ComptimeError::NotComptime(format!(
+                        "reflection field index {index} is out of range for struct '{name}' with {} field(s)",
+                        info.fields.len()
+                    )));
+                }
+                index
+            }
+            ("field_at", CtValue::Int(index)) => {
+                return Err(ComptimeError::NotComptime(format!(
+                    "reflection field index {index} is out of range for struct '{name}'"
+                )));
+            }
+            ("field_at", other) => {
+                return Err(ComptimeError::NotComptime(format!(
+                    "Reflected.field_at expects an Int field index, got {other}"
+                )));
+            }
+            _ => unreachable!("reflection selector filtered by the caller"),
+        };
+
+        let mut type_scope = scope.clone();
+        for (decl, argument) in info.decls.iter().zip(arguments) {
+            type_scope.insert(
+                decl.name().trim_start_matches('*').to_string(),
+                match argument {
+                    TyArg::Ty(ty) => CtValue::Type(Box::new(ty.clone())),
+                    TyArg::Val(value) => value.clone(),
+                },
+            );
+        }
+        let field_ty = self.type_from_anno(&info.fields[index].ty, &type_scope)?;
+        Ok(CtValue::Reflected(Box::new(field_ty)))
+    }
+
+    /// Replace a reflected handle's terminal `.T` with an ordinary source type
+    /// before the handle-only comptime binding is erased. This is the handoff
+    /// that makes the nightly pattern `comptime f = reflect[S].field["x"]`
+    /// followed by `var value: f.T` visible to the regular checker.
+    fn resolve_reflected_type(
+        &self,
+        source: &Type,
+        scope: &HashMap<String, CtValue>,
+    ) -> Result<Type, ComptimeError> {
+        if let Type::Assoc { base, name } = source
+            && name == "T"
+            && let Type::Named(binding, arguments) = &**base
+            && arguments.is_empty()
+            && let Some(CtValue::Reflected(ty)) = scope.get(binding)
+        {
+            return source_type_from_ty(ty).ok_or_else(|| {
+                ComptimeError::NotComptime(format!(
+                    "reflected type '{ty}' cannot be represented in a source annotation"
+                ))
+            });
+        }
+
+        Ok(match source {
+            Type::Named(name, arguments) => Type::Named(
+                name.clone(),
+                arguments
+                    .iter()
+                    .map(|argument| self.resolve_reflected_param_arg(argument, scope))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            Type::Assoc { base, name } => Type::Assoc {
+                base: Box::new(self.resolve_reflected_type(base, scope)?),
+                name: name.clone(),
+            },
+            Type::Func {
+                params,
+                ret,
+                thin,
+                raises,
+                raises_type,
+            } => Type::Func {
+                params: params
+                    .iter()
+                    .map(|ty| self.resolve_reflected_type(ty, scope))
+                    .collect::<Result<Vec<_>, _>>()?,
+                ret: Box::new(self.resolve_reflected_type(ret, scope)?),
+                thin: *thin,
+                raises: *raises,
+                raises_type: raises_type
+                    .as_deref()
+                    .map(|ty| self.resolve_reflected_type(ty, scope).map(Box::new))
+                    .transpose()?,
+            },
+            Type::Ref { referent, origin } => Type::Ref {
+                referent: Box::new(self.resolve_reflected_type(referent, scope)?),
+                origin: origin.clone(),
+            },
+            scalar_or_symbolic => scalar_or_symbolic.clone(),
+        })
+    }
+
+    fn resolve_reflected_param_arg(
+        &self,
+        argument: &ParamArg,
+        scope: &HashMap<String, CtValue>,
+    ) -> Result<ParamArg, ComptimeError> {
+        Ok(match argument {
+            ParamArg::Type(ty) => ParamArg::Type(self.resolve_reflected_type(ty, scope)?),
+            ParamArg::Value(value) => ParamArg::Value(value.clone()),
+            ParamArg::Named { name, value } => ParamArg::Named {
+                name: name.clone(),
+                value: Box::new(self.resolve_reflected_param_arg(value, scope)?),
+            },
+        })
     }
 
     fn eval_infix(
@@ -659,13 +1210,32 @@ impl<'a> Elab<'a> {
         use InfixOp::*;
         let bad = |m: &str| ComptimeError::BadArithmetic(m.to_string());
         match op {
-            Add => Ok(CtValue::Int(a + b)),
-            Sub => Ok(CtValue::Int(a - b)),
-            Mul => Ok(CtValue::Int(a * b)),
-            FloorDiv if b != 0 => Ok(CtValue::Int(a.div_euclid(b))),
-            Mod if b != 0 => Ok(CtValue::Int(a.rem_euclid(b))),
+            Add => a
+                .checked_add(b)
+                .map(CtValue::Int)
+                .ok_or_else(|| bad("compile-time integer overflow")),
+            Sub => a
+                .checked_sub(b)
+                .map(CtValue::Int)
+                .ok_or_else(|| bad("compile-time integer overflow")),
+            Mul => a
+                .checked_mul(b)
+                .map(CtValue::Int)
+                .ok_or_else(|| bad("compile-time integer overflow")),
+            FloorDiv if b != 0 => a
+                .checked_div_euclid(b)
+                .map(CtValue::Int)
+                .ok_or_else(|| bad("compile-time integer overflow")),
+            Mod if b != 0 => a
+                .checked_rem_euclid(b)
+                .map(CtValue::Int)
+                .ok_or_else(|| bad("compile-time integer overflow")),
             FloorDiv | Mod => Err(bad("division by zero")),
-            Pow if b >= 0 => Ok(CtValue::Int(a.pow(b as u32))),
+            Pow if b >= 0 => u32::try_from(b)
+                .ok()
+                .and_then(|exponent| a.checked_pow(exponent))
+                .map(CtValue::Int)
+                .ok_or_else(|| bad("compile-time integer overflow")),
             Pow => Err(bad("negative exponent")),
             Eq | Ne | Lt | Gt | Le | Ge => Ok(CtValue::Bool(compare_ints(op, a, b)?)),
             _ => Err(ComptimeError::NotComptime(
@@ -746,7 +1316,7 @@ impl<'a> Elab<'a> {
         let mut value_params = Vec::new();
         for (decl, arg) in f.ct_params.iter().zip(param_args) {
             let value = self.resolve_ct_arg(decl, arg, scope)?;
-            if let ParamDecl::Value { name } = decl
+            if let ParamDecl::Value { name, .. } = decl
                 && !matches!(value, CtValue::Type(_))
             {
                 value_params.push((name.clone(), ct_to_vm(&value)?));
@@ -789,9 +1359,15 @@ impl<'a> Elab<'a> {
         let mut program = self
             .program
             .iter()
-            .filter(
-                |stmt| matches!(&stmt.kind, StmtKind::Def { name, .. } if needed.contains(name)),
-            )
+            // The checked boundary needs the declaration environment, not just
+            // the transitively executed bodies. Retain all declarations so trait
+            // bounds, struct types, overloads, and helper calls resolve exactly;
+            // the VM still executes only the requested function.
+            .filter(|stmt| match &stmt.kind {
+                StmtKind::Def { name, .. } => needed.contains(name),
+                StmtKind::Struct { .. } | StmtKind::Trait { .. } => true,
+                _ => false,
+            })
             .cloned()
             .collect::<Vec<_>>();
         self.rewrite_vm_ctfe_program(&mut program, name, locals)?;
@@ -800,10 +1376,9 @@ impl<'a> Elab<'a> {
                 "missing compile-time function '{name}' for VM CTFE"
             )));
         }
-        program.sort_by_key(|stmt| match &stmt.kind {
-            StmtKind::Def { name: def_name, .. } if def_name == name => 0,
-            _ => 1,
-        });
+        // Preserve declaration order: the ordinary checker intentionally uses
+        // source-order visibility for traits and sibling helpers. Execution
+        // selects `name` explicitly and does not require it to be first.
         let (value, remaining_fuel) = vm
             .run_function_value(&program, name, args, value_params, self.fuel.get())
             .map_err(|e| ComptimeError::NotComptime(format!("VM CTFE failed for '{name}': {e}")))?;
@@ -872,7 +1447,7 @@ impl<'a> Elab<'a> {
                 }
                 Ok(())
             }
-            StmtKind::While { cond, body } => {
+            StmtKind::While { cond, body, .. } => {
                 self.rewrite_vm_ctfe_expr(cond, scope)?;
                 self.rewrite_vm_ctfe_block(body, scope)
             }
@@ -921,7 +1496,7 @@ impl<'a> Elab<'a> {
                 }
                 Ok(())
             }
-            ExprKind::Prefix(_, inner) | ExprKind::Transfer(inner) => {
+            ExprKind::Prefix(_, inner) | ExprKind::Transfer(inner) | ExprKind::Spread(inner) => {
                 self.rewrite_vm_ctfe_expr(inner, scope)
             }
             ExprKind::Infix(_, left, right) => {
@@ -971,10 +1546,29 @@ impl<'a> Elab<'a> {
                 lower,
                 upper,
                 step,
+                ..
             } => {
                 self.rewrite_vm_ctfe_expr(object, scope)?;
                 for bound in [lower, upper, step].into_iter().flatten() {
                     self.rewrite_vm_ctfe_expr(bound, scope)?;
+                }
+                Ok(())
+            }
+            ExprKind::MultiIndex { object, args } => {
+                self.rewrite_vm_ctfe_expr(object, scope)?;
+                for argument in args {
+                    match argument {
+                        crate::ast::SubscriptArg::Index(value) => {
+                            self.rewrite_vm_ctfe_expr(value, scope)?
+                        }
+                        crate::ast::SubscriptArg::Slice {
+                            lower, upper, step, ..
+                        } => {
+                            for value in [lower, upper, step].into_iter().flatten() {
+                                self.rewrite_vm_ctfe_expr(value, scope)?;
+                            }
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -983,6 +1577,36 @@ impl<'a> Elab<'a> {
                     self.rewrite_vm_ctfe_expr(item, scope)?;
                 }
                 Ok(())
+            }
+            ExprKind::BraceLit(entries) => {
+                for (key, value) in entries {
+                    self.rewrite_vm_ctfe_expr(key, scope)?;
+                    if let Some(value) = value {
+                        self.rewrite_vm_ctfe_expr(value, scope)?;
+                    }
+                }
+                Ok(())
+            }
+            ExprKind::Comprehension {
+                key,
+                value,
+                clauses,
+                ..
+            } => {
+                for clause in clauses {
+                    match clause {
+                        crate::ast::ComprehensionClause::For { iter, .. } => {
+                            self.rewrite_vm_ctfe_expr(iter, scope)?
+                        }
+                        crate::ast::ComprehensionClause::If(condition) => {
+                            self.rewrite_vm_ctfe_expr(condition, scope)?
+                        }
+                    }
+                }
+                if let Some(key) = key {
+                    self.rewrite_vm_ctfe_expr(key, scope)?;
+                }
+                self.rewrite_vm_ctfe_expr(value, scope)
             }
             ExprKind::Named { value, .. } => self.rewrite_vm_ctfe_expr(value, scope),
             ExprKind::IfExpr {
@@ -1014,10 +1638,10 @@ impl<'a> Elab<'a> {
             | ExprKind::Bool(_)
             | ExprKind::Str(_)
             | ExprKind::None
+            | ExprKind::Uninitialized
             | ExprKind::Identifier(_)
             | ExprKind::TypeValue(_)
             | ExprKind::Invoke { .. }
-            | ExprKind::BraceLit(_)
             | ExprKind::TypeApply { .. } => Ok(()),
         }
     }
@@ -1086,7 +1710,7 @@ impl<'a> Elab<'a> {
                     .as_ref()
                     .is_none_or(|body| self.vm_ctfe_safe_block(body, visiting, needed))
             }
-            StmtKind::While { cond, body } => {
+            StmtKind::While { cond, body, .. } => {
                 self.vm_ctfe_safe_expr(cond, visiting, needed)
                     && self.vm_ctfe_safe_block(body, visiting, needed)
             }
@@ -1124,7 +1748,7 @@ impl<'a> Elab<'a> {
             | ExprKind::Str(_)
             | ExprKind::None
             | ExprKind::Identifier(_) => true,
-            ExprKind::Prefix(_, inner) | ExprKind::Transfer(inner) => {
+            ExprKind::Prefix(_, inner) | ExprKind::Transfer(inner) | ExprKind::Spread(inner) => {
                 self.vm_ctfe_safe_expr(inner, visiting, needed)
             }
             ExprKind::Infix(_, left, right) => {
@@ -1159,6 +1783,7 @@ impl<'a> Elab<'a> {
                 lower,
                 upper,
                 step,
+                ..
             } => {
                 self.vm_ctfe_safe_expr(object, visiting, needed)
                     && lower
@@ -1171,6 +1796,20 @@ impl<'a> Elab<'a> {
                         .as_ref()
                         .is_none_or(|e| self.vm_ctfe_safe_expr(e, visiting, needed))
             }
+            ExprKind::MultiIndex { object, args } => {
+                self.vm_ctfe_safe_expr(object, visiting, needed)
+                    && args.iter().all(|argument| match argument {
+                        crate::ast::SubscriptArg::Index(value) => {
+                            self.vm_ctfe_safe_expr(value, visiting, needed)
+                        }
+                        crate::ast::SubscriptArg::Slice {
+                            lower, upper, step, ..
+                        } => [lower, upper, step]
+                            .into_iter()
+                            .flatten()
+                            .all(|value| self.vm_ctfe_safe_expr(value, visiting, needed)),
+                    })
+            }
             ExprKind::Call {
                 name,
                 param_args,
@@ -1181,6 +1820,11 @@ impl<'a> Elab<'a> {
                     && param_args.iter().all(|arg| match arg {
                         ParamArg::Value(e) => self.vm_ctfe_safe_expr(e, visiting, needed),
                         ParamArg::Type(_) => true,
+                        ParamArg::Named { value, .. } => match &**value {
+                            ParamArg::Value(e) => self.vm_ctfe_safe_expr(e, visiting, needed),
+                            ParamArg::Type(_) => true,
+                            ParamArg::Named { .. } => false,
+                        },
                     })
                     && args
                         .iter()
@@ -1191,11 +1835,13 @@ impl<'a> Elab<'a> {
             }
             ExprKind::MethodCall { .. }
             | ExprKind::BraceLit(_)
+            | ExprKind::Comprehension { .. }
             | ExprKind::Invoke { .. }
             | ExprKind::TypeValue(_)
             | ExprKind::TypeApply { .. }
             | ExprKind::Named { .. }
-            | ExprKind::TString { .. } => false,
+            | ExprKind::TString { .. }
+            | ExprKind::Uninitialized => false,
         }
     }
 
@@ -1221,18 +1867,23 @@ impl<'a> Elab<'a> {
                 ParamArg::Value(expr) => Err(ComptimeError::NotComptime(format!(
                     "type parameter '{name}' needs a type argument, got {expr:?}"
                 ))),
+                ParamArg::Named { value, .. } => self.resolve_ct_arg(decl, value, scope),
             },
-            ParamDecl::Value { name } => match arg {
+            ParamDecl::Value { name, ty, .. } => match arg {
                 ParamArg::Value(expr) => {
                     let value = self.eval(expr, scope)?;
-                    match value {
-                        CtValue::Int(_) | CtValue::Bool(_) => Ok(value),
-                        _ => Err(ComptimeError::NotInt(format!("value parameter '{name}'"))),
+                    if ct_value_has_type(&value, ty) {
+                        Ok(value)
+                    } else {
+                        Err(ComptimeError::NotComptime(format!(
+                            "value parameter '{name}' expects {ty}, got {value}"
+                        )))
                     }
                 }
                 ParamArg::Type(_) => {
                     Err(ComptimeError::NotInt(format!("value parameter '{name}'")))
                 }
+                ParamArg::Named { value, .. } => self.resolve_ct_arg(decl, value, scope),
             },
         }
     }
@@ -1283,9 +1934,13 @@ impl<'a> Elab<'a> {
                 kind: ExprKind::TypeApply { name, args },
                 ..
             }) => self.type_from_name(name, args, scope),
-            ParamArg::Value(_) => Err(ComptimeError::NotComptime(
-                "expected a type argument".to_string(),
-            )),
+            ParamArg::Value(expr) => match self.eval(expr, scope)? {
+                CtValue::Type(ty) => Ok(*ty),
+                _ => Err(ComptimeError::NotComptime(
+                    "expected a type argument".to_string(),
+                )),
+            },
+            ParamArg::Named { value, .. } => self.param_arg_type(value, scope),
         }
     }
 
@@ -1312,6 +1967,13 @@ impl<'a> Elab<'a> {
                 ))),
             },
             Type::Assoc { base, name } => {
+                if let Type::Named(binding, args) = &**base
+                    && args.is_empty()
+                    && name == "T"
+                    && let Some(CtValue::Reflected(ty)) = scope.get(binding)
+                {
+                    return Ok((**ty).clone());
+                }
                 let base = self.type_from_anno(base, scope)?;
                 match self.associated_value(&base, name)? {
                     CtValue::Type(ty) => Ok(*ty),
@@ -1340,6 +2002,24 @@ impl<'a> Elab<'a> {
             if let Some(ty) = scalar_type_name(name) {
                 return Ok(ty);
             }
+        }
+        // In type-argument grammar, `types[i]` is represented as a named type
+        // application. A reflected `field_types()` result is a compile-time
+        // sequence of type values, so interpret that spelling as dependent
+        // type-list indexing.
+        if let Some(CtValue::Tuple(values) | CtValue::List(values)) = scope.get(name)
+            && let [ParamArg::Value(index)] = args
+        {
+            let index = self.eval(index, scope)?.as_int("type-list index")?;
+            return match values.get(index as usize) {
+                Some(CtValue::Type(ty)) => Ok((**ty).clone()),
+                Some(_) => Err(ComptimeError::NotComptime(format!(
+                    "'{name}[{index}]' is not type-valued"
+                ))),
+                None => Err(ComptimeError::BadArithmetic(format!(
+                    "type-list index {index} out of range"
+                ))),
+            };
         }
         let Some(info) = self.structs.get(name) else {
             return Err(ComptimeError::NotComptime(format!(
@@ -1395,7 +2075,7 @@ impl<'a> Elab<'a> {
                 (ParamDecl::Type { name, .. }, TyArg::Ty(ty)) => {
                     env.insert(name.clone(), CtValue::Type(Box::new(ty.clone())));
                 }
-                (ParamDecl::Value { name }, TyArg::Val(value)) => {
+                (ParamDecl::Value { name, .. }, TyArg::Val(value)) => {
                     env.insert(name.clone(), value.clone());
                 }
                 _ => {}
@@ -1428,6 +2108,12 @@ impl<'a> Elab<'a> {
         // Drain the worklist, generating each requested specialization and scanning
         // its body for further (e.g. recursive) instantiations.
         while let Some(job) = mono.queue.pop_front() {
+            self.burn().map_err(|_| {
+                ComptimeError::NotComptime(format!(
+                    "specialization quota exceeded while instantiating '{}' requested at {}; possible unbounded generic recursion",
+                    mangle(&job.orig, &job.vals), job.site
+                ))
+            })?;
             let mut def = self.generate_spec(&job.orig, &job.vals)?;
             if let StmtKind::Def { body, .. } = &mut def.kind {
                 self.mono_block(body, &consts, &mut mono)?;
@@ -1496,11 +2182,45 @@ impl<'a> Elab<'a> {
             subs.remove(&p.name);
         }
         let mut kept_type_params = Vec::new();
+        let mut specialized_params = params.clone();
+        let mut type_pack_expansions: HashMap<String, Vec<Type>> = HashMap::new();
+        let mut runtime_pack_lengths: HashMap<String, usize> = HashMap::new();
         for ((decl, tp), v) in decls.iter().zip(type_params).zip(vals) {
-            env.insert(decl.name().to_string(), v.clone());
+            let binding = decl.name().trim_start_matches('*').to_string();
+            env.insert(binding.clone(), v.clone());
             match decl {
-                ParamDecl::Value { name } => {
-                    subs.insert(name.clone(), v.clone());
+                ParamDecl::Value { name, .. } => {
+                    subs.insert(name.trim_start_matches('*').to_string(), v.clone());
+                }
+                ParamDecl::Type { variadic: true, .. } => {
+                    let CtValue::Tuple(types) = v else {
+                        return Err(ComptimeError::NotComptime(
+                            "a type pack specialization requires a tuple of types".to_string(),
+                        ));
+                    };
+                    let source_types = types
+                        .iter()
+                        .map(|value| match value {
+                            CtValue::Type(ty) => source_type_from_ty(ty),
+                            _ => None,
+                        })
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or_else(|| {
+                            ComptimeError::NotComptime(
+                                "type pack contains a non-type value".to_string(),
+                            )
+                        })?;
+                    type_pack_expansions.insert(binding.clone(), source_types.clone());
+                    for parameter in &mut specialized_params {
+                        if matches!(&parameter.ty, Type::Named(name, _) if name.trim_start_matches('*') == decl.name().trim_start_matches('*'))
+                        {
+                            runtime_pack_lengths.insert(parameter.name.clone(), source_types.len());
+                            parameter.ty = Type::Named(
+                                "$pack".to_string(),
+                                source_types.iter().cloned().map(ParamArg::Type).collect(),
+                            );
+                        }
+                    }
                 }
                 ParamDecl::Type { .. } => kept_type_params.push(tp.clone()),
             }
@@ -1522,18 +2242,38 @@ impl<'a> Elab<'a> {
         // Elaborate the body with the parameters bound, so its comptime constructs
         // select/unroll against the concrete arguments.
         let elaborated = self.block(body, &mut env, true)?;
-        let final_body = materialize_block(elaborated, &subs);
+        let mut final_body = materialize_block(elaborated, &subs);
+        expand_pack_spreads_in_block(
+            &mut final_body,
+            &type_pack_expansions,
+            &runtime_pack_lengths,
+        );
+        let mut specialized_ret = ret.clone();
+        if let Some(ret) = &mut specialized_ret {
+            expand_type_packs(ret, &type_pack_expansions);
+        }
+        for parameter in &mut specialized_params {
+            expand_type_packs(&mut parameter.ty, &type_pack_expansions);
+        }
         Ok(mk(
             StmtKind::Def {
                 name: mangle(orig, vals),
                 decorators: decorators.clone(),
                 type_params: kept_type_params,
-                params: params.clone(),
+                params: specialized_params,
                 positional_only: *positional_only,
                 keyword_only: *keyword_only,
+                captures: match &template.kind {
+                    StmtKind::Def { captures, .. } => captures.clone(),
+                    _ => None,
+                },
                 raises: *raises,
                 raises_type: raises_type.clone(),
-                ret: ret.clone(),
+                ret: specialized_ret,
+                where_clause: match &template.kind {
+                    StmtKind::Def { where_clause, .. } => where_clause.clone(),
+                    _ => None,
+                },
                 body: final_body,
             },
             template.span,
@@ -1595,7 +2335,7 @@ impl<'a> Elab<'a> {
                 }
                 Ok(())
             }
-            StmtKind::While { cond, body } => {
+            StmtKind::While { cond, body, .. } => {
                 self.mono_expr(cond, consts, mono)?;
                 self.mono_block(body, consts, mono)
             }
@@ -1643,6 +2383,7 @@ impl<'a> Elab<'a> {
         consts: &HashMap<String, CtValue>,
         mono: &mut Mono,
     ) -> Result<(), ComptimeError> {
+        let request_site = format!("{:?}", e.source_span());
         match &mut e.kind {
             ExprKind::Int(_)
             | ExprKind::Float(_)
@@ -1652,7 +2393,7 @@ impl<'a> Elab<'a> {
             | ExprKind::Identifier(_)
             | ExprKind::TString { .. }
             | ExprKind::TypeApply { .. } => Ok(()),
-            ExprKind::Prefix(_, inner) | ExprKind::Transfer(inner) => {
+            ExprKind::Prefix(_, inner) | ExprKind::Transfer(inner) | ExprKind::Spread(inner) => {
                 self.mono_expr(inner, consts, mono)
             }
             ExprKind::Infix(_, l, r) => {
@@ -1686,6 +2427,7 @@ impl<'a> Elab<'a> {
                         mono.queue.push_back(Job {
                             orig: name.clone(),
                             vals,
+                            site: request_site,
                         });
                     }
                     *name = mangled;
@@ -1720,10 +2462,29 @@ impl<'a> Elab<'a> {
                 lower,
                 upper,
                 step,
+                ..
             } => {
                 self.mono_expr(object, consts, mono)?;
                 for b in [lower, upper, step].into_iter().flatten() {
                     self.mono_expr(b, consts, mono)?;
+                }
+                Ok(())
+            }
+            ExprKind::MultiIndex { object, args } => {
+                self.mono_expr(object, consts, mono)?;
+                for argument in args {
+                    match argument {
+                        crate::ast::SubscriptArg::Index(value) => {
+                            self.mono_expr(value, consts, mono)?
+                        }
+                        crate::ast::SubscriptArg::Slice {
+                            lower, upper, step, ..
+                        } => {
+                            for value in [lower, upper, step].into_iter().flatten() {
+                                self.mono_expr(value, consts, mono)?;
+                            }
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -1733,10 +2494,40 @@ impl<'a> Elab<'a> {
                 }
                 Ok(())
             }
+            ExprKind::BraceLit(entries) => {
+                for (key, value) in entries {
+                    self.mono_expr(key, consts, mono)?;
+                    if let Some(value) = value {
+                        self.mono_expr(value, consts, mono)?;
+                    }
+                }
+                Ok(())
+            }
+            ExprKind::Comprehension {
+                key,
+                value,
+                clauses,
+                ..
+            } => {
+                for clause in clauses {
+                    match clause {
+                        crate::ast::ComprehensionClause::For { iter, .. } => {
+                            self.mono_expr(iter, consts, mono)?
+                        }
+                        crate::ast::ComprehensionClause::If(condition) => {
+                            self.mono_expr(condition, consts, mono)?
+                        }
+                    }
+                }
+                if let Some(key) = key {
+                    self.mono_expr(key, consts, mono)?;
+                }
+                self.mono_expr(value, consts, mono)
+            }
             ExprKind::Named { value, .. } => self.mono_expr(value, consts, mono),
             ExprKind::TypeValue(_) => Ok(()),
             ExprKind::Invoke { .. } => Ok(()),
-            ExprKind::BraceLit(_) => Ok(()),
+            ExprKind::Uninitialized => Ok(()),
             ExprKind::IfExpr {
                 cond,
                 then_branch,
@@ -1772,20 +2563,58 @@ impl<'a> Elab<'a> {
         consts: &HashMap<String, CtValue>,
     ) -> Result<(Vec<CtValue>, Vec<ParamArg>), ComptimeError> {
         let decls = self.template_decls(name)?;
-        if param_args.is_empty()
-            && let [ParamDecl::Type { name: pack, .. }] = decls.as_slice()
+        if let [
+            ParamDecl::Value {
+                name: pack,
+                ty,
+                variadic: true,
+                ..
+            },
+        ] = decls.as_slice()
+        {
+            let mut values = Vec::with_capacity(param_args.len());
+            for argument in param_args {
+                let value = self.resolve_ct_arg(&decls[0], argument, consts)?;
+                if !ct_value_has_type(&value, ty) {
+                    return Err(ComptimeError::NotComptime(format!(
+                        "value pack '{}' expects {ty}, got {value}",
+                        pack.trim_start_matches('*')
+                    )));
+                }
+                values.push(value);
+            }
+            return Ok((vec![CtValue::Tuple(values)], Vec::new()));
+        }
+        if let [ParamDecl::Type { name: pack, .. }] = decls.as_slice()
             && pack.starts_with('*')
         {
-            let types = call_args
-                .iter()
-                .map(infer_pack_argument_type)
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .map(|ty| CtValue::Type(Box::new(ty)))
-                .collect();
+            let types = if param_args.is_empty() {
+                call_args
+                    .iter()
+                    .map(infer_pack_argument_type)
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                param_args
+                    .iter()
+                    .map(|argument| self.param_arg_type(argument, consts))
+                    .collect::<Result<Vec<_>, _>>()?
+            }
+            .into_iter()
+            .map(|ty| CtValue::Type(Box::new(ty)))
+            .collect();
             return Ok((vec![CtValue::Tuple(types)], Vec::new()));
         }
-        if param_args.len() != decls.len() {
+        if param_args.len() > decls.len()
+            || decls[param_args.len()..].iter().any(|decl| {
+                !matches!(
+                    decl,
+                    ParamDecl::Value {
+                        default: Some(_),
+                        ..
+                    }
+                )
+            })
+        {
             return Err(ComptimeError::Arity(format!(
                 "generic '{name}' must be called with {} explicit argument(s), got {}",
                 decls.len(),
@@ -1796,10 +2625,22 @@ impl<'a> Elab<'a> {
         let mut kept_type_args = Vec::new();
         for (decl, arg) in decls.iter().zip(param_args) {
             match decl {
-                ParamDecl::Value { name: pn } => match arg {
-                    ParamArg::Value(expr) => vals.push(self.eval(expr, consts)?),
+                ParamDecl::Value { name: pn, ty, .. } => match arg {
+                    ParamArg::Value(expr) => {
+                        let value = self.eval(expr, consts)?;
+                        if !ct_value_has_type(&value, ty) {
+                            return Err(ComptimeError::NotComptime(format!(
+                                "value parameter '{pn}' expects {ty}, got {value}"
+                            )));
+                        }
+                        vals.push(value);
+                    }
                     ParamArg::Type(_) => {
                         return Err(ComptimeError::NotInt(format!("value parameter '{pn}'")));
+                    }
+                    ParamArg::Named { value, .. } => {
+                        let value = self.resolve_ct_arg(decl, value, consts)?;
+                        vals.push(value);
                     }
                 },
                 ParamDecl::Type { .. } => {
@@ -1809,7 +2650,54 @@ impl<'a> Elab<'a> {
                 }
             }
         }
+        for decl in &decls[param_args.len()..] {
+            let ParamDecl::Value {
+                default: Some(value),
+                ..
+            } = decl
+            else {
+                unreachable!("missing specialization defaults rejected above")
+            };
+            let environment: HashMap<String, CtValue> = decls
+                .iter()
+                .zip(&vals)
+                .filter(|(_, value)| !matches!(value, CtValue::Type(_)))
+                .map(|(decl, value)| {
+                    (
+                        decl.name().trim_start_matches('*').to_string(),
+                        value.clone(),
+                    )
+                })
+                .collect();
+            vals.push(value.evaluate(&environment).ok_or_else(|| {
+                ComptimeError::NotComptime(format!(
+                    "cannot evaluate default for parameter '{}'",
+                    decl.name()
+                ))
+            })?);
+        }
         Ok((vals, kept_type_args))
+    }
+}
+
+fn ct_value_has_type(value: &CtValue, ty: &Ty) -> bool {
+    match (value, ty) {
+        (CtValue::Int(_), Ty::Int)
+        | (CtValue::UInt(_), Ty::UInt)
+        | (CtValue::Float(_), Ty::Float64)
+        | (CtValue::Bool(_), Ty::Bool)
+        | (CtValue::Str(_), Ty::String) => true,
+        (CtValue::Tuple(values), Ty::Tuple(types)) => {
+            values.len() == types.len()
+                && values
+                    .iter()
+                    .zip(types)
+                    .all(|(value, ty)| ct_value_has_type(value, ty))
+        }
+        (CtValue::List(values), Ty::List(element)) => {
+            values.iter().all(|value| ct_value_has_type(value, element))
+        }
+        _ => false,
     }
 }
 
@@ -1828,17 +2716,104 @@ fn infer_pack_argument_type(expr: &Expr) -> Result<Ty, ComptimeError> {
             "String" => Ty::String,
             other => Ty::Struct(other.to_string(), Vec::new()),
         }),
+        ExprKind::Prefix(_, value) | ExprKind::Transfer(value) => infer_pack_argument_type(value),
+        ExprKind::Infix(op, left, right) => {
+            let left = infer_pack_argument_type(left)?;
+            let right = infer_pack_argument_type(right)?;
+            if matches!(op, InfixOp::Eq | InfixOp::Ne | InfixOp::Lt | InfixOp::Le | InfixOp::Gt | InfixOp::Ge | InfixOp::And | InfixOp::Or) {
+                return Ok(Ty::Bool);
+            }
+            if left == right {
+                Ok(left)
+            } else if matches!((&left, &right), (Ty::Int, Ty::Float64) | (Ty::Float64, Ty::Int)) {
+                Ok(Ty::Float64)
+            } else {
+                Err(ComptimeError::NotComptime(format!(
+                    "cannot infer a pack element type for operands {left} and {right}"
+                )))
+            }
+        }
+        ExprKind::ListLit(values) => {
+            let mut types = values.iter().map(infer_pack_argument_type);
+            let first = types.next().transpose()?.ok_or_else(|| {
+                ComptimeError::NotComptime("cannot infer an empty list pack argument".to_string())
+            })?;
+            if types.all(|ty| matches!(ty, Ok(ty) if ty == first)) {
+                Ok(Ty::List(Box::new(first)))
+            } else {
+                Err(ComptimeError::NotComptime(
+                    "a list pack argument must have one element type".to_string(),
+                ))
+            }
+        }
+        ExprKind::TupleLit(values) => values
+            .iter()
+            .map(infer_pack_argument_type)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Ty::Tuple),
+        ExprKind::IfExpr {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            let then_ty = infer_pack_argument_type(then_branch)?;
+            let else_ty = infer_pack_argument_type(else_branch)?;
+            if then_ty == else_ty {
+                Ok(then_ty)
+            } else {
+                Err(ComptimeError::NotComptime(
+                    "conditional pack argument branches have different types".to_string(),
+                ))
+            }
+        }
         _ => Err(ComptimeError::NotComptime(
-            "a heterogeneous pack specialization currently needs literal or constructed arguments"
+            "a heterogeneous pack specialization needs an expression whose type is statically evident before checking"
                 .to_string(),
         )),
     }
+}
+
+fn source_type_from_ty(ty: &Ty) -> Option<Type> {
+    Some(match ty {
+        Ty::Int | Ty::IntLiteral => Type::Int,
+        Ty::UInt => Type::UInt,
+        Ty::Bool => Type::Bool,
+        Ty::String => Type::String,
+        Ty::Float64 | Ty::FloatLiteral => Type::Float64,
+        Ty::None => Type::None,
+        Ty::List(element) => Type::Named(
+            "List".to_string(),
+            vec![ParamArg::Type(source_type_from_ty(element)?)],
+        ),
+        Ty::Tuple(elements) => Type::Named(
+            "Tuple".to_string(),
+            elements
+                .iter()
+                .map(source_type_from_ty)
+                .collect::<Option<Vec<_>>>()?
+                .into_iter()
+                .map(ParamArg::Type)
+                .collect(),
+        ),
+        Ty::Struct(name, arguments) => Type::Named(
+            name.clone(),
+            arguments
+                .iter()
+                .map(|argument| match argument {
+                    TyArg::Ty(ty) => source_type_from_ty(ty).map(ParamArg::Type),
+                    TyArg::Val(value) => value.materialize((0, 0)).map(ParamArg::Value),
+                })
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        _ => return None,
+    })
 }
 
 /// A pending specialization request: template `orig`, specialized for `vals`.
 struct Job {
     orig: String,
     vals: Vec<CtValue>,
+    site: String,
 }
 
 /// The monomorphization worklist and its results.
@@ -1858,9 +2833,42 @@ fn mangle(orig: &str, vals: &[CtValue]) -> String {
     let mut s = orig.to_string();
     for v in vals {
         s.push('$');
-        s.push_str(&v.to_string());
+        encode_specialization_value(v, &mut s);
     }
     s
+}
+
+fn encode_specialization_value(value: &CtValue, out: &mut String) {
+    match value {
+        CtValue::Int(value) => out.push_str(&format!("i{value};")),
+        CtValue::UInt(value) => out.push_str(&format!("u{value};")),
+        CtValue::Float(bits) => out.push_str(&format!("f{bits:016x};")),
+        CtValue::Bool(value) => out.push_str(if *value { "b1;" } else { "b0;" }),
+        CtValue::Str(value) => out.push_str(&format!("s{}:{value}", value.len())),
+        CtValue::Tuple(values) => {
+            out.push_str(&format!("t{}[", values.len()));
+            for value in values {
+                encode_specialization_value(value, out);
+            }
+            out.push(']');
+        }
+        CtValue::List(values) => {
+            out.push_str(&format!("l{}[", values.len()));
+            for value in values {
+                encode_specialization_value(value, out);
+            }
+            out.push(']');
+        }
+        CtValue::Type(ty) => {
+            let rendered = ty.to_string();
+            out.push_str(&format!("y{}:{rendered}", rendered.len()));
+        }
+        CtValue::Reflected(ty) => {
+            let rendered = ty.to_string();
+            out.push_str(&format!("r{}:{rendered}", rendered.len()));
+        }
+        CtValue::Param(name) => out.push_str(&format!("p{}:{name}", name.len())),
+    }
 }
 
 fn compare_ints(op: InfixOp, a: i64, b: i64) -> Result<bool, ComptimeError> {
@@ -1899,6 +2907,8 @@ fn lit_result(val: &CtValue, span: Span) -> Result<Expr, ComptimeError> {
 fn ct_to_vm(value: &CtValue) -> Result<Value, ComptimeError> {
     match value {
         CtValue::Int(n) => Ok(Value::Int(*n)),
+        CtValue::UInt(n) => Ok(Value::UInt(*n)),
+        CtValue::Float(bits) => Ok(Value::Float64(f64::from_bits(*bits))),
         CtValue::Bool(b) => Ok(Value::Bool(*b)),
         CtValue::Str(s) => Ok(Value::Str(s.clone())),
         CtValue::Tuple(items) => Ok(Value::Tuple(
@@ -1907,15 +2917,19 @@ fn ct_to_vm(value: &CtValue) -> Result<Value, ComptimeError> {
         CtValue::List(items) => Ok(Value::List(
             items.iter().map(ct_to_vm).collect::<Result<Vec<_>, _>>()?,
         )),
-        CtValue::Type(_) | CtValue::Param(_) => Err(ComptimeError::NotComptime(
-            "type-valued or symbolic values cannot cross into VM CTFE".to_string(),
-        )),
+        CtValue::Type(_) | CtValue::Reflected(_) | CtValue::Param(_) => {
+            Err(ComptimeError::NotComptime(
+                "type-valued or symbolic values cannot cross into VM CTFE".to_string(),
+            ))
+        }
     }
 }
 
 fn vm_to_ct(value: Value) -> Result<CtValue, ComptimeError> {
     match value {
         Value::Int(n) => Ok(CtValue::Int(n)),
+        Value::UInt(n) => Ok(CtValue::UInt(n)),
+        Value::Float64(value) => Ok(CtValue::Float(value.to_bits())),
         Value::Bool(b) => Ok(CtValue::Bool(b)),
         Value::Str(s) => Ok(CtValue::Str(s)),
         Value::Tuple(items) => Ok(CtValue::Tuple(

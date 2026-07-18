@@ -8,8 +8,9 @@
 use std::iter::Peekable;
 
 use crate::ast::{
-    ArgConvention, Decorator, Expr, ExprKind, FnParam, InfixOp, KwArg, Method, Param, ParamKind,
-    PrefixOp, Stmt, StmtKind, TStringPart, Type, WithItem,
+    ArgConvention, Capture, CaptureKind, CaptureList, Decorator, Expr, ExprKind, FnParam, InfixOp,
+    KwArg, Method, Param, ParamKind, PrefixOp, Stmt, StmtKind, SubscriptArg, TStringPart, Type,
+    WithItem,
 };
 use crate::error::{LexError, ParseError};
 use crate::lexer::Lexer;
@@ -26,6 +27,18 @@ struct ParamList {
 /// The parsed body of an `if`/`elif`/`else` chain: the `(condition, body)`
 /// branches plus the optional `else` body. Shared by `if` and `comptime if`.
 type IfChain = (Vec<(Expr, Vec<Stmt>)>, Option<Vec<Stmt>>);
+type StructConformanceList = (Vec<String>, Vec<(String, Expr)>, Option<Type>);
+type ParsedSliceTail = (Option<Box<Expr>>, Option<Box<Expr>>, bool);
+
+enum ParsedBracketItem {
+    Param(crate::ast::ParamArg),
+    Slice {
+        lower: Option<Box<Expr>>,
+        upper: Option<Box<Expr>>,
+        step: Option<Box<Expr>>,
+        explicit_step: bool,
+    },
+}
 
 /// Binding-power levels, lowest to highest. Mirrors Python/Mojo expression
 /// precedence for the implemented operator set (no bitwise / `**` yet).
@@ -337,11 +350,22 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
             let mut targets = vec![expr];
             while matches!(self.peek_token()?, Some(Token::Comma)) {
                 // A trailing comma before `=` is allowed (`a, = t`, `a, b, = t`).
+                // Without a following `=`, the same comma syntax is a bare tuple
+                // display (`a, b`), because the comma creates the tuple.
                 self.next_token()?; // consume ','
-                if matches!(self.peek_token()?, Some(Token::Assign)) {
+                if matches!(
+                    self.peek_token()?,
+                    Some(Token::Assign | Token::Newline | Token::Semicolon | Token::Eof) | None
+                ) {
                     break;
                 }
                 targets.push(self.parse_expression(Precedence::Lowest)?);
+            }
+            if !matches!(self.peek_token()?, Some(Token::Assign)) {
+                let start = targets[0].span.0;
+                let display = self.node(ExprKind::TupleLit(targets), start);
+                self.expect_stmt_end()?;
+                return Ok(StmtKind::Expr(display));
             }
             for target in &targets {
                 if !matches!(
@@ -358,17 +382,24 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
                 Token::Assign,
                 "Expected '=' after the unpacking target list",
             )?;
-            let value = self.parse_expression(Precedence::Lowest)?;
+            let value = self.parse_tuple_display()?;
             self.expect_stmt_end()?;
             return Ok(StmtKind::Unpack { targets, value });
         }
 
         if matches!(self.peek_token()?, Some(Token::Assign)) {
             self.next_token()?; // consume '='
-            let value = self.parse_expression(Precedence::Lowest)?;
+            let value = self.parse_tuple_display()?;
             let stmt = if let ExprKind::Identifier(name) = expr.kind {
                 StmtKind::Assign { name, value }
-            } else if matches!(expr.kind, ExprKind::Member { .. } | ExprKind::Index { .. }) {
+            } else if matches!(
+                expr.kind,
+                ExprKind::Member { .. }
+                    | ExprKind::Index { .. }
+                    | ExprKind::Slice { .. }
+                    | ExprKind::MultiIndex { .. }
+                    | ExprKind::TypeApply { .. }
+            ) {
                 // A field/index chain — the checker verifies its root is a
                 // mutable variable (or `mut self`) and that the write is valid.
                 StmtKind::SetPlace { place: expr, value }
@@ -387,7 +418,10 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
             self.next_token()?; // consume the `OP=` token
             if !matches!(
                 expr.kind,
-                ExprKind::Identifier(_) | ExprKind::Member { .. } | ExprKind::Index { .. }
+                ExprKind::Identifier(_)
+                    | ExprKind::Member { .. }
+                    | ExprKind::Index { .. }
+                    | ExprKind::TypeApply { .. }
             ) {
                 return Err(ParseError::UnexpectedToken(
                     Token::Assign,
@@ -422,7 +456,7 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
                 Token::Assign,
                 "Expected '=' after variable unpacking targets",
             )?;
-            let value = self.parse_expression(Precedence::Lowest)?;
+            let value = self.parse_tuple_display()?;
             self.expect_stmt_end()?;
             return Ok(StmtKind::Unpack { targets, value });
         }
@@ -435,12 +469,36 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         };
         let value = if matches!(self.peek_token()?, Some(Token::Assign)) {
             self.next_token()?;
-            self.parse_expression(Precedence::Lowest)?
+            self.parse_tuple_display()?
         } else {
-            Expr::new(ExprKind::None, self.last_span)
+            Expr::new(ExprKind::Uninitialized, self.last_span)
         };
         self.expect_stmt_end()?;
         Ok(StmtKind::VarDecl { name, ty, value })
+    }
+
+    /// Parse an expression in a statement-RHS position, where a top-level comma
+    /// forms a tuple without requiring parentheses (`var pair = 1, "one"`).
+    /// Delimited expression lists (call arguments, list elements, and so on) keep
+    /// using `parse_expression` so their commas remain delimiters.
+    fn parse_tuple_display(&mut self) -> Result<Expr, ParseError> {
+        let first = self.parse_expression(Precedence::Lowest)?;
+        if !matches!(self.peek_token()?, Some(Token::Comma)) {
+            return Ok(first);
+        }
+        let start = first.span.0;
+        let mut elements = vec![first];
+        while matches!(self.peek_token()?, Some(Token::Comma)) {
+            self.next_token()?;
+            if matches!(
+                self.peek_token()?,
+                Some(Token::Newline | Token::Semicolon | Token::Eof) | None
+            ) {
+                break;
+            }
+            elements.push(self.parse_expression(Precedence::Lowest)?);
+        }
+        Ok(self.node(ExprKind::TupleLit(elements), start))
     }
 
     /// `ref name = expression` — Mojo's explicit reference binding. The AST
@@ -469,7 +527,13 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
                 Ok(StmtKind::ComptimeIf { branches, orelse })
             }
             Some(Token::For) => {
-                let (var, iter, body) = self.parse_for_rest()?;
+                let (var, reference, owned, iter, body) = self.parse_for_rest()?;
+                if reference || owned {
+                    return Err(ParseError::UnexpectedToken(
+                        Token::For,
+                        "comptime for cannot use an explicit ref/var binding".to_string(),
+                    ));
+                }
                 Ok(StmtKind::ComptimeFor { var, iter, body })
             }
             _ => {
@@ -562,6 +626,8 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         } = self.parse_params()?;
         self.expect(Token::RParen, "Expected ')' after parameters")?;
 
+        let captures = self.parse_unified_captures()?;
+
         let (raises, raises_type) = self.parse_raises_effect()?;
         if matches!(self.peek_token()?, Some(Token::Identifier(id)) if id == "abi") {
             self.next_token()?;
@@ -586,6 +652,14 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
             self.expect(Token::RBrace, "Expected '}' after function effects")?;
         }
 
+        let where_clause = if matches!(self.peek_token()?, Some(Token::Identifier(word)) if word == "where")
+        {
+            self.next_token()?;
+            Some(self.parse_expression(Precedence::Lowest)?)
+        } else {
+            None
+        };
+
         self.expect(Token::Colon, "Expected ':' before the function body")?;
         let body = self.parse_suite()?;
 
@@ -596,11 +670,73 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
             params,
             positional_only,
             keyword_only,
+            captures,
             raises,
             raises_type,
             ret,
+            where_clause,
             body,
         })
+    }
+
+    fn parse_unified_captures(&mut self) -> Result<Option<CaptureList>, ParseError> {
+        if !matches!(self.peek_token()?, Some(Token::Identifier(word)) if word == "unified") {
+            return Ok(None);
+        }
+        self.next_token()?;
+        self.expect(Token::LBrace, "Expected '{' after 'unified'")?;
+        let mut entries = Vec::new();
+        let mut default_read = false;
+        while !matches!(self.peek_token()?, Some(Token::RBrace)) {
+            let mutable =
+                matches!(self.peek_token()?, Some(Token::Identifier(word)) if word == "mut");
+            if mutable {
+                self.next_token()?;
+            }
+            let mut name = self.expect_identifier("Expected a captured name")?;
+            let immutable = matches!(name.as_str(), "imm" | "read")
+                && matches!(self.peek_token()?, Some(Token::Identifier(_)));
+            if immutable {
+                name = self.expect_identifier("Expected a name after the capture convention")?;
+            }
+            let moved = matches!(self.peek_token()?, Some(Token::Caret));
+            if moved {
+                self.next_token()?;
+            }
+            if matches!(name.as_str(), "imm" | "read") && !mutable && !immutable && !moved {
+                default_read = true;
+            } else {
+                if entries.iter().any(|capture: &Capture| capture.name == name) {
+                    return Err(ParseError::UnexpectedToken(
+                        Token::Identifier(name.clone()),
+                        format!("duplicate capture '{name}'"),
+                    ));
+                }
+                entries.push(Capture {
+                    name,
+                    kind: if moved {
+                        CaptureKind::Move
+                    } else if mutable {
+                        CaptureKind::Mut
+                    } else {
+                        CaptureKind::Read
+                    },
+                });
+            }
+            if matches!(self.peek_token()?, Some(Token::Comma)) {
+                self.next_token()?;
+            } else if !matches!(self.peek_token()?, Some(Token::RBrace)) {
+                return Err(ParseError::UnexpectedToken(
+                    self.next_token()?,
+                    "Expected ',' or '}' in capture list".to_string(),
+                ));
+            }
+        }
+        self.next_token()?;
+        Ok(Some(CaptureList {
+            entries,
+            default_read,
+        }))
     }
 
     /// Parses an optional `raises` effect after a function's parameter list. An
@@ -838,6 +974,30 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
                         keyword_only = Some(params.len());
                     }
                 }
+                // Current Mojo places the ownership convention before the pack
+                // marker: `var *args: *Ts` (not `*var args`).
+                Some(Token::Var) => {
+                    self.next_token()?;
+                    if matches!(self.peek_token()?, Some(Token::Star)) {
+                        self.next_token()?;
+                        let name = self.expect_identifier("Expected a name after 'var *'")?;
+                        params.push(self.finish_param(
+                            name,
+                            ParamKind::Variadic,
+                            Some(ArgConvention::Var),
+                            None,
+                        )?);
+                    } else {
+                        let name = self
+                            .expect_identifier("Expected a parameter name after the convention")?;
+                        params.push(self.finish_param(
+                            name,
+                            ParamKind::Regular,
+                            Some(ArgConvention::Var),
+                            None,
+                        )?);
+                    }
+                }
                 // A regular parameter, with an optional convention prefix.
                 _ => {
                     let (convention, origin, name) = self.parse_convention_and_name()?;
@@ -891,7 +1051,7 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         }) else {
             return Err(ParseError::UnexpectedToken(
                 Token::Identifier(word),
-                "expected a parameter name (or a convention: read/mut/var/out/ref)".into(),
+                "expected a parameter name (or a convention: imm/mut/var/out/ref)".into(),
             ));
         };
         // A `ref` convention may carry an origin specifier: `ref[origin] name`.
@@ -964,7 +1124,8 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         self.expect(Token::Struct, "Expected 'struct'")?;
         let name = self.expect_identifier("Expected a struct name after 'struct'")?;
         let type_params = self.parse_type_params()?;
-        let conforms = self.parse_conformance()?;
+        let (conforms, conformance_conditions, callable_conformance) =
+            self.parse_struct_conformance()?;
         self.expect(Token::Colon, "Expected ':' after the struct name")?;
         self.expect_stmt_end()?;
 
@@ -1030,6 +1191,8 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
             decorators,
             type_params,
             conforms,
+            callable_conformance,
+            conformance_conditions,
             fields,
             associated,
             methods,
@@ -1069,6 +1232,56 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         }
         self.expect(Token::RParen, "Expected ')' after the conformance list")?;
         Ok(traits)
+    }
+
+    /// Current Mojo permits a predicate after an individual struct conformance:
+    /// `Trait where conforms_to(T, Trait)`. Conditions are retained separately
+    /// while the nominal trait-name list remains compatible with existing passes.
+    fn parse_struct_conformance(&mut self) -> Result<StructConformanceList, ParseError> {
+        if !matches!(self.peek_token()?, Some(Token::LParen)) {
+            return Ok((Vec::new(), Vec::new(), None));
+        }
+        self.next_token()?;
+        let mut traits = Vec::new();
+        let mut conditions = Vec::new();
+        let mut callable = None;
+        loop {
+            if matches!(self.peek_token()?, Some(Token::Def)) {
+                if callable.is_some() {
+                    return Err(ParseError::UnexpectedToken(
+                        Token::Def,
+                        "a struct may declare only one def(...) callable conformance".into(),
+                    ));
+                }
+                callable = Some(self.parse_type()?);
+                if matches!(self.peek_token()?, Some(Token::Comma)) {
+                    self.next_token()?;
+                    if matches!(self.peek_token()?, Some(Token::RParen)) {
+                        break;
+                    }
+                    continue;
+                }
+                break;
+            }
+            let trait_name =
+                self.expect_identifier("Expected a trait name in the conformance list")?;
+            traits.push(trait_name.clone());
+            if matches!(self.peek_token()?, Some(Token::Identifier(word)) if word == "where") {
+                self.next_token()?;
+                let condition = self.parse_expression(Precedence::Lowest)?;
+                conditions.push((trait_name, condition));
+            }
+            if matches!(self.peek_token()?, Some(Token::Comma)) {
+                self.next_token()?;
+                if matches!(self.peek_token()?, Some(Token::RParen)) {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        self.expect(Token::RParen, "Expected ')' after the conformance list")?;
+        Ok((traits, conditions, callable))
     }
 
     /// `trait Name[(Super, …)]: <members>` — a trait, optionally **refining**
@@ -1122,7 +1335,20 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         self.expect(Token::Comptime, "Expected 'comptime'")?;
         let name = self.expect_identifier("Expected a name after 'comptime'")?;
         self.expect(Token::Colon, "Expected ':' after the comptime member name")?;
-        let ty = self.parse_type()?;
+        let first = self.parse_type()?;
+        let mut bounds = vec![first];
+        while matches!(self.peek_token()?, Some(Token::Amp)) {
+            self.next_token()?;
+            bounds.push(self.parse_type()?);
+        }
+        let ty = if bounds.len() == 1 {
+            bounds.pop().expect("one associated member annotation")
+        } else {
+            crate::ast::Type::Named(
+                "$trait_composition".to_string(),
+                bounds.into_iter().map(crate::ast::ParamArg::Type).collect(),
+            )
+        };
         self.expect_stmt_end()?;
         Ok(crate::ast::TraitComptime { name, ty })
     }
@@ -1133,9 +1359,7 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
     fn parse_trait_method(&mut self) -> Result<crate::ast::TraitMethod, ParseError> {
         self.expect(Token::Def, "Expected 'def'")?;
         let name = self.expect_identifier("Expected a method name after 'def'")?;
-        if matches!(self.peek_token()?, Some(Token::LBracket)) {
-            self.parse_type_params()?;
-        }
+        let type_params = self.parse_type_params()?;
 
         self.expect(Token::LParen, "Expected '(' after the method name")?;
         let first = if matches!(self.peek_token()?, Some(Token::Var)) {
@@ -1185,6 +1409,7 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         };
         self.expect(Token::RParen, "Expected ')' after the parameters")?;
 
+        let (raises, raises_type) = self.parse_raises_effect()?;
         let ret = if matches!(self.peek_token()?, Some(Token::Arrow)) {
             self.next_token()?;
             Some(self.parse_type()?)
@@ -1199,6 +1424,13 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
             }
             self.expect(Token::RBrace, "Expected '}' after method effects")?;
         }
+        let where_clause = if matches!(self.peek_token()?, Some(Token::Identifier(word)) if word == "where")
+        {
+            self.next_token()?;
+            Some(self.parse_expression(Precedence::Lowest)?)
+        } else {
+            None
+        };
         self.expect(Token::Colon, "Expected ':' before the method body")?;
         // A body of exactly `...` is a pure requirement; anything else is a
         // default implementation (parsed, flagged unsupported by the checker).
@@ -1206,12 +1438,16 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
 
         Ok(crate::ast::TraitMethod {
             name,
+            type_params,
             self_convention,
             self_origin,
             params,
             positional_only,
             keyword_only,
+            raises,
+            raises_type,
             ret,
+            where_clause,
             default_body,
         })
     }
@@ -1220,13 +1456,11 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
     fn parse_method(&mut self, decorators: Vec<Decorator>) -> Result<Method, ParseError> {
         self.expect(Token::Def, "Expected 'def'")?;
         let name = self.expect_identifier("Expected a method name after 'def'")?;
-        if matches!(self.peek_token()?, Some(Token::LBracket)) {
-            self.parse_type_params()?;
-        }
+        let type_params = self.parse_type_params()?;
 
         self.expect(Token::LParen, "Expected '(' after the method name")?;
         // Detect the receiver. An instance method starts with `self`, optionally
-        // carrying a convention (`mut self`, `out self`, `var self`, `read self`
+        // carrying a convention (`mut self`, `out self`, `var self`, `imm self`
         // — convention words are contextual identifiers). A `@staticmethod` has no
         // `self`: its parameters (if any) start immediately. (A convention word as
         // the first token is read as `<conv> self`, so a static method whose first
@@ -1294,11 +1528,20 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
             None
         };
 
+        let where_clause = if matches!(self.peek_token()?, Some(Token::Identifier(word)) if word == "where")
+        {
+            self.next_token()?;
+            Some(self.parse_expression(Precedence::Lowest)?)
+        } else {
+            None
+        };
+
         self.expect(Token::Colon, "Expected ':' before the method body")?;
         let body = self.parse_suite()?;
 
         Ok(Method {
             name,
+            type_params,
             has_self,
             self_convention,
             self_origin,
@@ -1309,6 +1552,7 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
             raises,
             raises_type,
             ret,
+            where_clause,
             body,
         })
     }
@@ -1355,25 +1599,56 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
     fn parse_while(&mut self) -> Result<StmtKind, ParseError> {
         self.expect(Token::While, "Expected 'while'")?;
         let (cond, body) = self.parse_condition_block("Expected ':' after the while condition")?;
-        Ok(StmtKind::While { cond, body })
+        let orelse = self.parse_loop_else()?;
+        Ok(StmtKind::While { cond, body, orelse })
     }
 
     /// `for var in iter: <block>`
     fn parse_for(&mut self) -> Result<StmtKind, ParseError> {
-        let (var, iter, body) = self.parse_for_rest()?;
-        Ok(StmtKind::For { var, iter, body })
+        let (var, reference, owned, iter, body) = self.parse_for_rest()?;
+        let orelse = self.parse_loop_else()?;
+        Ok(StmtKind::For {
+            var,
+            reference,
+            owned,
+            iter,
+            body,
+            orelse,
+        })
+    }
+
+    fn parse_loop_else(&mut self) -> Result<Option<Vec<Stmt>>, ParseError> {
+        if !matches!(self.peek_token()?, Some(Token::Else)) {
+            return Ok(None);
+        }
+        self.next_token()?;
+        self.expect(Token::Colon, "Expected ':' after loop 'else'")?;
+        Ok(Some(self.parse_suite()?))
     }
 
     /// Parses a `for var in iter: <block>` — the current token must be `for`.
     /// Shared by the runtime `for` and the compile-time `comptime for`.
-    fn parse_for_rest(&mut self) -> Result<(String, Expr, Vec<Stmt>), ParseError> {
+    fn parse_for_rest(&mut self) -> Result<(String, bool, bool, Expr, Vec<Stmt>), ParseError> {
         self.expect(Token::For, "Expected 'for'")?;
+        let reference = if matches!(self.peek_token()?, Some(Token::Identifier(word)) if word == "ref")
+        {
+            self.next_token()?;
+            true
+        } else {
+            false
+        };
+        let owned = if !reference && matches!(self.peek_token()?, Some(Token::Var)) {
+            self.next_token()?;
+            true
+        } else {
+            false
+        };
         let var = self.expect_identifier("Expected a loop variable name after 'for'")?;
         self.expect(Token::In, "Expected 'in' after the loop variable")?;
         let iter = self.parse_expression(Precedence::Lowest)?;
         self.expect(Token::Colon, "Expected ':' after the for-loop iterable")?;
         let body = self.parse_suite()?;
-        Ok((var, iter, body))
+        Ok((var, reference, owned, iter, body))
     }
 
     /// `return` or `return expr`
@@ -1381,7 +1656,7 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         self.expect(Token::Return, "Expected 'return'")?;
         let value = match self.peek_token()? {
             Some(Token::Newline) | Some(Token::Eof) | None => None,
-            _ => Some(self.parse_expression(Precedence::Lowest)?),
+            _ => Some(self.parse_tuple_display()?),
         };
         self.expect_stmt_end()?;
         Ok(StmtKind::Return(value))
@@ -1630,12 +1905,26 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         let mut args = Vec::new();
         loop {
             let mut arg = self.parse_param_arg()?;
-            // Named compile-time arguments (`scope="singlethread"`) are not yet
-            // represented distinctly in the AST, but retain their value so the
-            // syntax can be consumed and rejected later if semantics require it.
             if matches!(self.peek_token()?, Some(Token::Assign)) {
+                let name = match &arg {
+                    crate::ast::ParamArg::Value(Expr {
+                        kind: ExprKind::Identifier(name),
+                        ..
+                    }) => name.clone(),
+                    _ => {
+                        return Err(ParseError::UnexpectedToken(
+                            Token::Assign,
+                            "a compile-time keyword argument requires a name".into(),
+                        ));
+                    }
+                };
                 self.next_token()?;
-                arg = crate::ast::ParamArg::Value(self.parse_expression(Precedence::Lowest)?);
+                arg = crate::ast::ParamArg::Named {
+                    name,
+                    value: Box::new(crate::ast::ParamArg::Value(
+                        self.parse_expression(Precedence::Lowest)?,
+                    )),
+                };
             }
             args.push(arg);
             if matches!(self.peek_token()?, Some(Token::Comma)) {
@@ -1713,14 +2002,15 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
     }
 
     /// Whether the next token unambiguously begins a *type* (a scalar keyword,
-    /// `None`, or `Self`) — used to classify a parameter argument.
+    /// `None`, `Self`, a function type, or Mojito's reference-type extension) —
+    /// used to classify a parameter argument.
     fn peek_starts_type(&mut self) -> Result<bool, ParseError> {
         Ok(match self.peek_token()? {
-            Some(Token::None) => true,
+            Some(Token::None | Token::Def | Token::Star) => true,
             Some(Token::Identifier(id)) => {
                 matches!(
                     id.as_str(),
-                    "Int" | "UInt" | "Bool" | "String" | "Float64" | "Self"
+                    "Int" | "UInt" | "Bool" | "String" | "Float64" | "Self" | "ref"
                 )
             }
             _ => false,
@@ -1780,6 +2070,7 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
             // Origin parameters use `Origin[mut=<bool expression>]`. Preserve the
             // Origin classification and parse the mutability expression; semantic
             // origin parameters are deliberately deferred.
+            let mut value_type = None;
             let origin_mutability =
                 if first_bound == "Origin" && matches!(self.peek_token()?, Some(Token::LBracket)) {
                     self.next_token()?;
@@ -1795,9 +2086,8 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
                     self.expect(Token::RBracket, "Expected ']' after Origin mutability")?;
                     Some(mutability)
                 } else if matches!(self.peek_token()?, Some(Token::LBracket)) {
-                    // A concrete parameterized value type such as `List[Int]`.
-                    // TypeParam currently records only its head name.
-                    self.parse_param_args()?;
+                    let args = self.parse_param_args()?;
+                    value_type = Some(Type::Named(first_bound.clone(), args));
                     None
                 } else {
                     None
@@ -1807,15 +2097,27 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
                 self.next_token()?; // consume '&'
                 bounds.push(self.expect_identifier("Expected a trait name after '&'")?);
             }
-            if matches!(self.peek_token()?, Some(Token::Assign)) {
-                self.next_token()?;
-                self.parse_expression(Precedence::Lowest)?;
+            if matches!(self.peek_token()?, Some(Token::Identifier(word)) if word == "where") {
+                return Err(ParseError::UnexpectedToken(
+                    self.next_token()?,
+                    "parameter-list 'where' clauses were removed; place the constraint after the function return type"
+                        .into(),
+                ));
             }
+            let default = if matches!(self.peek_token()?, Some(Token::Assign)) {
+                self.next_token()?;
+                Some(self.parse_expression(Precedence::Lowest)?)
+            } else {
+                None
+            };
             params.push(crate::ast::TypeParam {
                 name,
                 bounds,
+                value_type,
                 origin_mutability,
                 infer_only,
+                default,
+                constraints: Vec::new(),
             });
             if matches!(self.peek_token()?, Some(Token::Comma)) {
                 self.next_token()?; // consume ','
@@ -1853,25 +2155,122 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         Ok(left)
     }
 
-    /// Builds an `ExprKind::TString` from a lexed t-string, parsing each
-    /// interpolation chunk's raw source into a real sub-expression. `start` is the
-    /// t-string token's start offset (its end is the last-consumed token).
-    fn build_tstring(
-        &self,
-        chunks: Vec<TStringChunk>,
-        raw: bool,
-        start: usize,
-    ) -> Result<Expr, ParseError> {
-        let mut parts = Vec::with_capacity(chunks.len());
-        for chunk in chunks {
-            match chunk {
-                TStringChunk::Text(text) => parts.push(TStringPart::Literal(text)),
-                TStringChunk::Interp(src) => {
-                    parts.push(TStringPart::Expr(Box::new(parse_interpolation(&src)?)));
+    /// Parse the postfix generator/filter sequence shared by list, set, and
+    /// dictionary comprehensions. Expressions use `Conditional` as their stop
+    /// precedence so the next clause's `if` is not mistaken for a ternary.
+    fn parse_comprehension_clauses(
+        &mut self,
+    ) -> Result<Vec<crate::ast::ComprehensionClause>, ParseError> {
+        use crate::ast::ComprehensionClause;
+
+        let mut clauses = Vec::new();
+        loop {
+            match self.peek_token()? {
+                Some(Token::For) => {
+                    self.next_token()?;
+                    let reference = if matches!(self.peek_token()?, Some(Token::Identifier(word)) if word == "ref")
+                    {
+                        self.next_token()?;
+                        true
+                    } else {
+                        false
+                    };
+                    let owned = if !reference && matches!(self.peek_token()?, Some(Token::Var)) {
+                        self.next_token()?;
+                        true
+                    } else {
+                        false
+                    };
+                    let var = self.expect_identifier(
+                        "Expected a comprehension variable after 'for'",
+                    )?;
+                    self.expect(Token::In, "Expected 'in' in comprehension")?;
+                    let iter = self.parse_expression(Precedence::Conditional)?;
+                    clauses.push(ComprehensionClause::For {
+                        var,
+                        reference,
+                        owned,
+                        iter: Box::new(iter),
+                    });
                 }
+                Some(Token::If) => {
+                    if clauses.is_empty() {
+                        return Err(ParseError::UnexpectedToken(
+                            Token::If,
+                            "a comprehension must begin with a 'for' clause".to_string(),
+                        ));
+                    }
+                    self.next_token()?;
+                    let condition = self.parse_expression(Precedence::Conditional)?;
+                    clauses.push(ComprehensionClause::If(Box::new(condition)));
+                }
+                _ => break,
             }
         }
-        Ok(self.node(ExprKind::TString { parts, raw }, start))
+        if clauses.is_empty() {
+            return Err(ParseError::UnexpectedToken(
+                self.peek_token()?.cloned().unwrap_or(Token::Eof),
+                "expected a comprehension 'for' clause".to_string(),
+            ));
+        }
+        Ok(clauses)
+    }
+
+    /// Parse one or more adjacent ordinary/triple string tokens, or one or more
+    /// adjacent t-string tokens. Mojo concatenates within each family; a regular
+    /// string and a `TString` remain distinct types and cannot form one literal.
+    fn build_string_sequence(&mut self, first: Token, start: usize) -> Result<Expr, ParseError> {
+        let tstring_sequence = matches!(first, Token::TString { .. });
+        let mut tokens = vec![first];
+        while if tstring_sequence {
+            matches!(self.peek_token()?, Some(Token::TString { .. }))
+        } else {
+            matches!(
+                self.peek_token()?,
+                Some(Token::StringLiteral(_)) | Some(Token::TripleStringLiteral(_))
+            )
+        } {
+            tokens.push(self.next_token()?);
+        }
+
+        if !tstring_sequence {
+            let mut value = String::new();
+            for token in tokens {
+                match token {
+                    Token::StringLiteral(piece) | Token::TripleStringLiteral(piece) => {
+                        value.push_str(&piece);
+                    }
+                    _ => unreachable!("t-string entered an ordinary literal sequence"),
+                }
+            }
+            return Ok(self.node(ExprKind::Str(value), start));
+        }
+
+        let mut parts = Vec::new();
+        let mut all_tstrings_raw = true;
+        for token in tokens {
+            match token {
+                Token::TString { chunks, raw } => {
+                    all_tstrings_raw &= raw;
+                    for chunk in chunks {
+                        match chunk {
+                            TStringChunk::Text(text) => push_tstring_literal(&mut parts, text),
+                            TStringChunk::Interp(src) => {
+                                parts.push(TStringPart::Expr(Box::new(parse_interpolation(&src)?)))
+                            }
+                        }
+                    }
+                }
+                _ => unreachable!("ordinary string entered a t-string sequence"),
+            }
+        }
+        Ok(self.node(
+            ExprKind::TString {
+                parts,
+                raw: all_tstrings_raw,
+            },
+            start,
+        ))
     }
 
     fn parse_prefix(&mut self) -> Result<Expr, ParseError> {
@@ -1881,15 +2280,9 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
             Token::IntLiteral(val) => Ok(self.node(ExprKind::Int(val), start)),
             Token::FloatLiteral(val) => Ok(self.node(ExprKind::Float(val), start)),
             Token::BoolLiteral(val) => Ok(self.node(ExprKind::Bool(val), start)),
-            Token::StringLiteral(mut val) => {
-                while let Some(Token::StringLiteral(next)) = self.peek_token()?.cloned() {
-                    self.next_token()?;
-                    val.push_str(&next);
-                }
-                Ok(self.node(ExprKind::Str(val), start))
-            }
-            Token::TripleStringLiteral(val) => Ok(self.node(ExprKind::Str(val), start)),
-            Token::TString { chunks, raw } => self.build_tstring(chunks, raw, start),
+            token @ (Token::StringLiteral(_)
+            | Token::TripleStringLiteral(_)
+            | Token::TString { .. }) => self.build_string_sequence(token, start),
             Token::None => Ok(self.node(ExprKind::None, start)),
             Token::Ellipsis => Ok(self.node(ExprKind::Identifier("...".into()), start)),
             Token::Identifier(id) => Ok(self.node(ExprKind::Identifier(id), start)),
@@ -1931,22 +2324,76 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
                 }
             }
             // A list literal `[a, b, …]`. Empty `[]` can't infer an element type,
-            // so it is rejected — use `List[T]()`.
+            // but is retained so an enclosing type annotation can supply it.
             Token::LBracket => {
                 if matches!(self.peek_token()?, Some(Token::RBracket)) {
                     self.next_token()?; // consume ']'
-                    return Err(ParseError::UnexpectedToken(
-                        Token::RBracket,
-                        "an empty list literal '[]' has no element type; use List[T]()".into(),
+                    return Ok(self.node(ExprKind::ListLit(Vec::new()), start));
+                }
+                let first = self.parse_expression(Precedence::Lowest)?;
+                if matches!(self.peek_token()?, Some(Token::For)) {
+                    let clauses = self.parse_comprehension_clauses()?;
+                    self.expect(Token::RBracket, "Expected ']' after list comprehension")?;
+                    return Ok(self.node(
+                        ExprKind::Comprehension {
+                            kind: crate::ast::CollectionKind::List,
+                            key: None,
+                            value: Box::new(first),
+                            clauses,
+                        },
+                        start,
                     ));
                 }
-                let elems = self.parse_args()?;
+                let mut elems = vec![first];
+                while matches!(self.peek_token()?, Some(Token::Comma)) {
+                    self.next_token()?;
+                    if matches!(self.peek_token()?, Some(Token::RBracket)) {
+                        break;
+                    }
+                    elems.push(self.parse_expression(Precedence::Lowest)?);
+                }
                 self.expect(Token::RBracket, "Expected ']' after list elements")?;
                 Ok(self.node(ExprKind::ListLit(elems), start))
             }
             Token::LBrace => {
-                let mut entries = Vec::new();
-                while !matches!(self.peek_token()?, Some(Token::RBrace)) {
+                if matches!(self.peek_token()?, Some(Token::RBrace)) {
+                    self.next_token()?;
+                    return Ok(self.node(ExprKind::BraceLit(Vec::new()), start));
+                }
+                let first_key = self.parse_expression(Precedence::Lowest)?;
+                let first_value = if matches!(self.peek_token()?, Some(Token::Colon)) {
+                    self.next_token()?;
+                    Some(self.parse_expression(Precedence::Lowest)?)
+                } else {
+                    None
+                };
+                if matches!(self.peek_token()?, Some(Token::For)) {
+                    let kind = if first_value.is_some() {
+                        crate::ast::CollectionKind::Dict
+                    } else {
+                        crate::ast::CollectionKind::Set
+                    };
+                    let value = first_value.unwrap_or_else(|| first_key.clone());
+                    let clauses = self.parse_comprehension_clauses()?;
+                    self.expect(Token::RBrace, "Expected '}' after collection comprehension")?;
+                    return Ok(self.node(
+                        ExprKind::Comprehension {
+                            kind,
+                            key: (kind == crate::ast::CollectionKind::Dict)
+                                .then(|| Box::new(first_key)),
+                            value: Box::new(value),
+                            clauses,
+                        },
+                        start,
+                    ));
+                }
+                let dictionary = first_value.is_some();
+                let mut entries = vec![(first_key, first_value)];
+                while matches!(self.peek_token()?, Some(Token::Comma)) {
+                    self.next_token()?;
+                    if matches!(self.peek_token()?, Some(Token::RBrace)) {
+                        break;
+                    }
                     let key = self.parse_expression(Precedence::Lowest)?;
                     let value = if matches!(self.peek_token()?, Some(Token::Colon)) {
                         self.next_token()?;
@@ -1954,12 +2401,14 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
                     } else {
                         None
                     };
-                    entries.push((key, value));
-                    if matches!(self.peek_token()?, Some(Token::Comma)) {
-                        self.next_token()?;
-                    } else {
-                        break;
+                    if dictionary != value.is_some() {
+                        return Err(ParseError::UnexpectedToken(
+                            self.peek_token()?.cloned().unwrap_or(Token::RBrace),
+                            "set elements and dictionary key/value pairs cannot be mixed"
+                                .to_string(),
+                        ));
                     }
+                    entries.push((key, value));
                 }
                 self.expect(Token::RBrace, "Expected '}' after brace literal")?;
                 Ok(self.node(ExprKind::BraceLit(entries), start))
@@ -1977,7 +2426,7 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         // Every node built here spans from `left`'s start to the last token consumed.
         let start = left.span.0;
         // Postfix transfer sigil `expr '^'`.
-        if matches!(self.peek_token()?, Some(Token::Caret)) {
+        if matches!(self.peek_token()?, Some(Token::Caret)) && left.span.1 == self.peek_start() {
             self.next_token()?; // consume '^'
             return Ok(self.node(ExprKind::Transfer(Box::new(left)), start));
         }
@@ -2013,108 +2462,7 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         // or a plain subscript (`obj '[' index ']'`). A top-level `:` inside the
         // brackets marks a slice; otherwise `(` following decides call vs subscript.
         if matches!(self.peek_token()?, Some(Token::LBracket)) {
-            // A leading `:` is a slice with no lower bound (`obj[:j]`, `obj[::2]`).
-            self.next_token()?; // consume '['
-            if matches!(self.peek_token()?, Some(Token::RBracket)) {
-                self.next_token()?;
-                return Ok(self.node(
-                    ExprKind::Index {
-                        object: Box::new(left),
-                        index: Box::new(Expr::new(ExprKind::None, self.last_span)),
-                    },
-                    start,
-                ));
-            }
-            if matches!(self.peek_token()?, Some(Token::Colon)) {
-                return self.parse_slice_rest(left, None);
-            }
-            let mut first = self.parse_param_arg()?;
-            if matches!(self.peek_token()?, Some(Token::Assign)) {
-                self.next_token()?;
-                first = crate::ast::ParamArg::Value(self.parse_expression(Precedence::Lowest)?);
-            }
-            // A `:` after the first entry makes this a slice; the entry is its lower
-            // bound and must be a value expression.
-            if matches!(self.peek_token()?, Some(Token::Colon)) {
-                let lower = match first {
-                    crate::ast::ParamArg::Value(expr) => Some(expr),
-                    crate::ast::ParamArg::Type(_) => {
-                        return Err(ParseError::UnexpectedToken(
-                            Token::Colon,
-                            "a slice bound must be an expression".into(),
-                        ));
-                    }
-                };
-                return self.parse_slice_rest(left, lower);
-            }
-            // Otherwise collect any remaining comma-separated entries and finish as
-            // a generic call (if `(` follows) or a single-index subscript.
-            let mut param_args = vec![first];
-            while matches!(self.peek_token()?, Some(Token::Comma)) {
-                self.next_token()?; // consume ','
-                if matches!(self.peek_token()?, Some(Token::RBracket)) {
-                    break;
-                }
-                let mut arg = self.parse_param_arg()?;
-                if matches!(self.peek_token()?, Some(Token::Assign)) {
-                    self.next_token()?;
-                    arg = crate::ast::ParamArg::Value(self.parse_expression(Precedence::Lowest)?);
-                }
-                param_args.push(arg);
-            }
-            self.expect(Token::RBracket, "Expected ']' after a subscript")?;
-            if matches!(self.peek_token()?, Some(Token::LParen)) {
-                self.next_token()?; // consume '('
-                let (args, kwargs) = self.parse_call_args()?;
-                self.expect(Token::RParen, "Expected ')' after arguments")?;
-                let kind = match left.kind {
-                    ExprKind::Identifier(name) => ExprKind::Call {
-                        name,
-                        param_args,
-                        args,
-                        kwargs,
-                    },
-                    _ => ExprKind::Invoke {
-                        callee: Box::new(left),
-                        param_args,
-                        args,
-                        kwargs,
-                    },
-                };
-                return Ok(self.node(kind, start));
-            }
-            // A single value entry is an ordinary subscript `obj[i]`; anything with a
-            // type argument (`UnsafePointer[Int]`) is a parameterized-type reference
-            // (`TypeApply`) — valid as a static-method receiver, e.g. `.alloc(n)`.
-            match <[_; 1]>::try_from(param_args) {
-                Ok([crate::ast::ParamArg::Value(expr)]) => {
-                    return Ok(self.node(
-                        ExprKind::Index {
-                            object: Box::new(left),
-                            index: Box::new(expr),
-                        },
-                        start,
-                    ));
-                }
-                Ok([other]) => {
-                    return Ok(self.node(
-                        ExprKind::TypeApply {
-                            name: call_name(left)?,
-                            args: vec![other],
-                        },
-                        start,
-                    ));
-                }
-                Err(param_args) => {
-                    return Ok(self.node(
-                        ExprKind::TypeApply {
-                            name: call_name(left)?,
-                            args: param_args,
-                        },
-                        start,
-                    ));
-                }
-            }
+            return self.parse_bracket_suffix(left, start);
         }
 
         // Postfix call without explicit parameters: `IDENT '(' args ')'`.
@@ -2213,10 +2561,12 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
             Token::Slash => InfixOp::Div,
             Token::DoubleSlash => InfixOp::FloorDiv,
             Token::Percent => InfixOp::Mod,
+            Token::At => InfixOp::MatMul,
             Token::Shl => InfixOp::Shl,
             Token::Shr => InfixOp::Shr,
             Token::Amp => InfixOp::BitAnd,
             Token::Pipe => InfixOp::BitOr,
+            Token::Caret => InfixOp::BitXor,
             Token::DoubleStar => InfixOp::Pow,
             // Comparisons (`== != < > <= >=`, `in`, `not in`) are handled by the
             // chained-comparison path above, never here.
@@ -2236,39 +2586,260 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
         Ok(self.node(ExprKind::Infix(op, Box::new(left), Box::new(right)), start))
     }
 
-    /// Finishes a slice subscript once a `:` has been seen (the parser is
-    /// positioned at that first `:`), with `lower` already parsed. Grammar:
-    /// `':' [upper] [':' [step]] ']'`.
-    fn parse_slice_rest(&mut self, object: Expr, lower: Option<Expr>) -> Result<Expr, ParseError> {
-        let start = object.span.0;
+    fn parse_bracket_suffix(&mut self, object: Expr, start: usize) -> Result<Expr, ParseError> {
+        self.expect(Token::LBracket, "Expected '['")?;
+        if matches!(self.peek_token()?, Some(Token::RBracket)) {
+            self.next_token()?;
+            return Ok(self.node(
+                ExprKind::Index {
+                    object: Box::new(object),
+                    index: Box::new(Expr::new(ExprKind::None, self.last_span)),
+                },
+                start,
+            ));
+        }
+
+        let mut items = Vec::new();
+        loop {
+            if matches!(self.peek_token()?, Some(Token::Colon)) {
+                let (upper, step, explicit_step) = self.parse_slice_components()?;
+                items.push(ParsedBracketItem::Slice {
+                    lower: None,
+                    upper,
+                    step,
+                    explicit_step,
+                });
+            } else {
+                let mut argument = self.parse_param_arg()?;
+                if matches!(self.peek_token()?, Some(Token::Assign)) {
+                    let name = param_argument_name(&argument)?;
+                    self.next_token()?;
+                    argument = crate::ast::ParamArg::Named {
+                        name,
+                        value: Box::new(crate::ast::ParamArg::Value(
+                            self.parse_expression(Precedence::Lowest)?,
+                        )),
+                    };
+                }
+                if matches!(self.peek_token()?, Some(Token::Colon)) {
+                    let lower = match argument {
+                        crate::ast::ParamArg::Value(value) => Some(Box::new(value)),
+                        _ => {
+                            return Err(ParseError::UnexpectedToken(
+                                Token::Colon,
+                                "a slice bound must be an expression".into(),
+                            ));
+                        }
+                    };
+                    let (upper, step, explicit_step) = self.parse_slice_components()?;
+                    items.push(ParsedBracketItem::Slice {
+                        lower,
+                        upper,
+                        step,
+                        explicit_step,
+                    });
+                } else {
+                    items.push(ParsedBracketItem::Param(argument));
+                }
+            }
+
+            if !matches!(self.peek_token()?, Some(Token::Comma)) {
+                break;
+            }
+            self.next_token()?;
+            if matches!(self.peek_token()?, Some(Token::RBracket)) {
+                break;
+            }
+        }
+        self.expect(Token::RBracket, "Expected ']' after a subscript")?;
+
+        let contains_slice = items
+            .iter()
+            .any(|item| matches!(item, ParsedBracketItem::Slice { .. }));
+        if matches!(self.peek_token()?, Some(Token::LParen)) {
+            if contains_slice {
+                return Err(ParseError::UnexpectedToken(
+                    Token::LParen,
+                    "slice expressions cannot be compile-time call parameters".into(),
+                ));
+            }
+            let param_args = items
+                .into_iter()
+                .map(|item| match item {
+                    ParsedBracketItem::Param(argument) => argument,
+                    ParsedBracketItem::Slice { .. } => unreachable!(),
+                })
+                .collect();
+            self.next_token()?;
+            let (args, kwargs) = self.parse_call_args()?;
+            self.expect(Token::RParen, "Expected ')' after arguments")?;
+            let kind = match object.kind {
+                ExprKind::Identifier(name) => ExprKind::Call {
+                    name,
+                    param_args,
+                    args,
+                    kwargs,
+                },
+                _ => ExprKind::Invoke {
+                    callee: Box::new(object),
+                    param_args,
+                    args,
+                    kwargs,
+                },
+            };
+            return Ok(self.node(kind, start));
+        }
+
+        if contains_slice {
+            let mut arguments = Vec::with_capacity(items.len());
+            for item in items {
+                arguments.push(match item {
+                    ParsedBracketItem::Param(crate::ast::ParamArg::Value(value)) => {
+                        SubscriptArg::Index(value)
+                    }
+                    ParsedBracketItem::Param(_) => {
+                        return Err(ParseError::UnexpectedToken(
+                            Token::RBracket,
+                            "a mixed subscript argument must be an expression".into(),
+                        ));
+                    }
+                    ParsedBracketItem::Slice {
+                        lower,
+                        upper,
+                        step,
+                        explicit_step,
+                    } => SubscriptArg::Slice {
+                        lower,
+                        upper,
+                        step,
+                        explicit_step,
+                    },
+                });
+            }
+            if let [
+                SubscriptArg::Slice {
+                    lower,
+                    upper,
+                    step,
+                    explicit_step,
+                },
+            ] = arguments.as_slice()
+            {
+                return Ok(self.node(
+                    ExprKind::Slice {
+                        object: Box::new(object),
+                        lower: lower.clone(),
+                        upper: upper.clone(),
+                        step: step.clone(),
+                        explicit_step: *explicit_step,
+                    },
+                    start,
+                ));
+            }
+            return Ok(self.node(
+                ExprKind::MultiIndex {
+                    object: Box::new(object),
+                    args: arguments,
+                },
+                start,
+            ));
+        }
+
+        let param_args: Vec<_> = items
+            .into_iter()
+            .map(|item| match item {
+                ParsedBracketItem::Param(argument) => argument,
+                ParsedBracketItem::Slice { .. } => unreachable!(),
+            })
+            .collect();
+
+        // `reflect[T]` is the current Mojo reflection handle.  Unlike an
+        // ordinary lower-case expression followed by one subscript, its
+        // brackets carry a compile-time type argument and the resulting handle
+        // is used directly (`reflect[T].field["name"]`).  Recognize the builtin
+        // here so user-defined types such as `Point` do not make the expression
+        // look like a runtime `reflect[Point]` index operation.
+        if matches!(&object.kind, ExprKind::Identifier(name) if name == "reflect") {
+            return Ok(self.node(
+                ExprKind::TypeApply {
+                    name: "reflect".to_string(),
+                    args: param_args,
+                },
+                start,
+            ));
+        }
+
+        match <[_; 1]>::try_from(param_args) {
+            Ok([crate::ast::ParamArg::Value(index)]) => Ok(self.node(
+                ExprKind::Index {
+                    object: Box::new(object),
+                    index: Box::new(index),
+                },
+                start,
+            )),
+            Ok([other]) => Ok(self.node(
+                ExprKind::TypeApply {
+                    name: call_name(object)?,
+                    args: vec![other],
+                },
+                start,
+            )),
+            Err(param_args)
+                if param_args
+                    .iter()
+                    .all(|argument| matches!(argument, crate::ast::ParamArg::Value(_)))
+                    && expression_name_starts_lowercase(&object) =>
+            {
+                let args = param_args
+                    .into_iter()
+                    .map(|argument| match argument {
+                        crate::ast::ParamArg::Value(value) => SubscriptArg::Index(value),
+                        _ => unreachable!(),
+                    })
+                    .collect();
+                Ok(self.node(
+                    ExprKind::MultiIndex {
+                        object: Box::new(object),
+                        args,
+                    },
+                    start,
+                ))
+            }
+            Err(param_args) => Ok(self.node(
+                ExprKind::TypeApply {
+                    name: call_name(object)?,
+                    args: param_args,
+                },
+                start,
+            )),
+        }
+    }
+
+    /// Parse the tail after the first `:` of one slice item. Comma ends the item
+    /// for a multi-dimensional subscript; a second colon is retained even when
+    /// its step expression is omitted.
+    fn parse_slice_components(&mut self) -> Result<ParsedSliceTail, ParseError> {
         self.expect(Token::Colon, "Expected ':' in a slice")?;
-        // Optional upper bound — absent if the next token is `:` or `]`.
-        let upper = if matches!(self.peek_token()?, Some(Token::Colon | Token::RBracket)) {
+        let upper = if matches!(
+            self.peek_token()?,
+            Some(Token::Colon | Token::Comma | Token::RBracket)
+        ) {
             None
         } else {
-            Some(self.parse_expression(Precedence::Lowest)?)
+            Some(Box::new(self.parse_expression(Precedence::Lowest)?))
         };
-        // Optional step after a second `:`.
-        let step = if matches!(self.peek_token()?, Some(Token::Colon)) {
-            self.next_token()?; // consume the second ':'
-            if matches!(self.peek_token()?, Some(Token::RBracket)) {
+        let explicit_step = matches!(self.peek_token()?, Some(Token::Colon));
+        let step = if explicit_step {
+            self.next_token()?;
+            if matches!(self.peek_token()?, Some(Token::Comma | Token::RBracket)) {
                 None
             } else {
-                Some(self.parse_expression(Precedence::Lowest)?)
+                Some(Box::new(self.parse_expression(Precedence::Lowest)?))
             }
         } else {
             None
         };
-        self.expect(Token::RBracket, "Expected ']' after a slice")?;
-        Ok(self.node(
-            ExprKind::Slice {
-                object: Box::new(object),
-                lower: lower.map(Box::new),
-                upper: upper.map(Box::new),
-                step: step.map(Box::new),
-            },
-            start,
-        ))
+        Ok((upper, step, explicit_step))
     }
 
     /// Whether the next token begins a comparison operator (`== != < > <= >=`,
@@ -2329,39 +2900,23 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
             // position (after an operand) `not` can only start `not in`.
             Some(Token::In | Token::Not) => Precedence::Comparison,
             Some(
-                Token::Plus | Token::Minus | Token::Shl | Token::Shr | Token::Amp | Token::Pipe,
+                Token::Plus
+                | Token::Minus
+                | Token::Shl
+                | Token::Shr
+                | Token::Amp
+                | Token::Pipe
+                | Token::Caret,
             ) => Precedence::Sum,
-            Some(Token::Star | Token::Slash | Token::DoubleSlash | Token::Percent) => {
+            Some(Token::Star | Token::Slash | Token::DoubleSlash | Token::Percent | Token::At) => {
                 Precedence::Product
             }
             Some(Token::DoubleStar) => Precedence::Power,
-            // `[` begins an explicit compile-time parameter list on a call; `^`
-            // is the postfix transfer sigil.
-            Some(Token::LParen | Token::LBracket | Token::Dot | Token::Caret) => Precedence::Call,
+            // `[` begins an explicit compile-time parameter list on a call.
+            Some(Token::LParen | Token::LBracket | Token::Dot) => Precedence::Call,
             _ => Precedence::Lowest,
         };
         Ok(prec)
-    }
-
-    /// Parses a (possibly empty) comma-separated argument list. The opening `(`
-    /// has been consumed; stops at the closing `)` without consuming it.
-    fn parse_args(&mut self) -> Result<Vec<Expr>, ParseError> {
-        let mut args = Vec::new();
-        if matches!(self.peek_token()?, Some(Token::RParen)) {
-            return Ok(args);
-        }
-        loop {
-            args.push(self.parse_expression(Precedence::Lowest)?);
-            if matches!(self.peek_token()?, Some(Token::Comma)) {
-                self.next_token()?; // consume ','
-                if matches!(self.peek_token()?, Some(Token::RParen | Token::RBracket)) {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-        Ok(args)
     }
 
     /// Parses call arguments: positional expressions and keyword arguments. Both
@@ -2375,7 +2930,38 @@ impl<I: Iterator<Item = Result<(Token, Span), LexError>>> Parser<I> {
             return Ok((args, kwargs));
         }
         loop {
-            let expr = self.parse_expression(Precedence::Lowest)?;
+            if matches!(self.peek_token()?, Some(Token::DoubleStar)) {
+                self.next_token()?;
+                let value = self.parse_expression(Precedence::Lowest)?;
+                if !matches!(&value.kind, ExprKind::Transfer(_)) {
+                    return Err(ParseError::UnexpectedToken(
+                        Token::DoubleStar,
+                        "keyword forwarding requires a transferred StringDict (`**kwargs^`)".into(),
+                    ));
+                }
+                kwargs.push(KwArg {
+                    name: crate::ast::FORWARDED_KWARGS_NAME.to_string(),
+                    value,
+                });
+                if matches!(self.peek_token()?, Some(Token::Comma)) {
+                    self.next_token()?;
+                    if !matches!(self.peek_token()?, Some(Token::RParen)) {
+                        return Err(ParseError::UnexpectedToken(
+                            Token::Comma,
+                            "`**kwargs^` must be the final call argument".into(),
+                        ));
+                    }
+                }
+                break;
+            }
+            let expr = if matches!(self.peek_token()?, Some(Token::Star)) {
+                let start = self.peek_start();
+                self.next_token()?;
+                let value = self.parse_expression(Precedence::Lowest)?;
+                self.node(ExprKind::Spread(Box::new(value)), start)
+            } else {
+                self.parse_expression(Precedence::Lowest)?
+            };
             if let ExprKind::Identifier(name) = &expr.kind
                 && matches!(self.peek_token()?, Some(Token::Assign) | Some(Token::Colon))
             {
@@ -2436,16 +3022,43 @@ fn parse_interpolation(src: &str) -> Result<Expr, ParseError> {
     Ok(expr)
 }
 
+/// Append a literal component while coalescing neighboring text. Keeping the
+/// normalized t-string tree compact also gives MIR one constant per run rather
+/// than one per source token.
+fn push_tstring_literal(parts: &mut Vec<TStringPart>, text: String) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(TStringPart::Literal(previous)) = parts.last_mut() {
+        previous.push_str(&text);
+    } else {
+        parts.push(TStringPart::Literal(text));
+    }
+}
+
 /// Maps a contextual convention word (`read`/`mut`/`out`/`ref`) to its
 /// `ArgConvention`, or `None` for any other identifier.
 fn convention_word(word: &str) -> Option<ArgConvention> {
     match word {
-        "read" => Some(ArgConvention::Read),
+        "imm" | "read" => Some(ArgConvention::Read),
         "mut" => Some(ArgConvention::Mut),
         "out" => Some(ArgConvention::Out),
         "ref" => Some(ArgConvention::Ref),
         "deinit" => Some(ArgConvention::Deinit),
         _ => None,
+    }
+}
+
+fn param_argument_name(arg: &crate::ast::ParamArg) -> Result<String, ParseError> {
+    match arg {
+        crate::ast::ParamArg::Value(Expr {
+            kind: ExprKind::Identifier(name),
+            ..
+        }) => Ok(name.clone()),
+        _ => Err(ParseError::UnexpectedToken(
+            Token::Assign,
+            "a compile-time keyword argument requires a name".into(),
+        )),
     }
 }
 
@@ -2459,6 +3072,14 @@ fn call_name(callee: Expr) -> Result<String, ParseError> {
             format!("only named functions can be called, found {:?}", other),
         )),
     }
+}
+
+fn expression_name_starts_lowercase(expression: &Expr) -> bool {
+    matches!(
+        &expression.kind,
+        ExprKind::Identifier(name)
+            if name.chars().next().is_some_and(|character| character.is_lowercase())
+    )
 }
 
 /// The infix operator an augmented-assignment token applies (`+=` → `Add`, …),
@@ -2494,8 +3115,11 @@ fn infix_precedence(op: InfixOp) -> Precedence {
         | InfixOp::Shl
         | InfixOp::Shr
         | InfixOp::BitAnd
-        | InfixOp::BitOr => Precedence::Sum,
-        InfixOp::Mul | InfixOp::Div | InfixOp::FloorDiv | InfixOp::Mod => Precedence::Product,
+        | InfixOp::BitOr
+        | InfixOp::BitXor => Precedence::Sum,
+        InfixOp::Mul | InfixOp::Div | InfixOp::FloorDiv | InfixOp::Mod | InfixOp::MatMul => {
+            Precedence::Product
+        }
         // Right-associative: parse the right operand one level below `**` so that
         // a following `**` (Power > Unary) is re-absorbed (`a ** b ** c` = `a ** (b ** c)`).
         InfixOp::Pow => Precedence::Unary,

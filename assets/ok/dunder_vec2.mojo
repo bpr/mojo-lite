@@ -1,7 +1,7 @@
 # Operator overloading: a user struct participates in `+`, `==`, and `String()`
-# via its `__add__`/`__eq__`/`__str__` dunder methods.
+# via its `__add__`/`__eq__` methods and `Writable.write_to`.
 @fieldwise_init
-struct Vec2:
+struct Vec2(Writable):
     var x: Int
     var y: Int
 
@@ -11,8 +11,8 @@ struct Vec2:
     def __eq__(self, other: Vec2) -> Bool:
         return self.x == other.x and self.y == other.y
 
-    def __str__(self) -> String:
-        return "Vec2(" + String(self.x) + ", " + String(self.y) + ")"
+    def write_to(self, mut writer: Some[Writer]):
+        writer.write("Vec2(", self.x, ", ", self.y, ")")
 
 def main():
     var a: Vec2 = Vec2(1, 2)

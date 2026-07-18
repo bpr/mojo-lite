@@ -32,6 +32,7 @@ pub(super) fn splats_to(ty: &Ty, dtype: Dtype) -> bool {
         Ty::IntLiteral => dtype != Dtype::Bool,
         Ty::FloatLiteral => dtype.is_float(),
         Ty::Bool => dtype == Dtype::Bool,
+        Ty::Int => dtype == Dtype::Int,
         // `Float64` is `SIMD[DType.float64, 1]`, so it splats into a float64 vector.
         Ty::Float64 => dtype == Dtype::Float64,
         Ty::Simd { dtype: d, width: 1 } => *d == dtype,
@@ -39,14 +40,54 @@ pub(super) fn splats_to(ty: &Ty, dtype: Dtype) -> bool {
     }
 }
 
+/// Check a directly written numeric literal against a fixed-width scalar alias.
+/// Non-literal expressions are validated by their checked type and retain the
+/// scalar constructor's wrapping behavior; contextual literal materialization
+/// must not silently wrap (for example, `var b: Byte = 256`).
+pub(super) fn literal_fits_dtype(expression: &Expr, dtype: Dtype) -> bool {
+    let integer = match &expression.kind {
+        ExprKind::Int(value) => Some(*value as i128),
+        ExprKind::Prefix(PrefixOp::Neg, inner) => match &inner.kind {
+            ExprKind::Int(value) => Some(-(*value as i128)),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(value) = integer {
+        return match dtype {
+            Dtype::Int => i64::try_from(value).is_ok(),
+            Dtype::Int8 => i8::try_from(value).is_ok(),
+            Dtype::Int16 => i16::try_from(value).is_ok(),
+            Dtype::Int32 => i32::try_from(value).is_ok(),
+            Dtype::Int64 => i64::try_from(value).is_ok(),
+            Dtype::UInt8 => u8::try_from(value).is_ok(),
+            Dtype::UInt16 => u16::try_from(value).is_ok(),
+            Dtype::UInt32 => u32::try_from(value).is_ok(),
+            Dtype::UInt64 => u64::try_from(value).is_ok(),
+            Dtype::Float32 => (value as f64).abs() <= f32::MAX as f64,
+            Dtype::Float64 => true,
+            Dtype::Bool => false,
+        };
+    }
+    match (&expression.kind, dtype) {
+        (ExprKind::Float(value), Dtype::Float32) => {
+            value.is_finite() && value.abs() <= f32::MAX as f64
+        }
+        (ExprKind::Prefix(PrefixOp::Neg, inner), Dtype::Float32) => {
+            matches!(&inner.kind, ExprKind::Float(value) if value.is_finite() && value.abs() <= f32::MAX as f64)
+        }
+        _ => true,
+    }
+}
+
 /// The (canonicalized) `Ty` for a SIMD of `dtype`/`width`: a **width-1 `float64`**
 /// is the native `Ty::Float64` (Mojo unifies `Float64` with `SIMD[DType.float64,
 /// 1]`); everything else is a `Ty::Simd`.
 pub(super) fn simd_ty(dtype: Dtype, width: i64) -> Ty {
-    if dtype == Dtype::Float64 && width == 1 {
-        Ty::Float64
-    } else {
-        Ty::Simd { dtype, width }
+    match (dtype, width) {
+        (Dtype::Int, 1) => Ty::Int,
+        (Dtype::Float64, 1) => Ty::Float64,
+        _ => Ty::Simd { dtype, width },
     }
 }
 
@@ -56,6 +97,7 @@ pub(super) fn simd_ty(dtype: Dtype, width: i64) -> Ty {
 pub(super) fn scalar_type_name(name: &str) -> Option<Ty> {
     match name {
         "Int" => Some(Ty::Int),
+        "SIMDSize" => Some(Ty::Int),
         "UInt" => Some(Ty::UInt),
         "Bool" => Some(Ty::Bool),
         "String" => Some(Ty::String),
@@ -70,7 +112,7 @@ pub(super) fn type_scope(decls: &[ParamDecl]) -> HashMap<String, Vec<String>> {
     decls
         .iter()
         .filter_map(|d| match d {
-            ParamDecl::Type { name, bounds } => Some((name.clone(), bounds.clone())),
+            ParamDecl::Type { name, bounds, .. } => Some((name.clone(), bounds.clone())),
             ParamDecl::Value { .. } => None,
         })
         .collect()
@@ -81,11 +123,11 @@ pub(super) fn type_scope(decls: &[ParamDecl]) -> HashMap<String, Vec<String>> {
 /// parameter as a symbolic `CtValue::Param`.
 pub(super) fn param_as_arg(decl: &ParamDecl) -> TyArg {
     match decl {
-        ParamDecl::Type { name, bounds } => TyArg::Ty(Ty::Param {
+        ParamDecl::Type { name, bounds, .. } => TyArg::Ty(Ty::Param {
             name: name.clone(),
             bounds: bounds.clone(),
         }),
-        ParamDecl::Value { name } => TyArg::Val(CtValue::Param(name.clone())),
+        ParamDecl::Value { name, .. } => TyArg::Val(CtValue::Param(name.clone())),
     }
 }
 

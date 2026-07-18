@@ -3,6 +3,7 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cases="$root/conformance/cases.tsv"
+parity="$root/conformance/parity.tsv"
 mojo_pixi_manifest="${MOJO_PIXI_MANIFEST:-}"
 
 usage() {
@@ -11,6 +12,7 @@ usage: scripts/conformance --mojo-pixi-manifest PATH
 
 Runs shared fixtures under Mojito and Mojo and compares their observable result.
 MOJO_PIXI_MANIFEST may be used instead of the command-line option.
+The Mojo compiler version must match conformance/parity.tsv.
 EOF
 }
 
@@ -38,6 +40,16 @@ if [[ -z "$mojo_pixi_manifest" || ! -f "$mojo_pixi_manifest" ]]; then
 fi
 
 cd "$root"
+expected_mojo_version="$(awk -F $'\t' '$1 == "# reference-version" { print $2 }' "$parity")"
+actual_mojo_version="$(pixi run --manifest-path "$mojo_pixi_manifest" mojo --version)"
+if [[ "$actual_mojo_version" != *"${expected_mojo_version#Mojo }"* ]]; then
+    echo "Mojo version mismatch" >&2
+    echo "  expected: $expected_mojo_version" >&2
+    echo "  actual:   $actual_mojo_version" >&2
+    exit 2
+fi
+echo "Mojo reference: $actual_mojo_version"
+
 env RUSTC_WRAPPER= cargo build --quiet
 mojito="$root/target/debug/mojito"
 tmp="$(mktemp -d)"

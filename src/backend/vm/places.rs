@@ -35,6 +35,14 @@ fn nav_step<'a>(
             ))),
         },
         Proj::Index(reg) => {
+            if let Value::Dict(entries) = slot {
+                let key = &regs[reg.0 as usize];
+                return entries
+                    .iter_mut()
+                    .find(|(candidate, _)| candidate == key)
+                    .map(|(_, value)| value)
+                    .ok_or_else(|| RuntimeError::TypeError("dictionary key not found".to_string()));
+            }
             let idx = value_as_index(&regs[reg.0 as usize])?;
             match slot {
                 Value::List(items) => {
@@ -51,6 +59,31 @@ fn nav_step<'a>(
                 ))),
             }
         }
+        Proj::Variant(expected) => match slot {
+            Value::Variant {
+                alternatives,
+                index,
+                value,
+            } => {
+                if index != expected {
+                    return Err(RuntimeError::TypeError(format!(
+                        "Variant holds '{}', not '{}'",
+                        alternatives
+                            .get(*index)
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| "<invalid>".to_string()),
+                        alternatives
+                            .get(*expected)
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| "<invalid>".to_string())
+                    )));
+                }
+                Ok(value.as_mut())
+            }
+            _ => Err(RuntimeError::TypeError(
+                "Variant projection on a non-Variant value".to_string(),
+            )),
+        },
     }
 }
 
@@ -94,6 +127,20 @@ pub(super) fn store_place(
             {
                 let idx = value_as_index(&regs[ireg.0 as usize])?;
                 return crate::runtime::set_simd_lane(*dtype, lanes, idx, value);
+            }
+            if let Proj::Index(ireg) = last
+                && let Value::Dict(entries) = slot
+            {
+                let key = regs[ireg.0 as usize].clone();
+                if let Some((_, existing)) = entries
+                    .iter_mut()
+                    .find(|(candidate, _)| *candidate == key)
+                {
+                    *existing = value;
+                } else {
+                    entries.push((key, value));
+                }
+                return Ok(());
             }
             *nav_step(slot, last, regs)? = value;
             Ok(())

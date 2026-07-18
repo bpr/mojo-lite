@@ -1,5 +1,5 @@
 use mojito::Lexer;
-use mojito::token::Token;
+use mojito::token::{TStringChunk, Token};
 
 /// Collect all tokens, panicking if the lexer reports an error.
 fn lex_all(source: &str) -> Vec<Token> {
@@ -122,7 +122,9 @@ fn decodes_numeric_escapes() {
     // Higher code points encode as UTF-8.
     assert_eq!(lex_str(r#""café""#), "café");
     assert_eq!(lex_str(r#""\U0001F600""#), "\u{1F600}");
-    // Octal reads exactly three digits: \000 is NUL, \377 is 0xFF (ÿ, U+00FF).
+    // Octal reads one to three digits: \0 is NUL, \377 is 0xFF (ÿ, U+00FF).
+    assert_eq!(lex_str(r#""\0""#), "\u{00}");
+    assert_eq!(lex_str(r#""\41""#), "!");
     assert_eq!(lex_str(r#""\000""#), "\u{00}");
     assert_eq!(lex_str(r#""\377""#), "\u{FF}");
 }
@@ -130,8 +132,14 @@ fn decodes_numeric_escapes() {
 #[test]
 fn rejects_invalid_escapes() {
     // An unknown letter, a bad hex digit, a surrogate/out-of-range scalar, a
-    // truncated hex run, and an out-of-range octal lead are all lexer errors.
-    for src in [r#""\q""#, r#""\xZZ""#, r#""\uD800""#, r#""\x4""#, r#""\4""#] {
+    // truncated hex run, and an out-of-range octal value are all lexer errors.
+    for src in [
+        r#""\q""#,
+        r#""\xZZ""#,
+        r#""\uD800""#,
+        r#""\x4""#,
+        r#""\777""#,
+    ] {
         assert!(
             Lexer::new(src).any(|r| r.is_err()),
             "expected a lex error for {src}"
@@ -155,6 +163,20 @@ fn lexes_float_literals_and_slash() {
             Token::Eof,
         ]
     );
+}
+
+#[test]
+fn lexes_current_numeric_literal_spellings() {
+    assert_eq!(lex_literal(".5"), Token::FloatLiteral(0.5));
+    assert_eq!(lex_literal("2."), Token::FloatLiteral(2.0));
+    assert_eq!(lex_literal("2.e3"), Token::FloatLiteral(2_000.0));
+    assert_eq!(lex_literal("1__000_"), Token::IntLiteral(1_000));
+    assert_eq!(lex_literal("0x__FF_"), Token::IntLiteral(255));
+    assert!(Lexer::new("0123").any(|token| token.is_err()));
+    assert!(Lexer::new("1e+").any(|token| token.is_err()));
+    // Until Task 9 introduces arbitrary-precision literal storage, overflow is
+    // rejected instead of wrapping through the signed AST representation.
+    assert!(Lexer::new("18446744073709551615").any(|token| token.is_err()));
 }
 
 #[test]
@@ -434,11 +456,30 @@ fn lexes_single_and_triple_quoted_strings() {
     );
 }
 
+#[test]
+fn lexes_raw_and_case_insensitive_string_prefixes() {
+    assert_eq!(lex_literal(r#"r"\n""#), Token::StringLiteral("\\n".into()));
+    assert_eq!(lex_literal(r#"R'\t'"#), Token::StringLiteral("\\t".into()));
+    assert_eq!(
+        lex_literal(r#"Tr"value={x}""#),
+        Token::TString {
+            chunks: vec![
+                TStringChunk::Text("value=".into()),
+                TStringChunk::Interp("x".into()),
+            ],
+            raw: true,
+        }
+    );
+    assert_eq!(
+        lex_all("var x = \"\"\"a\\\n    b\"\"\"")[3],
+        Token::TripleStringLiteral("a    b".into())
+    );
+}
+
 // --- t-strings: lexed into text/interpolation chunks ---
 
 #[test]
 fn lexes_tstring_chunks() {
-    use mojito::token::TStringChunk;
     assert_eq!(
         lex_literal("t\"n={n}, sum={a+b}!\""),
         Token::TString {
@@ -465,4 +506,25 @@ fn lexes_tstring_chunks() {
     );
     // `t` on its own is still an identifier (no adjacent quote).
     assert_eq!(lex_all("var t = 1")[1], Token::Identifier("t".into()));
+}
+
+#[test]
+fn tstring_interpolation_respects_nested_lexical_structure() {
+    assert_eq!(
+        lex_literal(r###"t"{choose("}", {1: 2})}""###),
+        Token::TString {
+            chunks: vec![TStringChunk::Interp("choose(\"}\", {1: 2})".into())],
+            raw: false,
+        }
+    );
+    assert_eq!(
+        lex_literal(r###"t"outer={t"inner={value}"}""###),
+        Token::TString {
+            chunks: vec![
+                TStringChunk::Text("outer=".into()),
+                TStringChunk::Interp("t\"inner={value}\"".into()),
+            ],
+            raw: false,
+        }
+    );
 }

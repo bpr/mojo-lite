@@ -28,6 +28,24 @@ fn output(source: &str) -> String {
     backend.output()
 }
 
+#[test]
+fn bounded_trait_dispatch_preserves_raising_effects_at_runtime() {
+    assert_eq!(
+        output(
+            "trait Fallible:\n    def run(self) raises -> Int: ...\n\n@fieldwise_init\nstruct Failure(Fallible):\n    var code: Int\n    def run(self) raises -> Int:\n        raise \"failed\"\n        return self.code\n\ndef invoke[T: Fallible](value: T) raises -> Int:\n    return value.run()\n\ndef main():\n    try:\n        var ignored = invoke(Failure(7))\n    except error:\n        print(\"caught trait effect\")\n"
+        ),
+        "caught trait effect\n"
+    );
+}
+
+#[test]
+fn executes_function_scoped_implicit_binding_from_a_nested_block() {
+    assert_eq!(
+        output("def main():\n    if True:\n        value = 7\n    print(value)\n"),
+        "7\n"
+    );
+}
+
 fn binding(bindings: &[(String, Value)], name: &str) -> Value {
     bindings
         .iter()
@@ -98,6 +116,16 @@ fn generic_function_value_runs_through_a_monomorphic_callable_view() {
     assert_eq!(
         output(
             "def identity[T: Copyable & Movable](value: T) -> T:\n    return value\n\ndef main():\n    var callback: def(Int) -> Int = identity\n    print(callback(42))\n"
+        ),
+        "42\n"
+    );
+}
+
+#[test]
+fn overloaded_function_value_uses_its_contextual_signature() {
+    assert_eq!(
+        output(
+            "def choose(value: Int) -> Int:\n    return value + 1\n\ndef choose(value: String) -> Int:\n    return len(value)\n\ndef main():\n    var callback: def(Int) -> Int = choose\n    print(callback(41))\n"
         ),
         "42\n"
     );
@@ -203,9 +231,19 @@ fn returned_index_reference_captures_the_selected_element() {
 #[test]
 fn closure_captures_enclosing_local_downward() {
     let e = run(
-        "def adder(n: Int) -> Int:\n    def add_n(x: Int) -> Int:\n        return x + n\n    return add_n(100)\n\nvar c: Int = adder(42)\n",
+        "def adder(n: Int) -> Int:\n    def add_n(x: Int) unified {n} -> Int:\n        return x + n\n    return add_n(100)\n\nvar c: Int = adder(42)\n",
     );
     assert_eq!(binding(&e, "c"), Value::Int(142));
+}
+
+#[test]
+fn unified_closure_value_carries_read_and_mutable_environments() {
+    assert_eq!(
+        output(
+            "def apply_twice(callback: def(Int) -> None):\n    callback(2)\n    callback(3)\n\ndef total() -> Int:\n    var sum: Int = 0\n    def add(value: Int) unified {mut sum}:\n        sum += value\n    apply_twice(add)\n    return sum\n\ndef main():\n    print(total())\n"
+        ),
+        "5\n"
+    );
 }
 
 // Note: closure-escape (`return helper` / `f = g`), undefined-variable, and
@@ -271,11 +309,54 @@ fn opaque_trait_bound_dispatches_indexing() {
 }
 
 #[test]
+fn indexer_values_normalize_for_builtin_collections() {
+    let actual = output(
+        "@fieldwise_init\nstruct Offset(Indexer):\n    var value: Int\n    def __mlir_index__(self) -> Int:\n        return self.value\n\ndef main():\n    var values = [3, 7, 11]\n    print(values[Offset(1)])\n",
+    );
+    assert_eq!(actual, "7\n");
+}
+
+#[test]
 fn writable_value_formats_through_its_string_hook() {
     let actual = output(
-        "@fieldwise_init\nstruct Temperature(Writable):\n    var degrees: Int\n    def __str__(self) -> String:\n        return String(self.degrees) + \" degrees\"\n\ndef main():\n    print(Temperature(21))\n",
+        "@fieldwise_init\nstruct Temperature(Writable):\n    var degrees: Int\n    def write_to(self, mut writer: Some[Writer]):\n        writer.write(self.degrees, \" degrees\")\n\ndef main():\n    print(Temperature(21))\n",
     );
     assert_eq!(actual, "21 degrees\n");
+}
+
+#[test]
+fn writable_default_reflects_fields() {
+    let actual = output(
+        "@fieldwise_init\nstruct Point(Writable):\n    var x: Int\n    var y: Int\n\ndef main():\n    print(Point(2, 5))\n",
+    );
+    assert_eq!(actual, "Point(x=2, y=5)\n");
+}
+
+#[test]
+fn writable_repr_and_string_format_use_writer_rendering() {
+    let actual = output(
+        "@fieldwise_init\nstruct Point(Writable):\n    var x: Int\n    def write_to(self, mut writer: Some[Writer]):\n        writer.write(\"point=\", self.x)\n    def write_repr_to(self, mut writer: Some[Writer]):\n        writer.write(\"Point[\", self.x, \"]\")\n\ndef main():\n    var point = Point(4)\n    print(String(point))\n    print(repr(point))\n    print(\"{} / {!r} / {0}\".format(point, point))\n    print(\"|{:>5}|{:<5}|{:.2f}\".format(3, 4, 1.5))\n",
+    );
+    assert_eq!(
+        actual,
+        "point=4\nPoint[4]\npoint=4 / Point[4] / point=4\n|    3|4    |1.50\n"
+    );
+}
+
+#[test]
+fn hashable_contributes_to_a_caller_provided_hasher() {
+    let actual = output(
+        "@fieldwise_init\nstruct Pair(Hashable):\n    var left: Int\n    var right: Int\n    def __hash__(self, mut hasher: Some[Hasher]):\n        hasher.update(self.left)\n        hasher.update(self.right)\n\ndef main():\n    print(hash(Pair(1, 2)) == hash(Pair(1, 2)))\n    print(hash(Pair(1, 2)) == hash(Pair(2, 1)))\n",
+    );
+    assert_eq!(actual, "True\nFalse\n");
+}
+
+#[test]
+fn buffer_writer_receives_multiple_writable_values() {
+    let actual = output(
+        "@fieldwise_init\nstruct BufferWriter(Writer):\n    var buffer: String\n    def write_string(mut self, value: String):\n        self.buffer = self.buffer + value\n\ndef main():\n    var writer = BufferWriter(\"\")\n    writer.write(\"count=\", 3, \" ok=\", True)\n    print(writer.buffer)\n",
+    );
+    assert_eq!(actual, "count=3 ok=True\n");
 }
 
 #[test]
@@ -547,6 +628,18 @@ fn generic_struct_preserves_element_runtime_type() {
 }
 
 #[test]
+fn inferred_generic_methods_run_type_erased() {
+    let src = "@fieldwise_init\nstruct Factory:\n    var marker: Int\n    @staticmethod\n    def make[T: Copyable](value: T) -> T:\n        return value\n    def echo[T: Copyable](self, value: T) -> T:\n        return value\n\ndef main():\n    var factory = Factory(0)\n    print(Factory.make(7), factory.echo(\"ok\"))\n";
+    assert_eq!(output(src), "7 ok\n");
+}
+
+#[test]
+fn generic_target_implicit_conversion_runs_selected_constructor() {
+    let src = "struct Box[T: AnyType]:\n    var value: Self.T\n    @implicit\n    def __init__(out self, value: Self.T):\n        self.value = value\n\ndef take(value: Box[Int]) -> Int:\n    return value.value\n\ndef main():\n    print(take(42))\n";
+    assert_eq!(output(src), "42\n");
+}
+
+#[test]
 fn generic_function_identity_runs_type_erased() {
     let e = run(
         "def id[T: Copyable & Movable](x: T) -> T:\n    return x\n\nvar n: Int = id(5)\nvar s: String = id(\"hi\")\n",
@@ -615,6 +708,12 @@ fn value_parameter_is_reified_and_read_via_self() {
 }
 
 #[test]
+fn float_compile_time_parameter_materializes_at_runtime() {
+    let src = "def weight[value: Float64]() -> Float64:\n    return value\n\ndef main():\n    print(weight[1.5]())\n";
+    assert_eq!(output(src), "1.5\n");
+}
+
+#[test]
 fn comptime_arithmetic_argument_evaluates() {
     let e = run(&format!(
         "{FIXEDBUF}var b: FixedBuffer[2 + 3] = FixedBuffer[2 + 3](0)\nvar c: Int = b.capacity()\n"
@@ -669,6 +768,12 @@ fn uint8_arithmetic_wraps_bit_accurately() {
         "var v: SIMD[DType.uint8, 2] = SIMD[DType.uint8, 2](255)\nvar w: SIMD[DType.uint8, 2] = v + SIMD[DType.uint8, 2](1)\nvar lane: UInt8 = w[0]\n",
     );
     assert_eq!(binding(&e, "lane").to_string(), "0");
+}
+
+#[test]
+fn byte_alias_materializes_as_uint8() {
+    let execution = run("var byte: Byte = 255\n");
+    assert_eq!(binding(&execution, "byte").to_string(), "255");
 }
 
 #[test]
@@ -808,7 +913,7 @@ fn empty_print_writes_a_blank_line() {
 #[test]
 fn print_displays_structs_and_simd() {
     let e = output(
-        "@fieldwise_init\nstruct P(Writable):\n    var x: Int\n    var y: Int\n    def __str__(self) -> String:\n        return \"P(\" + String(self.x) + \", \" + String(self.y) + \")\"\n\nprint(P(1, 2))\nprint(SIMD[DType.int32, 4](1, 2, 3, 4))\n",
+        "@fieldwise_init\nstruct P(Writable):\n    var x: Int\n    var y: Int\n    def write_to(self, mut writer: Some[Writer]):\n        writer.write(\"P(\", self.x, \", \", self.y, \")\")\n\nprint(P(1, 2))\nprint(SIMD[DType.int32, 4](1, 2, 3, 4))\n",
     );
     assert_eq!(e, "P(1, 2)\n[1, 2, 3, 4]\n");
 }
@@ -1275,14 +1380,25 @@ fn float64_keeps_full_precision_unlike_float32() {
     );
 }
 
-// --- Walrus (parsed, unsupported at runtime) ---
+// --- Walrus ---
 
 #[test]
-fn walrus_is_unsupported_at_runtime() {
-    assert!(matches!(
-        run_err("var y: Int = (n := 5)\n"),
-        RuntimeError::Unsupported(_)
-    ));
+fn walrus_binds_and_produces_its_value() {
+    assert_eq!(
+        output("def main():\n    var y: Int = (n := 5)\n    print(y, n)\n"),
+        "5 5\n"
+    );
+}
+
+#[test]
+fn unsafe_pointer_provenance_arithmetic_and_deallocation() {
+    assert_eq!(
+        output(
+            "def main():\n    var base = UnsafePointer[Int].alloc_aligned(3, 16)\n    base[1] = 42\n    var next = base + 1\n    print(next[0], next - base, next == base + 1)\n    base.free()\n"
+        ),
+        "42 1 True\n"
+    );
+    assert!(run_err("def main():\n    var p = UnsafePointer[Int].alloc(1)\n    var q = p\n    p.free()\n    print(q[0])\n").to_string().contains("use after"));
 }
 
 // --- Inferred `var` ---

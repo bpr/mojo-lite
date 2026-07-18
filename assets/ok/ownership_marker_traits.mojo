@@ -1,10 +1,10 @@
 # Phase 8: lifecycle marker traits map to observable copy/move/delete behavior.
 
 @fieldwise_init
-struct Plain(ImplicitlyCopyable, ImplicitlyDestructible):
+struct Plain(ImplicitlyCopyable, ImplicitlyDeletable):
     var n: Int
 
-struct ExplicitBox(Copyable, ImplicitlyDestructible):
+struct ExplicitBox(Copyable, ImplicitlyDeletable):
     var n: Int
 
     def __init__(out self, n: Int):
@@ -24,7 +24,7 @@ def duplicate_implicit[T: ImplicitlyCopyable](x: T) -> T:
 def accept_movable[T: Movable](var x: T):
     pass
 
-def accept_deletable[T: ImplicitlyDestructible](x: T):
+def accept_deletable[T: ImplicitlyDeletable](x: T):
     pass
 
 def main():

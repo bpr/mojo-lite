@@ -136,22 +136,24 @@ semantics: only that binding changes).
 
 `x = e` on an **undeclared** name is a Mojo **`var`-less variable introduction**
 (implicit declaration). Mojito binds its inferred type and lowers it like an
-explicit inferred `var` declaration.
+explicit inferred `var` declaration. The binding belongs to the containing
+function even when the first assignment is nested in a branch or loop. Reads
+still require every reachable path to have initialized it; explicit `var`
+declarations retain lexical block scope.
 
 **Tuple unpacking** `a, b, … = e` binds each target to the corresponding element of
 the tuple `e` (Mojo's `x, y = example_tuple`; a top-level comma in the target list is
-what marks the statement as an unpack). Each target obeys the same rule as an
+what marks the statement as an unpack). Declaration unpacking (`var a, b = e`) is
+also accepted. Each target obeys the same rule as an
 assignment target — a `NAME` or a place — and a trailing comma is allowed
-(`a, = t`). This is the **bare form only**: the `var a, b = e` form is a still-open
-Mojo feature request ([modular/modular#2105](https://github.com/modular/modular/issues/2105)),
-so it is *not* accepted (strict-subset — mojo-lite never invents syntax Mojo lacks).
+(`a, = t`).
 The value tuple is evaluated **once**; each element is then bound to its target (a
 `NAME` follows the assignment rules — re-assign if in scope, else a var-less
 introduction).
 
 **Augmented assignment** `target OP= e` means `target = target OP e` for the seven
-arithmetic operators (`+ - * / // % **`; the bitwise/`@` forms Mojo also has are not
-in this subset). The target obeys the same place rules, and the operator/result must
+arithmetic and integer bitwise/shift operators. The target obeys the same place
+rules, and the operator/result must
 type-check like the expansion (`i /= 2` is an error when `i: Int`, since `/` yields
 `Float64`). The place — and any index inside it — is evaluated **once** (so
 `xs[f()] += 1` calls `f` a single time). Still unsupported: chained assignment
@@ -184,9 +186,12 @@ ellipsis, a 3-dot level (`from ...pkg import X`) is read as one `...` (plus any 
 `.`). **`from module import …` is now resolved** by a link pass (`src/module.rs`): when
 a file path is given (`mojo-lite run FILE`), the module is loaded from a `.mojo` file
 relative to the importing file's directory (`collections` → `collections.mojo`, dotted
-`a.b` → `a/b.mojo`, relative dots climb directories). A directory containing
-`__init__.mojo` is a source package, and imports in that initializer re-export names
-from the package. Top-level declarations (`def`/`struct`/`trait`/`comptime`, excluding
+`a.b` → `a/b.mojo`, relative dots climb directories). Ordinary directories may
+form intermediate namespaces. A directory containing `__init__.mojo` is a source
+package, wins over a same-named source module, and imports in that initializer re-export names
+from the package. Every prefix of an absolute dotted import becomes a namespace;
+submodules otherwise require an explicit import or initializer re-export.
+Top-level declarations (`def`/`struct`/`trait`/`comptime`, excluding
 `main`) receive module-qualified internal identities before being flattened. Plain
 qualified imports, module/member aliases, wildcard privacy for underscore names,
 lexically scoped imports, dots-only sibling imports, transitive imports, and collision
@@ -197,7 +202,7 @@ unsupported.
 ### function_def
 
 ```
-function_def: decorators 'def' NAME [params_decl] '(' [params] ')' ['raises' [type]] ['->' type] ':' block
+function_def: decorators 'def' NAME [params_decl] '(' [params] ')' [unified_captures] ['raises' [type]] ['->' type] [where_clause] ':' block
 decorators: decorator*
 decorator: '@' dotted_name ['(' [args] ')'] NEWLINE   # general — any name (only `@fieldwise_init` is acted on)
 dotted_name: NAME ('.' NAME)*
@@ -205,10 +210,12 @@ params: ','.param_item+ [',']
 param_item:
     | '/'                                  # positional-only marker
     | '*'                                  # keyword-only marker (bare)
-    | '*' NAME ':' type                    # *args (positional variadic)
+    | [convention] '*' NAME ':' type       # *args; `var *args: *Ts` may be transferred
     | '**' NAME ':' type                   # **kwargs (keyword variadic)
     | [convention] NAME ':' type ['=' expression]   # regular, optional default
-convention: 'read' | 'mut' | 'var' | 'out' | 'ref' [origin_spec] | 'deinit'
+convention: 'imm' | 'read' | 'mut' | 'var' | 'out' | 'ref' [origin_spec] | 'deinit'
+unified_captures: 'unified' '{' [capture_entry (',' capture_entry)* [',']] '}'
+capture_entry: ['mut'] NAME ['^'] | 'imm' | 'read'
 origin_spec: '[' ','.expression+ ']'   # an expression, a named origin, origin_of(...), or '_'
 reference_binding: 'ref' NAME '=' expression
 ```
@@ -217,16 +224,19 @@ Every parameter is typed; omitting `-> type` means the function returns `None`. 
 full Mojo parameter grammar is **parsed**. **Default values** (`b: Int = 2`) and a
 trailing **`*args` homogeneous variadic** (`*values: Int`, a `List[T]` in the body)
 are *implemented* for non-generic free `def`s. Generic
-`[*Types: Bound](*values: *Types)` declarations also accept heterogeneous values,
-check each value against `Bound`, and support pack length queries and compile-time
-iteration/indexing for literal or directly constructed call arguments. An indexed
-value has the common pack-bound type; per-index concrete type reflection remains
-deferred. Homogeneous `**kwargs: T` is also
-implemented: unmatched ordered keyword pairs are transported by the call ABI and
-materialized as an owned self-hosted `HashDict[String, T]` local. Generic and method
-`**kwargs` remain deferred. A single `out result: T` is a caller-transparent named
+`[*Types: Bound](var *values: *Types)` declarations also accept heterogeneous
+values, check each value against `Bound`, and support pack length queries and
+compile-time iteration/indexing for statically evident call arguments.
+Specialization exposes the concrete type at each pack index. A transferred pack
+can round-trip through `Tuple[*Types](*values^)`; this is a Tuple construction
+rule, not general spreading into fixed-arity calls. Homogeneous `**kwargs: T` is
+also implemented: unmatched ordered keyword pairs are transported by the call
+ABI and materialized as an owned self-hosted `StringDict[T]` local. Free,
+generic, instance, static, and bounded-trait calls share this binder. A collector
+can be consumed and forwarded as the final call argument with `**kwargs^`; the
+callee must also declare a compatible collector. A single `out result: T` is a caller-transparent named
 result; multiple named results are unsupported.
-A `convention` word is only a convention when a parameter name follows it, so `read`,
+A `convention` word is only a convention when a parameter name follows it, so `imm`, `read`,
 `mut`, `ref`, etc. remain usable as parameter names (`def f(read: Int)`, `def f(ref:
 Int)`). Ordering is parsed leniently. The **`ref` convention** (parametric-mutability
 reference) may carry an **origin specifier** — `ref[origin] x` — whose contents (an
@@ -241,10 +251,11 @@ signature and body (e.g. `def first[T: Copyable & Movable](p: Pair[T]) -> T`, or
 
 The optional **`raises`** effect (before `->`) marks a function that may raise an
 error (Mojo's `def` is non-raising by default). An error type may follow (`raises
-ValidationError`) — it is *parsed but not modeled* (mojo-lite has a single `Error`
-type). mojo-lite records `raises` but **does not enforce the effect** (it does not
-require that a call to a raising function be inside a `try` or in a `raises` function);
-that effect analysis is deferred. Methods take the same optional `raises`.
+ValidationError`). Calls must be protected by `try` or propagated by an enclosing
+function with the same concrete error contract. Effects survive free/method
+overload selection, callable values, trait requirements, and bounded dispatch;
+`raises Never` is nonraising. Methods and trait requirements take the same
+optional effect.
 
 ### Parameterization (generics)
 
@@ -315,7 +326,7 @@ declares that trait here.
 trait_def: 'trait' NAME [conformance] ':' trait_block         # conformance here = super-traits (refinement)
 trait_block: NEWLINE INDENT trait_member+ DEDENT
 trait_member: trait_method | trait_comptime
-trait_method: 'def' NAME '(' 'self' [',' params] ')' ['->' type] ':' NEWLINE INDENT (trait_req | block) DEDENT
+trait_method: decorators 'def' NAME [params_decl] '(' 'self' [',' params] ')' ['raises' [type]] ['->' type] [where_clause] ':' NEWLINE INDENT (trait_req | block) DEDENT
 trait_req: '...' NEWLINE                                       # a pure requirement
 trait_comptime: 'comptime' NAME ':' type NEWLINE              # a compile-time member requirement
 ```
@@ -325,6 +336,8 @@ A `trait` declares **method requirements**: each is a `def` header (with the imp
 token) — a requirement, not an implementation. A conforming struct must supply
 matching methods and associated `comptime` members. Receiver conventions and
 associated type/value facts participate in conformance and generic bounds.
+Raising requirements retain their optional concrete error family. A nonraising
+implementation may satisfy one; a raising implementation may not widen it.
 
 Two further valid-Mojo trait forms are parsed but rejected by the checker:
 **trait inheritance / refinement** (`trait Bird(Animal, Named):` — a
@@ -343,7 +356,7 @@ least one member; fields and methods may interleave.
   makes `self` writable: the method may do `self.field = e` (and call other `mut self`
   methods), and those mutations are **written back** to the receiver — so `c.increment()`
   persists. A `mut self` method must be called on a mutable place (a variable or a
-  field/index chain), never a temporary. Ordinary `read`/`mut`/`var`/`ref`
+  field/index chain), never a temporary. Ordinary `imm`/`mut`/`var`/`ref`
   parameters execute, and one `out name: Type` parameter denotes a named result
   that callers receive like an ordinary return value. Receiver conventions
   include lifecycle `out self` and `deinit self` plus `var`/`ref self`.
@@ -354,7 +367,7 @@ least one member; fields and methods may interleave.
   instance (an ordinary call — see `primary`). A struct without it has no constructor (a
   checker error to construct). Every other decorator is recorded and ignored.
 - **Dunder methods** (`__init__`, `__eq__`, `__add__`, …) are ordinary methods by name and
-  parse as such. **Receiver conventions** `read`/`mut`/`var`/`out`/`ref self` participate
+  parse as such. **Receiver conventions** `imm`/`mut`/`var`/`out`/`ref self` participate
   in checking and lowering, including lifecycle `out self` and origin-bearing reference
   receivers. A `@staticmethod` (no `self`) checks and executes through the ordinary
   function call ABI. Unsupported receiver combinations are diagnosed by the checker.
@@ -376,16 +389,21 @@ else_block: 'else' ':' block
 
 while_stmt: 'while' expression ':' block
 
-for_stmt: 'for' NAME 'in' expression ':' block
+for_stmt: 'for' [('ref' | 'var')] NAME 'in' expression ':' block ['else' ':' block]
 
 with_stmt: 'with' ','.with_item+ ':' block
 with_item: expression ['as' NAME]
 ```
 
-Conditions are any `expression` (the checker requires `Bool`). `while` / `for` have no
-loop-`else` clause. A `for` target is a single `NAME` (no tuple unpacking); its
+Conditions are any `expression` (the checker requires `Bool`). `while` / `for`
+support loop `else`; `break` bypasses it. A `for` target is a single `NAME`, optionally
+introduced with `ref` for mutable list-element iteration; its
 iterable is any `expression` — in practice a `range(...)` call or a `List` (see
-**Collections** and Built-ins). `break` / `continue` outside a loop are checker errors.
+**Collections** and Built-ins). `for var item in collection^` moves the collection
+and successively transfers its elements, including non-Copyable elements. An
+early exit destroys an implicitly deletable residual collection; it is rejected
+when residual linear elements would require explicit destruction. `break` /
+`continue` outside a loop are checker errors.
 
 ### with_stmt
 
@@ -400,9 +418,9 @@ block (`with open(p) as f:`, `with lock():`, or several comma-separated
 **optional** `as NAME` binding (Mojo's protocol: `__enter__` runs on entry — its
 result bound to `NAME` if present — and `__exit__` on exit). The `as` target is a
 plain `NAME`; the **parenthesized** and **tuple-target** forms are not in the Mojo
-docs, so (strict-subset) they are not parsed. The statement is **parsed and
-grammar-documented, but the checker rejects it because the
-`__enter__`/`__exit__` protocol is not implemented.
+docs, so (strict-subset) they are not parsed. The frontend elaborates the statement
+into checked `__enter__` and `__exit__` calls protected by `try`/`finally`, so a
+raising exit follows the ordinary effect rules.
 
 ### try_stmt
 
@@ -418,8 +436,8 @@ bind the error to a `NAME` — there is no `except Type as e:` form, matching Mo
 `except` / `finally` is required (a checker rule). Errors are raised with `raise` (see
 `raise_stmt`), whose operand is an `Error` (from the built-in `Error(msg)` constructor)
 or a `String` (auto-wrapped). Re-raise a caught error with the transfer sigil:
-`raise e^`. An **uncaught** raise surfaces as a runtime error (a deliberate signal —
-the checker does not prevent it, just as it can't prevent a `range(...)` zero `step`).
+`raise e^`. The checker rejects a statically unhandled effect; dynamically raised
+errors that a valid `raises` entry point does not catch surface as runtime errors.
 
 ### block
 
@@ -478,37 +496,49 @@ primary:
     | primary '.' NAME                   # field access / value-parameter read (Self.n)
     | atom [param_args] '(' [args] ')'   # call/construction, optionally with explicit params
     | NAME param_args                    # parameterized type in expr position (TypeApply), e.g. UnsafePointer[Int]
-    | primary '[' expression ']'         # subscript: index, v[i], ptr[i]
-    | primary '[' [expression] ':' [expression] [':' [expression]] ']'  # slice `a[i:j:k]` on List/String (implemented)
+    | primary '[' ','.subscript_arg+ ']' # index/slice arguments; one or many
     | primary '^'                        # transfer sigil; lowered and ownership-checked as a move
     | atom
 atom:
     | NAME
     | INT
     | FLOAT
-    | STRING
-    | TSTRING                     # t-string — parsed (sub-exprs), semantics deferred
+    | (STRING | TSTRING)+         # adjacent family concatenates; any TSTRING retains interpolation
     | 'True'
     | 'False'
     | 'None'
     | list_literal
+    | brace_literal
     | tuple_or_group
-list_literal: '[' ','.expression+ ']'      # a non-empty List literal, e.g. [1, 2, 3]
+list_literal:
+    | '[' [','.expression+ [',']] ']'
+    | '[' expression comprehension_clauses ']'
+brace_literal:
+    | '{' '}'                              # contextually typed empty Dict
+    | '{' ','.expression+ [','] '}'        # Set display
+    | '{' ','.(expression ':' expression)+ [','] '}' # Dict display
+    | '{' expression comprehension_clauses '}'       # Set comprehension
+    | '{' expression ':' expression comprehension_clauses '}' # Dict comprehension
+comprehension_clauses: ('for' [('ref' | 'var')] NAME 'in' expression | 'if' expression)+
 # A parenthesized form is a Tuple when it has a comma (or is empty), else grouping.
 tuple_or_group:
     | '(' ')'                                       # empty tuple ()
     | '(' expression ',' [','.expression+] [','] ')' # tuple (a,) (a, b) (a, b,)
     | '(' expression ')'                            # grouping (e)
 
-args: ','.arg+ [',']              # positional args, then keyword args
-arg: NAME '=' expression | expression   # `name=value` is a keyword argument
+subscript_arg:
+    | expression
+    | [expression] ':' [expression] [':' [expression]]
+args: ','.arg+ [',']              # positional args, then keyword args/forwarding
+arg: NAME '=' expression | forwarded_kwargs | expression
+forwarded_kwargs: '**' expression # expression must be a final transferred value (`kwargs^`)
 ```
 
-Keyword arguments (`f(x=1, y=2)`; a positional argument may not follow a keyword one)
-are **implemented** for free-function and ordinary user-method calls — matched to
-parameters by name, mixed with positional args, defaults, and homogeneous
-`*args`. Keyword args to builtins, general struct construction, and generic
-functions are still deferred. List literals use only positional elements.
+Keyword arguments (`f(x=1, y=2)`; a positional argument may not follow a keyword
+one) are matched to parameters by name and compose with positional arguments,
+defaults, homogeneous `*args`, and `**kwargs` across free, generic, constructor,
+instance, static, and bounded-trait calls. Builtins accept keywords only where
+their declared intrinsic contract does.
 
 Notes:
 
@@ -521,11 +551,9 @@ Notes:
   position `not` can only begin `not in`; note that the prefix form `not x in c` instead
   parses as `not (x in c)` (the same truth value).
 - **The walrus / named expression `NAME := e`** binds looser than every operator (so
-  `(n := a + b)` is `n := (a + b)`); the target must be a bare `NAME`. It is **parsed**
-  (AST `Expr::Named`) and type-checks as `e`'s type, but MIR execution reports an
-  **unsupported feature**; since it isn't run, the checker
-  does not bind the name, so a program that *uses* the walrus-bound name later won't
-  type-check.
+  `(n := a + b)` is `n := (a + b)`); the target must be a bare `NAME`. It evaluates
+  the right side once, introduces the target in the containing function scope, and
+  yields the assigned value.
 - **`primary` is left-recursive over `.NAME` (field access) and `.NAME(args)` (method
   call)**, which chain (`a.b.c`, `p.m().n`). The plain call form `atom '(' [args] ')'`
   is a *free* call whose callee must be a `NAME` — a free function, a built-in, or a
@@ -533,9 +561,12 @@ Notes:
   not a `NAME`; chain through a method instead).
 - **`[` after a `primary` is disambiguated by what follows**: `NAME '[' param_args ']'
   '(' args ')'` is a call/construction with explicit compile-time parameters;
-  `primary '[' expression ']'` *not* followed by `(` is a **subscript**. Lists,
-  tuples, SIMD values, unsafe pointers, and supported user indexing
-  protocols provide reads; writable containers also support indexed assignment.
+  `primary '[' subscript_arg, ... ']'` *not* followed by `(` is a **subscript**.
+  A slice preserves omitted bounds and whether a stride was written, selecting
+  `ContiguousSlice` or `StridedSlice`; mixed/multiple arguments dispatch through
+  variadic `__getitem__`/`__setitem__`. Lists, tuples, SIMD values, unsafe pointers,
+  and supported user indexing protocols provide reads; writable containers also
+  support indexed assignment.
 - **`^` (transfer sigil)** is a postfix that marks an ownership *move* of its operand
   (`x^`, `raise e^`). MIR represents whole-value and projected-field moves;
   ownership analysis rejects use-after-move, double moves, conditional moves,
@@ -549,9 +580,13 @@ Notes:
   `+ - * // % **` take same-type operands and return that type (`+` also concatenates
   `String`); `/` (true division) returns `Float64` for any numeric operands
   (`Int / Int → Float64`). Integer `//` / `%` by zero is a runtime error.
-- **`args`** accepts positional arguments followed by keyword arguments. Callee
+- **`args`** accepts positional arguments followed by keyword arguments. A final
+  `**kwargs^` consumes an owned `StringDict` into a compatible collector. Callee
   signatures may use defaults, `/`, bare `*`, homogeneous `*args`, and homogeneous
   `**kwargs`; structural matching is shared by checking and VM frame binding.
+- **Collection displays and comprehensions** are homogeneous. Set/dictionary
+  elements must be Hashable, dictionary keys evaluate before values, and
+  generator/filter clauses evaluate left to right with normal nested-loop scope.
 
 ## Types
 
@@ -578,16 +613,19 @@ inside a struct body); bare `Self` names the enclosing struct type (in a struct 
 or the conforming type (in a trait method). Inside a value-parameterized struct, bare
 `Self` as a *type* is not supported (a value parameter can't appear in a type).
 A **function/closure type** `def(T1, …) [thin] [raises] -> R` (parameters are types
-only; `thin` marks a non-capturing function pointer, default capturing) **parses**
-into `Type::Func`, but the checker flags function-typed bindings as unsupported
-(semantics deferred). Capture lists `{…}` on a closure are **not** parsed yet
-(their current-Mojo grammar is unsettled — the old `unified` keyword was removed).
+only; `thin` marks a non-capturing function pointer, default capturing) parses
+into `Type::Func` and participates in checked callable bindings. Current unified
+closure capture lists parse explicitly: a plain name is an immutable capture,
+`mut name` is mutable, `name^` moves ownership, and a trailing `imm` (legacy
+`read`) supplies the default convention for otherwise-unlisted free variables.
+Ordinary nested functions do not capture implicitly.
 A **reference type** `ref[origin] T` (used in a `ref` return, `def f(…) -> ref[o] T:`)
 likewise **parses** into `Type::Ref` with its origin retained, but the checker flags it as
 unsupported. `ref` is contextual here — only the reference form when a type-starting
 token follows.
 
-A `NAME` is also a **SIMD type** when it is `SIMD[DType.<dt>, <width>]` or one of the
+A `NAME` is also a **SIMD type** when it is `SIMD[DType.<dt>, <width>]`,
+`Scalar[DType.<dt>]`, or one of the
 fixed-width **scalar aliases** (`Int8` / `Int16` / `Int32` / `Int64`, `UInt8` / `UInt16`
 / `UInt32` / `UInt64`, `Float32`) — see **SIMD** — or a **`List[T]`** (see
 **Collections**). These are recognized by the checker, not reserved words.
@@ -645,13 +683,13 @@ built-ins only when not shadowed by a binding.
   `Int`, `UInt`, `Float64`, or `Bool`, producing the named type. (`Float64`→integer
   truncates toward zero; `Bool` is 0/1.)
 - `print(...)` — writes intrinsic values or user structs that declare `Writable`
-  / `Representable` and implement `__str__(self) -> String`, separated by a space
+  and are streamed through `Writable.write_to` into a `Writer`, separated by a space
   and followed by a newline; returns `None`. Keyword arguments (`sep=` / `end=`)
   are not supported. This hook is the first-pass formatter boundary; the complete
-  Writer and format-spec APIs remain narrower than Mojo.
+  `repr`, reflective defaults, and String replacement fields share the Writer path.
 - `Error(msg)` — constructs an `Error` from a `String` (see **try_stmt**).
-- `String(x)` — stringify a numeric, `Bool`, or `String` value → `String` (uses the
-  value's display, so `Bool` is `True`/`False` and `Float64` keeps a decimal point).
+- `String(x)` — materialize any `Writable` value into a buffered `String` (uses
+  display writing, so `Bool` is `True`/`False` and `Float64` keeps a decimal point).
   Lets you build messages: `"n = " + String(n)`.
 - `abs(x)` — absolute value of a numeric, preserving its type.
 - `min(a, b)` / `max(a, b)` — two numeric arguments unified like an operator (no
@@ -679,22 +717,24 @@ takes that type (`u + 1 : UInt`). The explicit conversions `Int(x)` / `UInt(x)` 
 ## SIMD
 
 `SIMD[DType.<dt>, <width>]` is a fixed-width vector of `<width>` lanes of element type
-`<dt>` — a built-in **parameterized** type (built on Phase 2 value parameters). `<width>`
-is a comptime `Int` and must be a power of two; `<dt>` is written `DType.<dt>` where
+`<dt>` — a built-in **parameterized** type. `<width>` is a comptime `SIMDSize`
+(represented by a compile-time `Int`) and must be a power of two; `_` in a
+construction infers the width from its explicit lanes. `<dt>` is written `DType.<dt>` where
 `DType` is a built-in namespace (`DType.<dt>` is valid only inside a `SIMD[...]`
 argument, never as a value).
 
-- **Element types (`<dt>`)**: `int8` / `int16` / `int32` / `int64`, `uint8` / `uint16` /
+- **Element types (`<dt>`)**: platform-sized `int`, `int8` / `int16` / `int32` / `int64`, `uint8` / `uint16` /
   `uint32` / `uint64`, `float32`, `float64`, `bool`. (The wider integers and the
   low-precision floats of real Mojo are not included.) Integer arithmetic is
   **bit-accurate** — it wraps at the element width; `float32` rounds each result to single
   precision, `float64` keeps full double precision.
 - **Scalar aliases**: `Int8`…`Int64`, `UInt8`…`UInt64`, `Float32` mean `SIMD[DType.<dt>,
-  1]`. **`Float64` is unified with `SIMD[DType.float64, 1]`** — they are the same type
+  1]`; `Byte` is exactly an alternate spelling of `UInt8` (there is no separate
+  byte-string literal family). **`Float64` is unified with `SIMD[DType.float64, 1]`** — they are the same type
   (as in real Mojo), so a `Float64` splats into a `float64` vector, a `float64` vector's
   lane reads/writes as a `Float64`, and either annotation names the same type; internally
-  a width-1 `float64` keeps `Float64`'s native representation. (`Int` / `UInt` / `Bool`
-  remain separate non-SIMD types, matching Mojo.)
+  a width-1 `float64` keeps `Float64`'s native representation. `Int` similarly
+  canonicalizes with `Scalar[DType.int]` while retaining its native VM representation.
 - **Construction**: `SIMD[DType.int32, 4](1, 2, 3, 4)` takes exactly `<width>` element
   arguments; `SIMD[DType.int32, 4](7)` **splats** one value across all lanes. A scalar
   alias constructs a width-1 vector: `Int32(5)`.
@@ -749,18 +789,23 @@ is a **value type**: assigning or passing a `List` **copies** it (no aliasing).
 
 `UnsafePointer[T]` is the built-in low-level pointer — a handle to contiguous heap
 storage of element type `T`. Unlike the value-type collections, a pointer **aliases**:
-copying it copies the offset, so two copies refer to the *same* storage (this is what lets
+copying it preserves allocation identity and the typed element offset, so two copies
+refer to the *same* storage (this is what lets
 a value-type struct own mutable heap storage, e.g. a self-hosted `List`).
 
-- **Allocation**: `UnsafePointer[T].alloc(n)` (a static method on the parameterized type —
+- **Allocation**: `UnsafePointer[T].alloc(n)` or
+  `UnsafePointer[T].alloc_aligned(n, alignment)` (static methods on the parameterized type —
   the `Name[T]` receiver is a `TypeApply` expression) reserves `n` uninitialized slots and
   returns a pointer to the base.
 - **Load / store**: `ptr[i]` reads, `ptr[i] = e` (and `ptr[i] += e`) writes the pointee at
   offset `i` (an `Int`); `e` must be a `T`.
-- **`free()`**: releases the allocation (a no-op in the model's arena, which never reclaims).
-- Deferred: pointer arithmetic (`ptr + i`), `.load()`/`.store()`, and the pointee-lifecycle
-  methods (`init_pointee_*`, `destroy_pointee`, `take_pointee`). `UnsafePointer` is
-  **unchecked** — an out-of-allocation (but in-arena) access is permitted, matching Mojo.
+- **Arithmetic/comparison**: `ptr + i` and `ptr - i` preserve provenance;
+  subtracting pointers from the same allocation returns their element distance.
+  Equality compares allocation identity and offset.
+- **`free()`**: invalidates the allocation and every alias. Non-base frees,
+  double frees, use-after-free, and out-of-allocation access are runtime errors.
+- **Dangling**: `UnsafePointer[T].dangling()` creates a non-null placeholder that
+  can be stored but not dereferenced or freed.
 
 ## Tokens (lexical structure)
 
@@ -769,21 +814,28 @@ Terminals above are produced by the lexer. Character classes: `letter` = ASCII
 
 ```
 NAME:  (letter | '_') (letter | digit | '_')*       # minus the reserved words below
-INT:                                                 # 64-bit signed; '-' is the operator
+INT:                                                 # currently stored signed-64; '-' is the operator
     | dec_digits                                     #   decimal
-    | '0' ('x'|'X') hex_digits                        #   hex 0xFF
-    | '0' ('o'|'O') oct_digits                        #   octal 0o77
-    | '0' ('b'|'B') bin_digits                        #   binary 0b0111
-dec_digits: digit ('_'? digit)*                       # '_' digit separators (between digits)
-FLOAT: dec_digits ('.' dec_digits)? exponent?        # is a FLOAT iff it has a '.' or exponent
-        | dec_digits exponent                        #   (otherwise the same text is an INT)
-exponent: ('e' | 'E') ('+' | '-')? digit+
-STRING:                                              # single- or double-quoted, escapes below
-    | ('"' | "'") (string_char | escape)*  ('"' | "'")        # may not span a newline
-    | ('"""' | "'''") (any_char | escape)* ('"""' | "'''")    # triple-quoted, multi-line
+    | '0' ('x'|'X') hex_run                           #   hex 0xFF
+    | '0' ('o'|'O') oct_run                           #   octal 0o77
+    | '0' ('b'|'B') bin_run                           #   binary 0b0111
+digit_run: digit (digit | '_')*                       # repeated/trailing `_` is current Mojo
+dec_digits: digit_run                                 # leading-zero decimal is only `0`/all-zero
+hex_run: (hex | '_')+                                 # each based run must contain a real digit
+oct_run: (octal | '_')+
+bin_run: ('0' | '1' | '_')+
+FLOAT:
+    | dec_digits '.' (digit | '_')* exponent?        # `2.`, `2.5`, `2.e3`
+    | '.' digit_run exponent?                        # `.5`
+    | dec_digits exponent                            # no point, but exponent makes it floating
+exponent: ('e' | 'E') ('+' | '-')? digit_run
+STRING:                                              # prefixes are case-insensitive
+    | ['r'|'R'] ('"' | "'") (string_char | escape)*  ('"' | "'")
+    | ['r'|'R'] ('"""' | "'''") (any_char | escape)* ('"""' | "'''")
+    # raw forms retain backslashes; non-raw triple forms suppress `\\` + newline
 escape:                                              # fully decoded to real chars
     | '\a' | '\b' | '\f' | '\n' | '\r' | '\t' | '\v' | '\\' | '\"' | "\'"   # simple
-    | '\' octal_lead octal octal          # octal byte: leading digit 0–3, then 2 octal digits
+    | '\' octal [octal [octal]]           # one-to-three octal digits, value <= 255
     | '\x' hex hex                        # 2-hex-digit code point (0–255)
     | '\u' hex hex hex hex                # 4-hex-digit Unicode scalar
     | '\U' hex hex hex hex hex hex hex hex # 8-hex-digit Unicode scalar
@@ -791,8 +843,11 @@ escape:                                              # fully decoded to real cha
     # a non-scalar value (e.g. a surrogate) or a missing/bad digit is a lex error.
     # NB: `\u`/`\U` are the exact-hex-digit forms — Mojo has NO `\u{…}` brace form.
 TSTRING:                                             # interpolation; parsed into sub-exprs
-    | ('t' | 'rt') STRING-body-with '{' expression '}'  and  '{{' '}}'  literal braces
-    # `t"…{x+1}…"` / raw `rt"…"`; each `{…}` is a parsed expression (semantics deferred)
+    | t_prefix STRING-body-with '{' expression '}'  and  '{{' '}}' literal braces
+t_prefix: case_insensitive('t' | 'rt' | 'tr')
+    # raw/interpolated prefixes may appear in either order/case. Interpolation
+    # boundary scanning respects braces inside nested strings, comments, and
+    # nested t-strings; Writable-checked values execute through MIR/VM.
 ```
 
 Reserved keywords (cannot be an unquoted `NAME`):
@@ -829,9 +884,8 @@ Structural tokens (significant-indentation / offside rule):
 Whitespace (spaces, tabs, `\r`) between tokens is insignificant; there are no
 comments.
 
-Operators intentionally absent (strict subset; see CLAUDE.md): bitwise, augmented
-assignment, and chained-comparison semantics. Do not add syntax that is not valid in
-current Mojo.
+Integer bitwise and shift operators, augmented assignment, matrix-multiply protocol
+dispatch, and chained comparisons are supported.
 
 ## Example derivations
 

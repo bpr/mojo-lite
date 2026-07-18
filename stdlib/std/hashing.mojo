@@ -7,15 +7,17 @@
 # (`Int`, `String`, …) hash intrinsically; a user key struct provides its own
 # `__hash__`.
 
-@fieldwise_init
 struct IncrementalHasher(Hasher):
     var state: UInt
 
+    def __init__(out self):
+        self.state = UInt(5381)
+
     @staticmethod
     def create() -> IncrementalHasher:
-        return IncrementalHasher(UInt(5381))
+        return IncrementalHasher()
 
-    def write_hash(mut self, value: UInt):
+    def update(mut self, value: UInt):
         self.state = self.state * UInt(33) + value
 
     def finish(self) -> UInt:

@@ -8,7 +8,28 @@
 use std::fmt;
 
 use crate::ast::{ArgConvention, Dtype};
-use crate::ct::CtValue;
+use crate::ct::{CtExpr, CtValue};
+
+/// Descriptor type selected for a slice literal at the checked boundary.
+/// Two-component literals can use the view-oriented contiguous descriptor;
+/// literals with a second colon use the owning strided descriptor. `Slice` is
+/// the general protocol fallback accepted by user-defined collections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SliceKind {
+    Slice,
+    ContiguousSlice,
+    StridedSlice,
+}
+
+impl SliceKind {
+    pub fn type_name(self) -> &'static str {
+        match self {
+            Self::Slice => "Slice",
+            Self::ContiguousSlice => "ContiguousSlice",
+            Self::StridedSlice => "StridedSlice",
+        }
+    }
+}
 
 /// A type in mojito's semantic lattice. Scalars mirror `ast::Type`; `Func` is
 /// synthesized from a `def` signature or lowered from a function-type annotation.
@@ -36,6 +57,8 @@ pub enum Ty {
         ret: Box<Ty>,
         required: Vec<bool>,
         variadic: Option<Box<Ty>>,
+        /// Homogeneous element type collected by `**kwargs`, when present.
+        kw_variadic: Option<Box<Ty>>,
         positional_only: Option<usize>,
         keyword_only: Option<usize>,
         raises: bool,
@@ -53,6 +76,8 @@ pub enum Ty {
         ret: Box<Ty>,
         required: Vec<bool>,
         variadic: Option<Box<Ty>>,
+        /// Homogeneous element type collected by `**kwargs`, when present.
+        kw_variadic: Option<Box<Ty>>,
         positional_only: Option<usize>,
         keyword_only: Option<usize>,
         raises: bool,
@@ -93,10 +118,21 @@ pub enum Ty {
     Error,
     /// The built-in `List[T]` collection type.
     List(Box<Ty>),
+    /// The default type of a set display/comprehension.
+    Set(Box<Ty>),
+    /// The default type of a dictionary display/comprehension.
+    Dict(Box<Ty>, Box<Ty>),
     /// The built-in `Tuple[T1, ..., Tn]`.
     Tuple(Vec<Ty>),
-    /// The built-in `UnsafePointer[T]`.
-    Pointer(Box<Ty>),
+    /// The built-in tagged union `Variant[T1, ..., Tn]`.  The ordering is part
+    /// of the type: it determines the runtime tag used by typed projection.
+    Variant(Vec<Ty>),
+    /// The built-in `UnsafePointer[T, origin]`.  The VM erases the origin, but
+    /// the checked and MIR types retain it for lifetime/aggregate validation.
+    Pointer {
+        element: Box<Ty>,
+        origin: crate::origin::PointerOrigin,
+    },
     /// A reference value. Origins and permissions are checked statically; its
     /// runtime representation is introduced only after loan checking exists.
     Ref(crate::origin::RefTy),
@@ -107,15 +143,54 @@ pub enum Ty {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParamDecl {
     /// A type parameter `T: Trait & ...`.
-    Type { name: String, bounds: Vec<String> },
-    /// A value parameter `n: Int`.
-    Value { name: String },
+    Type {
+        name: String,
+        bounds: Vec<String>,
+        default: Option<Box<Ty>>,
+        infer_only: bool,
+        variadic: bool,
+        constraints: Vec<GenericConstraint>,
+    },
+    /// A value parameter such as `n: Int` or `label: String`.  Retaining the
+    /// declared type is essential: compile-time values participate in generic
+    /// identity, but only values representable by this type may bind here.
+    Value {
+        name: String,
+        ty: Box<Ty>,
+        default: Option<CtExpr>,
+        infer_only: bool,
+        variadic: bool,
+        constraints: Vec<GenericConstraint>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConstraintOperand {
+    Param(String),
+    Value(CtValue),
+    Type(Ty),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenericConstraint {
+    Conforms { param: String, trait_name: String },
+    ConformsPack { param: String, trait_name: String },
+    Eq(ConstraintOperand, ConstraintOperand),
+    Ne(ConstraintOperand, ConstraintOperand),
+    Lt(ConstraintOperand, ConstraintOperand),
+    Le(ConstraintOperand, ConstraintOperand),
+    Gt(ConstraintOperand, ConstraintOperand),
+    Ge(ConstraintOperand, ConstraintOperand),
+    And(Box<GenericConstraint>, Box<GenericConstraint>),
+    Or(Box<GenericConstraint>, Box<GenericConstraint>),
+    Not(Box<GenericConstraint>),
+    Bool(bool),
 }
 
 impl ParamDecl {
     pub fn name(&self) -> &str {
         match self {
-            ParamDecl::Type { name, .. } | ParamDecl::Value { name } => name,
+            ParamDecl::Type { name, .. } | ParamDecl::Value { name, .. } => name,
         }
     }
 }
@@ -191,9 +266,36 @@ impl fmt::Display for Ty {
             },
             Ty::Simd { dtype, width } => write!(f, "SIMD[DType.{}, {}]", dtype.name(), width),
             Ty::Error => write!(f, "Error"),
-            Ty::Pointer(elem) => write!(f, "UnsafePointer[{}]", elem),
+            Ty::Pointer { element, origin } => {
+                write!(f, "UnsafePointer[{element}")?;
+                match origin {
+                    crate::origin::PointerOrigin::Legacy => {}
+                    crate::origin::PointerOrigin::Place { place, .. } => {
+                        write!(f, ", origin@{}", place.root.0)?
+                    }
+                    crate::origin::PointerOrigin::Param { id, .. } => {
+                        write!(f, ", origin#{}", id.0)?
+                    }
+                    crate::origin::PointerOrigin::Static => write!(f, ", StaticConstantOrigin")?,
+                    crate::origin::PointerOrigin::Untracked { mutable: true } => {
+                        write!(f, ", MutUntrackedOrigin")?
+                    }
+                    crate::origin::PointerOrigin::Untracked { mutable: false } => {
+                        write!(f, ", ImmutUntrackedOrigin")?
+                    }
+                    crate::origin::PointerOrigin::UnsafeAny { mutable: true } => {
+                        write!(f, ", MutUnsafeAnyOrigin")?
+                    }
+                    crate::origin::PointerOrigin::UnsafeAny { mutable: false } => {
+                        write!(f, ", ImmutUnsafeAnyOrigin")?
+                    }
+                }
+                write!(f, "]")
+            }
             Ty::Ref(reference) => write!(f, "ref {}", reference.referent),
             Ty::List(elem) => write!(f, "List[{}]", elem),
+            Ty::Set(elem) => write!(f, "Set[{}]", elem),
+            Ty::Dict(key, value) => write!(f, "Dict[{}, {}]", key, value),
             Ty::Tuple(elems) => {
                 write!(f, "Tuple[")?;
                 for (i, t) in elems.iter().enumerate() {
@@ -201,6 +303,16 @@ impl fmt::Display for Ty {
                         write!(f, ", ")?;
                     }
                     write!(f, "{}", t)?;
+                }
+                write!(f, "]")
+            }
+            Ty::Variant(alternatives) => {
+                write!(f, "Variant[")?;
+                for (i, ty) in alternatives.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", ty)?;
                 }
                 write!(f, "]")
             }

@@ -100,7 +100,9 @@ expressions.
 |---|---|---|
 | `field.get` | `GetField` | Read a named field from a register value |
 | `index.get` | `Index` | Read an indexed element |
-| `slice.get` | `Slice` | Produce a list or string slice |
+| `slice.get` | `Slice` | Slice a builtin or call a checked user `__getitem__` |
+| `index.multi` | `MultiIndex` | Call `__getitem__` with mixed index/slice arguments |
+| `index.multi_set` | `MultiSet` | Call `__setitem__` and write back its mutable receiver |
 | `place.load` | `LoadPlace` | Read a place without reevaluating it |
 | `place.store` | `Store` | Write a value through a place |
 | `place.move` | `MovePlace` | Move a value out of a place |
@@ -110,6 +112,9 @@ expressions.
 | Mnemonic | MIR operation | Purpose |
 |---|---|---|
 | `list.make` | `MakeList` | Construct a list |
+| `set.make` | `MakeSet` | Construct a set, retaining first insertion order |
+| `dict.make` | `MakeDict` | Construct a dictionary, replacing duplicate keys |
+| `collection.insert` | `CollectionInsert` | Insert one comprehension result into its collection |
 | `tuple.make` | `MakeTuple` | Construct a tuple |
 | `simd.make` | `MakeSimd` | Construct or splat a SIMD value |
 
@@ -302,6 +307,7 @@ The encoded operation carries more information than the compact spelling shows:
 - an optional caller place corresponding to each positional argument
 - optional compile-time value-parameter registers
 - the checker-resolved lowered symbol for overloaded calls
+- an optional checker-selected concrete error type for a raising call
 
 Caller places allow `mut` and `ref` parameters to write their final values back
 after the call. Type parameters are erased at runtime; value parameters can be
@@ -309,7 +315,10 @@ reified as function locals or struct metadata.
 
 Calls may dispatch to builtins, user functions, fieldwise constructors,
 hand-written `__init__`, or copy constructors. Argument binding handles required,
-default, positional-only, keyword-only, and variadic parameters where supported.
+default, positional-only, keyword-only, and variadic parameters. Homogeneous
+keyword collectors use the same ABI for free, generic, instance, static, and
+bounded-trait calls; a `**kwargs^` entry expands an owned `StringDict` before
+structural binding.
 
 ### `call.indirect` — Callable Value
 
@@ -319,7 +328,8 @@ call.indirect %dest, %callee(%r0, %r1)
 
 Invokes the non-capturing function value in `%callee`. The value carries a
 resolved MIR function symbol; arguments use the target's normal signature and
-execution pushes the same explicit frame as a direct user-function call.
+execution pushes the same explicit frame as a direct user-function call. The
+instruction also retains the callable type's selected error contract.
 
 ### `call.method` — Method Call
 
@@ -337,6 +347,7 @@ The instruction carries:
 - ordinary argument registers
 - an optional writable receiver place
 - optional writable places for ordinary arguments
+- an optional concrete error type selected from the method or trait requirement
 
 For a `mut self` method, the final receiver is written back through the receiver
 place. `mut` and `ref` ordinary parameters are likewise written back through
@@ -382,7 +393,23 @@ slice.get %r4, %r0, [%r1:%r2:_]
 slice.get %r5, %r0, [_:_:%r3]
 ```
 
-A zero step or an invalid bound produces a runtime error.
+A source slice is represented by its checker-selected `ContiguousSlice` or
+`StridedSlice` descriptor. User receivers receive that first-class descriptor
+through their selected `__getitem__`; builtin List/String values use normalized
+bounds directly. A zero step or invalid bound produces a runtime error.
+
+### `index.multi` / `index.multi_set` — Mixed Subscripts
+
+```text
+index.multi %dest, %object, [%row, stride(%lo:%hi:%step)]
+index.multi_set [$grid], [%row, stride(%lo:%hi:%step)], %value
+```
+
+These operations retain checker-selected overload identity and descriptor kind.
+`index.multi_set` also retains the receiver place, so a `mut self`
+`__setitem__` writes the updated aggregate back. Fixed methods receive the
+assignment value last; variadic `*indices, *, value` methods receive it in the
+keyword-only `value` slot.
 
 ### `place.load` — Read Place
 
@@ -433,6 +460,31 @@ list.make %dest, [%r0, %r1, %r2]
 Constructs a list from the supplied values. Numeric literal elements are
 promoted to a common runtime kind where required.
 
+### `set.make` / `dict.make` — Construct Keyed Collections
+
+```text
+set.make  %dest, [%r0, %r1, %r2]
+dict.make %dest, [(%k0, %v0), (%k1, %v1)]
+```
+
+Both instructions consume already-evaluated operands in source order. A set
+keeps the first equal element. A dictionary evaluates each key before its value;
+a later equal key replaces the earlier value without moving the key's insertion
+position.
+
+### `collection.insert` — Comprehension Insertion
+
+```text
+collection.insert $list, _, %value
+collection.insert $set,  _, %value
+collection.insert $dict, %key, %value
+```
+
+Inserts the leaf result of a lowered comprehension into its compiler-generated
+collection variable. Its surrounding MIR blocks encode generator nesting and
+filters, so the instruction itself performs only the family-specific append,
+add, or keyed replacement.
+
 ### `tuple.make` — Construct Tuple
 
 ```text
@@ -454,8 +506,11 @@ width. Scalar aliases can also lower through this operation with width one.
 
 ## Iteration Instructions
 
-The iterator instructions mutate a variable slot because range, list, and user
-iterators carry iteration state.
+The iterator instructions mutate a variable slot because ranges, lists, sets,
+dictionaries, and user iterators carry iteration state. For consuming
+`for var item in collection^`, the source has already moved into this slot;
+removing the next element transfers it to the loop binding and leaves the slot
+owning only the residual collection.
 
 ### `iter.init` — Normalize Iterator
 
@@ -476,7 +531,7 @@ iter.has_next %dest, $iterator
 Writes a boolean indicating whether `$iterator` can produce another element.
 
 - ranges compare the current value with the stop value using the step direction
-- lists test whether they are nonempty
+- lists, sets, and dictionaries test whether they are nonempty
 - user iterators call `__len__()` and test whether the returned `Int` is positive
 
 ### `iter.next` — Advance Iterator
@@ -488,7 +543,8 @@ iter.next %dest, $iterator
 Writes the current element to `%dest` and advances `$iterator` in place.
 
 - ranges return the current counter and add the step
-- lists remove and return the first element
+- lists and sets remove and return the first element
+- dictionaries remove an entry, return its key, and destroy its value
 - user iterators call `__next__(mut self)` and write the final receiver back into
   the iterator slot
 
@@ -554,8 +610,10 @@ drop.var $variable
 
 Removes the value from `$variable`, leaving `None`, and destroys the removed
 value. For a struct this can invoke `__del__`; fields are then dropped in reverse
-declaration order. Lists, tuples, and nested structs are destroyed recursively.
-Moved fields are skipped, preventing double destruction after a partial move.
+declaration order. Lists, sets, dictionaries, tuples, and nested structs are
+destroyed recursively. Moved fields are skipped, preventing double destruction
+after a partial move. This is also how an early exit destroys the residual state
+of an owned iterator when its elements are implicitly deletable.
 
 Drop elaboration inserts this instruction at the variable's last use or on an
 appropriate control-flow edge. Values without observable destruction make it a
@@ -715,7 +773,8 @@ call            call.indirect   call.method
 field.get       index.get       slice.get
 place.load      place.store     place.move
 
-list.make       tuple.make      simd.make
+list.make       set.make        dict.make       collection.insert
+tuple.make      simd.make
 
 iter.init       iter.has_next   iter.next
 

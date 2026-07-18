@@ -69,6 +69,9 @@ pub(crate) fn match_call_slots(
         *slot = Some(ArgSlot::Positional(index));
     }
     for (keyword_index, keyword) in kw_names.iter().enumerate() {
+        if kw_names[..keyword_index].contains(keyword) {
+            return Err(MatchError::Duplicate((*keyword).to_string()));
+        }
         let Some(parameter_index) = param_names.iter().position(|name| name == keyword) else {
             if variadics.keyword {
                 keyword_overflow.push(keyword_index);
@@ -174,5 +177,24 @@ mod tests {
         .err()
         .unwrap();
         assert_eq!(error, MatchError::PositionalOnly("a".to_string()));
+    }
+
+    #[test]
+    fn rejects_duplicate_keyword_collector_entries() {
+        let error = match_call_slots(
+            &[],
+            &[],
+            None,
+            None,
+            0,
+            &["extra", "extra"],
+            CallVariadics {
+                positional: false,
+                keyword: true,
+            },
+        )
+        .err()
+        .expect("collector keys must remain unique");
+        assert_eq!(error, MatchError::Duplicate("extra".to_string()));
     }
 }

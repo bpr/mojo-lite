@@ -1,0 +1,20 @@
+from std.utils import Variant
+
+def main():
+    var numeric = Variant[Int, UInt](1)
+    print(numeric.isa[Int](), numeric.isa[UInt]())
+    var value: Variant[Int, String] = Variant[Int, String](7)
+    print(value.isa[Int]())
+    print(value[Int])
+    value.set[String]("mojo")
+    print(value.isa[String]())
+    print(value[String])
+    print(value.is_type_supported[Int](), value.is_type_supported[Float64]())
+    var old = value.replace[Int, String](42)
+    print(old, value[Int])
+    var taken = value.take[Int]()
+    print(taken)
+    var unchecked = Variant[Int, String](9)
+    var unsafe_old = unchecked.unsafe_replace[String, Int]("nine")
+    var unsafe_taken = unchecked.unsafe_take[String]()
+    print(unsafe_old, unsafe_taken)

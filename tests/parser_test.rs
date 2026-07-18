@@ -1,7 +1,8 @@
 use mojito::ast::{
-    ArgConvention, Decorator, Expr, ExprKind, FnParam, ImportName, ImportNames, InfixOp, KwArg,
-    Method, Param, ParamArg, ParamKind, PrefixOp, Stmt, StmtKind, StructComptime, TStringPart,
-    TraitComptime, TraitMethod, Type, TypeParam, WithItem,
+    ArgConvention, Capture, CaptureKind, CollectionKind, ComprehensionClause, Decorator, Expr,
+    ExprKind, FnParam, ImportName, ImportNames, InfixOp, KwArg, Method, Param, ParamArg, ParamKind,
+    PrefixOp, Stmt, StmtKind, StructComptime, TStringPart, TraitComptime, TraitMethod, Type,
+    TypeParam, WithItem,
 };
 use mojito::{Lexer, Parser, parse_diagnostics};
 
@@ -166,12 +167,16 @@ fn parses_struct_with_field_and_method() {
             decorators: vec![fieldwise_deco()],
             type_params: vec![],
             conforms: vec![],
+            callable_conformance: None,
+            conformance_conditions: vec![],
             fields: vec![Param {
                 name: "x".into(),
                 ty: Type::Int
             }],
             associated: vec![],
             methods: vec![Method {
+                where_clause: None,
+                type_params: vec![],
                 name: "get".into(),
                 has_self: true,
                 self_convention: None,
@@ -331,12 +336,14 @@ fn parses_def_signature_and_body() {
     assert_eq!(
         stmts[0],
         Stmt::from(StmtKind::Def {
+            where_clause: None,
             name: "add".into(),
             decorators: vec![],
             type_params: vec![],
             params: vec![fnparam("a", Type::Int), fnparam("b", Type::Int)],
             positional_only: None,
             keyword_only: None,
+            captures: None,
             raises: false,
             raises_type: None,
             ret: Some(Type::Int),
@@ -391,6 +398,7 @@ fn parses_while() {
         Stmt::from(StmtKind::While {
             cond: Expr::from(ExprKind::Identifier("a".into())),
             body: vec![Stmt::from(StmtKind::Pass)],
+            orelse: None,
         })
     );
 }
@@ -402,6 +410,8 @@ fn parses_for_over_range() {
         stmts[0],
         Stmt::from(StmtKind::For {
             var: "i".into(),
+            reference: false,
+            owned: false,
             iter: Expr::from(ExprKind::Call {
                 name: "range".into(),
                 param_args: vec![],
@@ -409,8 +419,49 @@ fn parses_for_over_range() {
                 kwargs: vec![],
             }),
             body: vec![Stmt::from(StmtKind::Pass)],
+            orelse: None,
         })
     );
+}
+
+#[test]
+fn parses_owned_iteration_and_collection_comprehensions() {
+    let loop_statement = parse("for var item in values^:\n    pass\n");
+    assert!(matches!(
+        &loop_statement[0].kind,
+        StmtKind::For {
+            var,
+            owned: true,
+            reference: false,
+            iter: Expr {
+                kind: ExprKind::Transfer(_),
+                ..
+            },
+            ..
+        } if var == "item"
+    ));
+
+    let statement = parse(
+        "var result = {x: x * y for x in range(3) for y in range(2) if y == 1}\n",
+    );
+    let StmtKind::VarDecl { value, .. } = &statement[0].kind else {
+        panic!("expected variable declaration");
+    };
+    let ExprKind::Comprehension {
+        kind,
+        key,
+        clauses,
+        ..
+    } = &value.kind
+    else {
+        panic!("expected dictionary comprehension");
+    };
+    assert_eq!(*kind, CollectionKind::Dict);
+    assert!(key.is_some());
+    assert_eq!(clauses.len(), 3);
+    assert!(matches!(clauses[0], ComprehensionClause::For { .. }));
+    assert!(matches!(clauses[1], ComprehensionClause::For { .. }));
+    assert!(matches!(clauses[2], ComprehensionClause::If(_)));
 }
 
 #[test]
@@ -438,6 +489,7 @@ fn parses_break_and_continue() {
         Stmt::from(StmtKind::While {
             cond: Expr::from(ExprKind::Identifier("a".into())),
             body: vec![Stmt::from(StmtKind::Break), Stmt::from(StmtKind::Continue)],
+            orelse: None,
         })
     );
 }
@@ -455,12 +507,17 @@ fn parses_generic_struct_header_and_self_param_field() {
             name: "Pair".into(),
             decorators: vec![fieldwise_deco()],
             type_params: vec![TypeParam {
+                constraints: vec![],
+                value_type: None,
                 name: "T".into(),
                 bounds: vec!["Copyable".into(), "Movable".into()],
                 origin_mutability: None,
                 infer_only: false,
+                default: None,
             }],
             conforms: vec![],
+            callable_conformance: None,
+            conformance_conditions: vec![],
             fields: vec![
                 Param {
                     name: "left".into(),
@@ -484,17 +541,22 @@ fn parses_generic_def_with_type_param_signature() {
     assert_eq!(
         stmts[0],
         Stmt::from(StmtKind::Def {
+            where_clause: None,
             name: "id".into(),
             decorators: vec![],
             type_params: vec![TypeParam {
+                constraints: vec![],
+                value_type: None,
                 name: "T".into(),
                 bounds: vec!["AnyType".into()],
                 origin_mutability: None,
                 infer_only: false,
+                default: None,
             }],
             params: vec![fnparam("x", Type::Named("T".into(), vec![]))],
             positional_only: None,
             keyword_only: None,
+            captures: None,
             raises: false,
             raises_type: None,
             ret: Some(Type::Named("T".into(), vec![])),
@@ -541,22 +603,30 @@ fn parses_trait_with_method_requirements() {
             refines: vec![],
             methods: vec![
                 TraitMethod {
+                    where_clause: None,
+                    type_params: vec![],
                     name: "quack".into(),
                     self_convention: None,
                     self_origin: None,
                     params: vec![],
                     positional_only: None,
                     keyword_only: None,
+                    raises: false,
+                    raises_type: None,
                     ret: Some(Type::String),
                     default_body: None,
                 },
                 TraitMethod {
+                    where_clause: None,
+                    type_params: vec![],
                     name: "volume".into(),
                     self_convention: None,
                     self_origin: None,
                     params: vec![fnparam("loud", Type::Bool)],
                     positional_only: None,
                     keyword_only: None,
+                    raises: false,
+                    raises_type: None,
                     ret: Some(Type::Int),
                     default_body: None,
                 },
@@ -577,6 +647,21 @@ fn parses_single_line_trait_method_requirement() {
         }
         other => panic!("expected a trait, got {:?}", other),
     }
+}
+
+#[test]
+fn parses_raises_effect_on_trait_requirements() {
+    let stmts = parse(
+        "trait Fallible:\n    def run(self) raises ValidationError -> Int: ...\n",
+    );
+    let StmtKind::Trait { methods, .. } = &stmts[0].kind else {
+        panic!("expected a trait");
+    };
+    assert!(methods[0].raises);
+    assert_eq!(
+        methods[0].raises_type,
+        Some(Type::Named("ValidationError".into(), Vec::new()))
+    );
 }
 
 #[test]
@@ -643,6 +728,23 @@ fn parses_struct_conformance_list() {
         }
         other => panic!("expected a struct, got {:?}", other),
     }
+}
+
+#[test]
+fn retains_conditional_struct_conformance_predicates() {
+    let statements =
+        parse("struct Wrapper[T: AnyType](Writable where conforms_to(T, Writable)):\n    pass\n");
+    let StmtKind::Struct {
+        conforms,
+        conformance_conditions,
+        ..
+    } = &statements[0].kind
+    else {
+        panic!("expected struct");
+    };
+    assert_eq!(conforms, &["Writable"]);
+    assert_eq!(conformance_conditions.len(), 1);
+    assert_eq!(conformance_conditions[0].0, "Writable");
 }
 
 #[test]
@@ -823,15 +925,49 @@ fn parses_value_parameter_header() {
             assert_eq!(
                 type_params,
                 &vec![TypeParam {
+                    constraints: vec![],
+                    value_type: None,
                     name: "size".into(),
                     bounds: vec!["Int".into()],
                     origin_mutability: None,
                     infer_only: false,
+                    default: None,
                 }]
             );
         }
         other => panic!("expected a struct, got {:?}", other),
     }
+}
+
+#[test]
+fn retains_named_parameter_arguments_and_generic_method_parameters() {
+    let statements = parse(
+        "struct Factory:\n    def make[T: AnyType](self, value: T) -> T:\n        return value\n\ndef main():\n    var x = Factory.make[kind=Int](1)\n",
+    );
+    let StmtKind::Struct { methods, .. } = &statements[0].kind else {
+        panic!("expected struct");
+    };
+    assert_eq!(methods[0].type_params.len(), 1);
+}
+
+#[test]
+fn retains_trailing_where_constraints() {
+    let statements = parse("def f[n: Int]() -> Int where n > 0 and n < 10:\n    return n\n");
+    let StmtKind::Def {
+        type_params,
+        where_clause,
+        ..
+    } = &statements[0].kind
+    else {
+        panic!("expected def");
+    };
+    assert!(type_params[0].constraints.is_empty());
+    assert!(where_clause.is_some());
+}
+
+#[test]
+fn rejects_removed_parameter_list_where_constraints() {
+    assert!(mojito::parse("def f[n: Int where n > 0]():\n    pass\n").is_err());
 }
 
 #[test]
@@ -1082,6 +1218,41 @@ fn parses_raises_effect_on_def() {
 }
 
 #[test]
+fn parses_current_unified_closure_capture_lists() {
+    let program = parse(
+        "def outer():\n    var a = 1\n    var b = 2\n    var c = 3\n    def inner() unified {mut a, b, c^, imm}:\n        pass\n",
+    );
+    let StmtKind::Def { body, .. } = &program[0].kind else {
+        panic!("expected outer def");
+    };
+    let StmtKind::Def {
+        captures: Some(captures),
+        ..
+    } = &body[3].kind
+    else {
+        panic!("expected unified nested def");
+    };
+    assert!(captures.default_read);
+    assert_eq!(
+        captures.entries,
+        vec![
+            Capture {
+                name: "a".into(),
+                kind: CaptureKind::Mut,
+            },
+            Capture {
+                name: "b".into(),
+                kind: CaptureKind::Read,
+            },
+            Capture {
+                name: "c".into(),
+                kind: CaptureKind::Move,
+            },
+        ]
+    );
+}
+
+#[test]
 fn parses_transfer_sigil() {
     assert_eq!(parse_expr("x^"), Expr::from(ExprKind::Transfer(ident("x"))));
     // `raise e^` — transfer inside a raise.
@@ -1270,7 +1441,7 @@ fn rejects_non_place_assignment_target() {
     assert!(parser.parse_program().is_err());
 }
 
-// --- Tuple unpacking (bare form `a, b = t`; `var a, b = …` is not valid Mojo) ---
+// --- Tuple unpacking and declaration destructuring ---
 
 #[test]
 fn parses_tuple_unpacking() {
@@ -1284,6 +1455,16 @@ fn parses_tuple_unpacking() {
             value: Expr::from(ExprKind::Identifier("point".into())),
         })
     );
+}
+
+#[test]
+fn parses_var_tuple_destructuring() {
+    assert!(matches!(
+        &parse("var left, right = pair\n")[0].kind,
+        StmtKind::Unpack { targets, value }
+            if targets.len() == 2
+                && matches!(&value.kind, ExprKind::Identifier(name) if name == "pair")
+    ));
 }
 
 #[test]
@@ -1437,6 +1618,32 @@ fn parses_tuple_literals_and_grouping() {
     );
 }
 
+#[test]
+fn parses_bare_comma_tuple_displays() {
+    assert_eq!(
+        parse_expr("1, \"one\"\n"),
+        Expr::from(ExprKind::TupleLit(vec![
+            Expr::from(ExprKind::Int(1)),
+            Expr::from(ExprKind::Str("one".into())),
+        ]))
+    );
+    assert!(matches!(
+        &parse("var pair = 2, 3\n")[0].kind,
+        StmtKind::VarDecl {
+            value: Expr {
+                kind: ExprKind::TupleLit(elements),
+                ..
+            },
+            ..
+        } if elements.len() == 2
+    ));
+    assert!(matches!(
+        &parse("def pair() -> Tuple[Int, Int]:\n    return 4, 5\n")[0].kind,
+        StmtKind::Def { body, .. }
+            if matches!(&body[0].kind, StmtKind::Return(Some(Expr { kind: ExprKind::TupleLit(elements), .. })) if elements.len() == 2)
+    ));
+}
+
 // --- Function-argument forms (parsed; semantics deferred) ---
 
 /// Extract a `def`'s params + marker positions from a one-def program.
@@ -1471,6 +1678,26 @@ fn parses_variadic_and_kw_variadic() {
 }
 
 #[test]
+fn parses_generic_method_keyword_collectors_and_forwarding() {
+    let parsed = parse(
+        "struct Relay:\n    def target[T: Copyable & Movable](self, **options: T):\n        pass\n    def forward(self, **options: Int):\n        self.target(**options^)\n",
+    );
+    let StmtKind::Struct { methods, .. } = &parsed[0].kind else {
+        panic!("expected struct declaration")
+    };
+    assert_eq!(methods[0].type_params[0].name, "T");
+    assert_eq!(methods[0].params[0].kind, ParamKind::KwVariadic);
+    assert_eq!(methods[1].params[0].kind, ParamKind::KwVariadic);
+    assert!(matches!(
+        &methods[1].body[0].kind,
+        StmtKind::Expr(Expr {
+            kind: ExprKind::MethodCall { kwargs, .. },
+            ..
+        }) if kwargs.len() == 1 && kwargs[0].is_forwarded()
+    ));
+}
+
+#[test]
 fn retains_variadic_type_pack_declarations_and_uses() {
     let parsed =
         parse("def count[*ArgTypes: AnyType](*args: *ArgTypes) -> Int:\n    return len(args)\n");
@@ -1501,7 +1728,7 @@ fn parses_positional_only_and_keyword_only_markers() {
 #[test]
 fn parses_argument_conventions() {
     let (p, _, _) =
-        def_params("def f(mut x: Int, var y: String, out z: Bool, read w: Int):\n    pass\n");
+        def_params("def f(mut x: Int, var y: String, out z: Bool, imm w: Int):\n    pass\n");
     assert_eq!(p[0].convention, Some(ArgConvention::Mut));
     assert_eq!(p[1].convention, Some(ArgConvention::Var));
     assert_eq!(p[2].convention, Some(ArgConvention::Out));
@@ -1663,6 +1890,31 @@ fn rejects_positional_after_keyword_argument() {
     assert!(parser.parse_program().is_err());
 }
 
+#[test]
+fn parses_transferred_keyword_dictionary_forwarding() {
+    assert_eq!(
+        parse_expr("f(prefix=1, **kwargs^)"),
+        Expr::from(ExprKind::Call {
+            name: "f".into(),
+            param_args: vec![],
+            args: vec![],
+            kwargs: vec![
+                KwArg {
+                    name: "prefix".into(),
+                    value: Expr::from(ExprKind::Int(1)),
+                },
+                KwArg {
+                    name: mojito::ast::FORWARDED_KWARGS_NAME.into(),
+                    value: Expr::from(ExprKind::Transfer(ident("kwargs"))),
+                },
+            ],
+        })
+    );
+
+    let mut parser = Parser::new(Lexer::new("f(**kwargs)\n"));
+    assert!(parser.parse_program().is_err());
+}
+
 // --- Expressions: ternary, chained comparison, slices (parsed; semantics deferred) ---
 
 #[test]
@@ -1731,6 +1983,7 @@ fn parses_slice_subscripts() {
             lower: Some(int(1)),
             upper: Some(int(2)),
             step: None,
+            explicit_step: false,
         })
     );
     assert_eq!(
@@ -1739,7 +1992,8 @@ fn parses_slice_subscripts() {
             object: ident("xs"),
             lower: None,
             upper: None,
-            step: Some(int(2))
+            step: Some(int(2)),
+            explicit_step: true,
         })
     );
     assert_eq!(
@@ -1749,6 +2003,23 @@ fn parses_slice_subscripts() {
             lower: Some(bx(ExprKind::Identifier("i".into()))),
             upper: None,
             step: None,
+            explicit_step: false,
+        })
+    );
+
+    assert_eq!(
+        parse_expr("grid[row, 1:5:2]"),
+        Expr::from(ExprKind::MultiIndex {
+            object: ident("grid"),
+            args: vec![
+                mojito::ast::SubscriptArg::Index(Expr::from(ExprKind::Identifier("row".into(),))),
+                mojito::ast::SubscriptArg::Slice {
+                    lower: Some(Box::new(Expr::from(ExprKind::Int(1)))),
+                    upper: Some(Box::new(Expr::from(ExprKind::Int(5)))),
+                    step: Some(Box::new(Expr::from(ExprKind::Int(2)))),
+                    explicit_step: true,
+                },
+            ],
         })
     );
 }
@@ -1985,6 +2256,44 @@ fn parses_tstring_interpolations_into_subexprs() {
                 TStringPart::Expr(ident("x"))
             ],
             raw: true,
+        })
+    );
+}
+
+#[test]
+fn concatenates_the_full_adjacent_string_family() {
+    assert_eq!(
+        parse_expr("'a' \"\"\"b\"\"\" r'c'"),
+        Expr::from(ExprKind::Str("abc".into()))
+    );
+    assert_eq!(
+        parse_expr("t\"answer: \" t\"{value}\" t\"!\""),
+        Expr::from(ExprKind::TString {
+            parts: vec![
+                TStringPart::Literal("answer: ".into()),
+                TStringPart::Expr(ident("value")),
+                TStringPart::Literal("!".into()),
+            ],
+            raw: false,
+        })
+    );
+    assert_eq!(
+        parse_expr("(\"a\"\n \"b\")"),
+        Expr::from(ExprKind::Str("ab".into()))
+    );
+
+    let statements = parse("var text = t\"a\"\n    t\"{value}\"\n");
+    let StmtKind::VarDecl { value, .. } = &statements[0].kind else {
+        panic!("expected a variable declaration");
+    };
+    assert_eq!(
+        value,
+        &Expr::from(ExprKind::TString {
+            parts: vec![
+                TStringPart::Literal("a".into()),
+                TStringPart::Expr(ident("value")),
+            ],
+            raw: false,
         })
     );
 }
