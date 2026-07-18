@@ -158,6 +158,7 @@ impl MirPlace {
 /// A single three-address instruction. Each value-producing instruction writes a
 /// fresh `dest` register; control flow lives in the block's [`MirTerm`].
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum MirInstr {
     /// Establish a persistent local loan. The reference has no runtime value in
     /// this lowering; subsequent accesses carry `MirPlace::through` metadata.

@@ -1540,6 +1540,16 @@ fn rejects_empty_inferred_list() {
 }
 
 #[test]
+fn rejects_uncontextualized_empty_list_literal() {
+    let e = err("var xs = []\n");
+    assert!(
+        matches!(e, TypeError::CannotInferTypeParam { .. }),
+        "got {:?}",
+        e
+    );
+}
+
+#[test]
 fn rejects_non_int_list_index() {
     let e = err("var xs: List[Int] = [1, 2]\nvar y: Int = xs[True]\n");
     assert!(matches!(e, TypeError::TypeMismatch { .. }), "got {:?}", e);

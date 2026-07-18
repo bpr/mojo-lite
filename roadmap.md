@@ -129,28 +129,28 @@ default next task.
 
 ### 1. Close Remaining Nightly CPU Language Gaps
 
-- [ ] **Current reflected-field handles** — replace the legacy
+- [x] **Current reflected-field handles** — replace the legacy
   `Reflected.field_type[name]()` query with chainable `.field[name]` and
   `.field_at[index]` handles whose `.T` exposes the selected type. Migrate bundled
   code and turn the legacy spelling into a rejection case.
-- [ ] **Keyword collectors across call kinds** — support generic and method
+- [x] **Keyword collectors across call kinds** — support generic and method
   `**kwargs: T` collectors plus consuming `**kwargs^` forwarding through the
   same binder, specialization, duplicate detection, and origin/effect checks as
   ordinary free functions.
-- [ ] **Literal-default overload selection** — apply Mojo's contextual default
+- [x] **Literal-default overload selection** — apply Mojo's contextual default
   type for otherwise-unconstrained integer and floating literals before declaring
   an overload set ambiguous, while preserving ambiguity for genuinely equivalent
   conversions.
-- [ ] **Function-scoped implicit-binding flow** — make an implicit binding
+- [x] **Function-scoped implicit-binding flow** — make an implicit binding
   introduced in a nested block visible throughout its function while retaining
   path-sensitive definite-initialization errors on paths that do not assign it.
-- [ ] **Trait-requirement effects** — carry `raises` and typed error facts through
+- [x] **Trait-requirement effects** — carry `raises` and typed error facts through
   trait requirements, conforming methods, bounded dispatch, and selected calls so
   MIR effect verification receives the same contract as direct calls.
-- [ ] **Owned iteration** — implement `for var item in collection^` as consuming
+- [x] **Owned iteration** — implement `for var item in collection^` as consuming
   iteration over non-Copyable elements, including residual collection state,
   early exits, and conditional implicit-deletion/explicit-destroy obligations.
-- [ ] **Collection displays and comprehensions** — add set and dictionary
+- [x] **Collection displays and comprehensions** — add set and dictionary
   displays plus CPU collection comprehensions with checked evaluation order,
   inference, ownership, and protocol-based construction.
 

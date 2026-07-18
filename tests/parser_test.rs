@@ -1352,9 +1352,8 @@ fn parses_list_literal() {
 }
 
 #[test]
-fn rejects_empty_list_literal() {
-    let mut parser = Parser::new(Lexer::new("var xs: List[Int] = []\n"));
-    assert!(parser.parse_program().is_err());
+fn parses_empty_list_literal() {
+    assert_eq!(parse_expr("[]"), Expr::from(ExprKind::ListLit(vec![])));
 }
 
 // --- Membership: in / not in ---

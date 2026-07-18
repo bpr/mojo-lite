@@ -6648,6 +6648,12 @@ impl Checker {
             ExprKind::Index { object, index } => self.infer_index(object, index),
             // Transfer is identity for typing (ownership move is not modeled).
             ExprKind::Transfer(inner) => self.infer(inner),
+            // An empty list literal needs a contextual element type; the
+            // context-aware paths never reach this uncontextualized inference.
+            ExprKind::ListLit(elems) if elems.is_empty() => Err(TypeError::CannotInferTypeParam {
+                name: "List".to_string(),
+                param: "T".to_string(),
+            }),
             ExprKind::ListLit(elems) => Ok(Ty::List(Box::new(self.infer_list_elem(elems)?))),
             // A tuple literal keeps each element's own type (heterogeneous).
             ExprKind::TupleLit(elems) => {
@@ -8759,6 +8765,7 @@ impl Checker {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn instantiate_method_generics(
         &self,
         name: &str,
