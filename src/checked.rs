@@ -201,6 +201,7 @@ pub struct CheckedProgram {
     expression_index: HashMap<SourceSpan, Vec<CheckedNodeId>>,
     declarations: Vec<CheckedDeclaration>,
     explicit_destroy_types: HashMap<String, ExplicitDestroyInfo>,
+    declaration_effects: HashMap<AnnotationSite, DeclarationEffect>,
 }
 
 #[derive(Debug, Clone)]
@@ -232,6 +233,34 @@ pub(crate) enum AnnotationSite {
         method: usize,
         param: usize,
     },
+    /// The checked return type of a free function declaration.
+    FunctionReturn {
+        module: Option<String>,
+        declaration: Span,
+    },
+    /// The checked callable type of a free function declaration — the exact
+    /// `Func`/`GenericFunc` type the checker binds the name to. Lowering uses
+    /// it to type closure values without reconstructing signatures.
+    FunctionType {
+        module: Option<String>,
+        declaration: Span,
+    },
+    /// The checked return type of a struct method declaration.
+    MethodReturn {
+        module: Option<String>,
+        declaration: Span,
+        method: usize,
+    },
+}
+
+/// Checked declaration-level control facts: the raising contract and whether
+/// the declaration returns a reference. Recorded per callable so lowering
+/// never re-reads source `raises`/return annotations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeclarationEffect {
+    pub raises: bool,
+    pub error: Option<Ty>,
+    pub returns_reference: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -284,6 +313,7 @@ impl CheckedProgram {
         explicit_destroy_types: HashMap<String, ExplicitDestroyInfo>,
         explicit_destroy_calls: HashSet<SourceSpan>,
         reference_value_uses: HashMap<SourceSpan, bool>,
+        declaration_effects: HashMap<AnnotationSite, DeclarationEffect>,
     ) -> Self {
         let (expressions, expression_index) = build_checked_expressions(
             &statements,
@@ -311,6 +341,7 @@ impl CheckedProgram {
             expression_index,
             declarations,
             explicit_destroy_types,
+            declaration_effects,
         }
     }
 
@@ -332,6 +363,15 @@ impl CheckedProgram {
 
     pub(crate) fn checked_type_at(&self, site: &AnnotationSite) -> Option<&Ty> {
         self.checked_types.get(site)
+    }
+
+    /// Checked raising contract and reference-return fact for a callable
+    /// declaration site.
+    pub(crate) fn declaration_effect_at(
+        &self,
+        site: &AnnotationSite,
+    ) -> Option<&DeclarationEffect> {
+        self.declaration_effects.get(site)
     }
 
     pub fn expressions(&self) -> &[CheckedExpr] {

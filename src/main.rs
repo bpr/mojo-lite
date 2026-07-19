@@ -1,6 +1,6 @@
 use mojito::{
-    BackendKind, Compiler, CompilerError, LinkOptions, ModuleError, ParseError, Stmt, check, lex,
-    parse, parse_diagnostics,
+    BackendKind, Compiler, CompilerError, LinkOptions, ModuleError, ParseError, Stmt, lex, parse,
+    parse_diagnostics,
 };
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -321,21 +321,37 @@ fn run_lex(source: &str) -> Result<(), String> {
 }
 
 /// `check`: type-check the linked program; report success or the first error.
+/// Runs the whole static pipeline once — checking, typed-MIR verification, and
+/// ownership all consume the same checked program.
 fn run_check(program: &[Stmt]) -> Result<(), String> {
     mojito::validate_module_scope(program).map_err(|e| e.to_string())?;
-    check(program).map_err(|e| e.to_string())?;
+    let checked = mojito::check_program(program).map_err(|e| e.to_string())?;
+    let mir = mojito::mir::lower_checked_program(&checked);
+    if !mir.invariant_errors.is_empty() {
+        return Err(format!(
+            "invalid checked program: {}",
+            mir.invariant_errors.join("; ")
+        ));
+    }
     // The ownership analysis is part of a full check.
-    mojito::check_ownership(program).map_err(|e| e.to_string())?;
+    mojito::check_ownership_program(&mir).map_err(|e| e.to_string())?;
     println!("ok");
     Ok(())
 }
 
-/// `own` — type-check, then run the ownership (move) analysis. Reports `ok`, or the
-/// first move violation with its source byte range.
+/// `own` — type-check, then run the ownership (move) analysis over verified
+/// MIR. Reports `ok`, or the first move violation with its source byte range.
 fn run_own(program: &[Stmt]) -> Result<(), String> {
     mojito::validate_module_scope(program).map_err(|e| e.to_string())?;
-    check(program).map_err(|e| e.to_string())?;
-    match mojito::check_ownership(program) {
+    let checked = mojito::check_program(program).map_err(|e| e.to_string())?;
+    let mir = mojito::mir::lower_checked_program(&checked);
+    if !mir.invariant_errors.is_empty() {
+        return Err(format!(
+            "invalid checked program: {}",
+            mir.invariant_errors.join("; ")
+        ));
+    }
+    match mojito::check_ownership_program(&mir) {
         Ok(()) => {
             println!("ok");
             Ok(())

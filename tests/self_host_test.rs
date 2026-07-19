@@ -36,7 +36,7 @@ fn run(entry: &Path) -> Result<String, String> {
     let program = link(entry).map_err(|e| e.to_string())?;
     let program = elaborate(program).map_err(|e| format!("comptime error: {e}"))?;
     let checked = mojito::check_program(&program).map_err(|e| format!("type error: {e:?}"))?;
-    let mut backend = BackendKind::Vm.make();
+    let mut backend = BackendKind::make("vm").expect("the register VM is implemented");
     backend
         .run(&checked)
         .map_err(|e| format!("runtime error: {e:?}"))?;

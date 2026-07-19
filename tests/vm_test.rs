@@ -24,7 +24,7 @@ fn run(src: &str) -> Result<String, String> {
     let program = parse(src).map_err(|e| format!("parse error: {e:?}"))?;
     let program = elaborate(program).map_err(|e| format!("comptime error: {e}"))?;
     let checked = mojito::check_program(&program).map_err(|e| format!("type error: {e:?}"))?;
-    let mut backend = BackendKind::Vm.make();
+    let mut backend = BackendKind::make("vm").expect("the register VM is implemented");
     backend
         .run(&checked)
         .map_err(|e| format!("runtime error: {e:?}"))?;
@@ -295,7 +295,7 @@ fn vm_runs_every_ok_fixture() {
             .unwrap_or_else(|e| panic!("comptime failed on ok fixture {}: {e}", path.display()));
         let checked = mojito::check_program(&program)
             .unwrap_or_else(|e| panic!("check failed on ok fixture {}: {e:?}", path.display()));
-        let mut backend = BackendKind::Vm.make();
+        let mut backend = BackendKind::make("vm").expect("the register VM is implemented");
         backend
             .run(&checked)
             .unwrap_or_else(|e| panic!("vm failed on ok fixture {}: {e:?}", path.display()));

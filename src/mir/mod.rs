@@ -19,7 +19,7 @@
 
 use crate::ast::{
     ArgConvention, Dtype, Expr, ExprKind, FnParam, InfixOp, ParamArg, ParamKind, PrefixOp, Stmt,
-    StmtKind, TStringPart, Type as SourceType,
+    StmtKind, TStringPart,
 };
 use crate::call::{effective_keyword_only_index, regular_marker_index};
 use crate::checked::AnnotationSite;
@@ -49,6 +49,9 @@ struct NestedInfo {
     /// Captured enclosing-local names, in a deterministic (sorted) order shared by
     /// the lifted function's parameter list and every rewritten call site.
     captures: Vec<NestedCapture>,
+    /// The checker's exact callable type for the nested `def`, used to type
+    /// synthetic closure-value registers. `None` only on unchecked paths.
+    callable_ty: Option<Ty>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -582,6 +585,15 @@ impl Flatten<'_> {
         Reg(r)
     }
 
+    /// [`Self::fresh`] for a synthetic register with no checked expression
+    /// node: the caller supplies the register's type directly. Loan and
+    /// consumption markers, which never hold a runtime value, use `Ty::None`.
+    fn fresh_typed(&mut self, span: SourceSpan, origin: Option<VarId>, ty: Ty) -> Reg {
+        let r = self.fresh(span, origin);
+        self.f.reg_types.insert(r.0, ty);
+        r
+    }
+
     fn emit(&mut self, i: MirInstr) {
         self.f.blocks[self.cur].instrs.push(i);
     }
@@ -1017,8 +1029,10 @@ impl Flatten<'_> {
 
     fn expr(&mut self, e: &Expr) -> Reg {
         let result = self.expr_with_adjustments(e);
+        // An emit-site type (a conversion result, a closure value) is more
+        // precise than the source expression's pre-adjustment checked type.
         if let Some(ty) = self.checked_ty(e) {
-            self.f.reg_types.insert(result.0, ty);
+            self.f.reg_types.entry(result.0).or_insert(ty);
         }
         result
     }
@@ -1034,7 +1048,16 @@ impl Flatten<'_> {
         }
         if let Some(target) = self.implicit_conversion(e) {
             let argument = self.expr_unconverted(e);
-            let dest = self.fresh(span(e), None);
+            // The conversion result is the constructed type, not the source
+            // expression's checked type; targets are concrete constructors.
+            let dest = match target.split(".__init__").next() {
+                Some(constructed) if !constructed.is_empty() => self.fresh_typed(
+                    span(e),
+                    None,
+                    Ty::Struct(constructed.to_string(), Vec::new()),
+                ),
+                _ => self.fresh(span(e), None),
+            };
             self.emit(MirInstr::Call {
                 dest,
                 func: FuncRef::named(&target),
@@ -1086,7 +1109,10 @@ impl Flatten<'_> {
                             moved: capture.kind == crate::ast::CaptureKind::Move,
                         })
                         .collect();
-                    let dest = self.fresh(span(e), None);
+                    let dest = match info.callable_ty {
+                        Some(ty) => self.fresh_typed(span(e), None, ty),
+                        None => self.fresh(span(e), None),
+                    };
                     self.emit(MirInstr::MakeClosure {
                         dest,
                         function: info.mangled,
@@ -1925,7 +1951,10 @@ impl Flatten<'_> {
                 moved: capture.kind == crate::ast::CaptureKind::Move,
             })
             .collect();
-        let callee = self.fresh(span(e), None);
+        let callee = match &info.callable_ty {
+            Some(ty) => self.fresh_typed(span(e), None, ty.clone()),
+            None => self.fresh(span(e), None),
+        };
         self.emit(MirInstr::MakeClosure {
             dest: callee,
             function: info.mangled.clone(),
@@ -2246,6 +2275,10 @@ impl Flatten<'_> {
             owned_params: Vec::new(),
             ref_params: Vec::new(),
             returns_reference: self.returns_reference,
+            var_tys: HashMap::new(),
+            ret_ty: self.f.ret_ty.clone(),
+            raises: self.f.raises,
+            error_ty: self.f.error_ty.clone(),
             spans: std::mem::take(&mut self.f.spans), // accumulate into the shared table
             reg_types: std::mem::take(&mut self.f.reg_types),
         };
@@ -2315,6 +2348,14 @@ impl Flatten<'_> {
         let handler = match except {
             Some((name, ex_body)) => {
                 let slot = name.as_ref().map(|n| self.var(n));
+                if let Some(slot) = slot {
+                    // The checker rejects a try whose body can raise more than
+                    // one error type, so copying the first propagating raising
+                    // fact types the handler binding without re-inference.
+                    let error =
+                        region_error_type(&body_blocks, &self.f.reg_types).unwrap_or(Ty::Error);
+                    self.var_types.entry(slot).or_insert(error);
+                }
                 let blocks = self.lower_region(ex_body, ext_loops, outer_map);
                 Some((slot, blocks))
             }
@@ -2872,6 +2913,10 @@ fn lower_cfg_nested(
         owned_params: Vec::new(),
         ref_params: Vec::new(),
         returns_reference,
+        var_tys: HashMap::new(),
+        ret_ty: None,
+        raises: false,
+        error_ty: None,
         spans: SpanTable::default(),
         reg_types: HashMap::new(),
     };
@@ -2927,6 +2972,7 @@ fn lower_cfg_nested(
         // (short-circuit / iterator temporaries), so take the final interner.
         fl.f.n_vars = fl.vars.len();
         fl.f.var_names = fl.vars.clone();
+        fl.f.var_tys = fl.var_types.clone();
     } // `fl` (the &mut borrow of `mir`) ends here
 
     mir
@@ -2945,6 +2991,462 @@ pub struct MirProgram {
     /// Backends must reject a program with any entry rather than executing a
     /// guessed fallback representation.
     pub invariant_errors: Vec<String>,
+}
+
+/// The error type that can propagate out of a lowered `try`-body region: the
+/// first raising fact that would reach this region's handler. Nested regions
+/// with their own handler consume their body's raises, so only their
+/// handler/orelse/finalbody blocks (and handlerless bodies) propagate.
+fn region_error_type(blocks: &[MirBlock], reg_types: &HashMap<u32, Ty>) -> Option<Ty> {
+    for block in blocks {
+        for instr in &block.instrs {
+            match instr {
+                MirInstr::Raise { src } => {
+                    if let Some(ty) = reg_types.get(&src.0) {
+                        return Some(ty.clone());
+                    }
+                }
+                MirInstr::Call {
+                    raises: Some(ty), ..
+                }
+                | MirInstr::CallIndirect {
+                    raises: Some(ty), ..
+                }
+                | MirInstr::MethodCall {
+                    raises: Some(ty), ..
+                } => {
+                    return Some(ty.clone());
+                }
+                MirInstr::Try {
+                    body,
+                    handler,
+                    orelse,
+                    finalbody,
+                    ..
+                } => {
+                    let mut nested = Vec::new();
+                    if handler.is_none() {
+                        nested.push(body.as_slice());
+                    }
+                    if let Some((_, handler_blocks)) = handler {
+                        nested.push(handler_blocks.as_slice());
+                    }
+                    nested.extend(orelse.as_deref());
+                    nested.extend(finalbody.as_deref());
+                    for region in nested {
+                        if let Some(ty) = region_error_type(region, reg_types) {
+                            return Some(ty);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// Fill remaining register types by copying facts already present in the
+/// instruction stream: operand register types, typed places, inline element
+/// types, slot types, and declaration returns. This pass never re-implements
+/// checker inference — a register whose type cannot be copied from an existing
+/// fact is reported as an invariant error. Synthetic loan/consumption markers
+/// are typed `Ty::None`; a synthetic reference handle whose place storage is
+/// not already a handle type is typed as a reference with an untracked origin,
+/// because handle loan bookkeeping lives in `BeginLoan`/`through` metadata,
+/// not in the register type.
+fn close_register_types(
+    name: &str,
+    f: &mut MirFunction,
+    declarations: &MirDeclarations,
+    invariant_errors: &mut Vec<String>,
+) {
+    fn deref(ty: Ty) -> Ty {
+        match ty {
+            Ty::Ref(reference) => *reference.referent,
+            other => other,
+        }
+    }
+    fn handle_ty(place: &MirPlace) -> Option<Ty> {
+        let storage = place.ty.clone()?;
+        Some(match storage {
+            forwarded @ (Ty::Ref(_) | Ty::Pointer { .. }) => forwarded,
+            referent => Ty::Ref(crate::origin::RefTy {
+                referent: Box::new(referent),
+                origin: crate::origin::Origin::Untracked { mutable: true },
+                mutability: crate::origin::Mutability::Mutable,
+            }),
+        })
+    }
+    fn declared_return(declarations: &MirDeclarations, callee: &str) -> Option<Ty> {
+        declarations
+            .functions
+            .iter()
+            .find(|declaration| declaration.lowered_name == callee)
+            .map(|declaration| declaration.ret_ty.clone())
+    }
+    fn struct_field(declarations: &MirDeclarations, base: &Ty, field: &str) -> Option<Ty> {
+        let Ty::Struct(name, _) = base else {
+            return None;
+        };
+        declarations
+            .structs
+            .iter()
+            .find(|declaration| &declaration.name == name)?
+            .fields
+            .iter()
+            .find(|(candidate, _)| candidate == field)
+            .map(|(_, ty)| ty.clone())
+    }
+    fn close_blocks(
+        blocks: &[MirBlock],
+        reg_types: &mut HashMap<u32, Ty>,
+        var_tys: &mut HashMap<VarId, Ty>,
+        declarations: &MirDeclarations,
+    ) -> bool {
+        let mut changed = false;
+        // Compile-time integer registers within this region, so a tuple index
+        // through a constant register can copy the selected element type.
+        let mut const_ints: HashMap<u32, i64> = HashMap::new();
+        let record = |reg_types: &mut HashMap<u32, Ty>, reg: &Reg, ty: Option<Ty>| {
+            if let Some(ty) = ty
+                && !reg_types.contains_key(&reg.0)
+            {
+                reg_types.insert(reg.0, ty);
+                true
+            } else {
+                false
+            }
+        };
+        for block in blocks {
+            for instr in block.instrs.iter() {
+                let derived: Option<(&Reg, Option<Ty>)> = match instr {
+                    MirInstr::Const { dest, k } => {
+                        let ty = match k {
+                            Const::Int(value) => {
+                                const_ints.insert(dest.0, *value);
+                                Some(Ty::Int)
+                            }
+                            Const::Float(_) => Some(Ty::Float64),
+                            Const::Bool(_) => Some(Ty::Bool),
+                            Const::Str(_) => Some(Ty::String),
+                            Const::None => Some(Ty::None),
+                            // A callable constant's type needs the checked
+                            // expression; report rather than reconstruct.
+                            Const::Function(_) => None,
+                        };
+                        Some((dest, ty))
+                    }
+                    MirInstr::UseVar { dest, var, .. } => {
+                        Some((dest, var_tys.get(var).cloned().map(deref)))
+                    }
+                    MirInstr::DefVar {
+                        var,
+                        src,
+                        binding_ty,
+                    } => {
+                        // A synthetic binding (iterator, short-circuit carrier)
+                        // has no checked binding type; its slot type is the
+                        // initializing register's.
+                        if !var_tys.contains_key(var)
+                            && let Some(ty) = binding_ty
+                                .clone()
+                                .or_else(|| reg_types.get(&src.0).cloned())
+                        {
+                            var_tys.insert(*var, ty);
+                            changed = true;
+                        }
+                        None
+                    }
+                    MirInstr::LoadPlace { dest, place } => {
+                        Some((dest, place.ty.clone().map(deref)))
+                    }
+                    MirInstr::MovePlace { dest, place } => Some((dest, place.ty.clone())),
+                    MirInstr::MakeRef { dest, place } => Some((dest, handle_ty(place))),
+                    MirInstr::ReadRef { dest, reference } => Some((
+                        dest,
+                        reg_types.get(&reference.0).cloned().map(|ty| match ty {
+                            Ty::Ref(reference) => *reference.referent,
+                            Ty::Pointer { element, .. } => *element,
+                            other => other,
+                        }),
+                    )),
+                    MirInstr::UnOp { op, dest, a } => Some((
+                        dest,
+                        match op {
+                            PrefixOp::Not => Some(Ty::Bool),
+                            _ => reg_types.get(&a.0).cloned(),
+                        },
+                    )),
+                    MirInstr::BinOp { op, dest, a, b } => Some((
+                        dest,
+                        match op {
+                            InfixOp::Eq
+                            | InfixOp::Ne
+                            | InfixOp::Lt
+                            | InfixOp::Gt
+                            | InfixOp::Le
+                            | InfixOp::Ge
+                            | InfixOp::And
+                            | InfixOp::Or
+                            | InfixOp::In
+                            | InfixOp::NotIn => Some(Ty::Bool),
+                            _ => reg_types.get(&a.0).or_else(|| reg_types.get(&b.0)).cloned(),
+                        },
+                    )),
+                    MirInstr::GetField { dest, base, field } => Some((
+                        dest,
+                        reg_types
+                            .get(&base.0)
+                            .and_then(|base| struct_field(declarations, base, field))
+                            .map(deref),
+                    )),
+                    MirInstr::Index { dest, base, index } => Some((
+                        dest,
+                        reg_types.get(&base.0).and_then(|base| match base {
+                            Ty::List(element) | Ty::Set(element) => Some((**element).clone()),
+                            Ty::Pointer { element, .. } => Some((**element).clone()),
+                            Ty::Dict(_, value) => Some((**value).clone()),
+                            Ty::Simd { dtype, .. } => Some(Ty::Simd {
+                                dtype: *dtype,
+                                width: 1,
+                            }),
+                            // A tuple element type needs the compile-time
+                            // index the checker already validated.
+                            Ty::Tuple(elements) => const_ints
+                                .get(&index.0)
+                                .and_then(|value| usize::try_from(*value).ok())
+                                .and_then(|value| elements.get(value).cloned())
+                                .map(deref),
+                            _ => None,
+                        }),
+                    )),
+                    MirInstr::Call {
+                        dest,
+                        func: FuncRef(callee),
+                        ..
+                    } => Some((dest, declared_return(declarations, callee))),
+                    MirInstr::MethodCall {
+                        dest,
+                        resolved: Some(callee),
+                        ..
+                    } => Some((dest, declared_return(declarations, callee))),
+                    MirInstr::CallIndirect { dest, callee, .. } => Some((
+                        dest,
+                        reg_types.get(&callee.0).and_then(|ty| match ty {
+                            Ty::Func { ret, .. } => Some((**ret).clone()),
+                            _ => None,
+                        }),
+                    )),
+                    MirInstr::MakeList {
+                        dest,
+                        element_type: Some(element),
+                        ..
+                    } => Some((dest, Some(Ty::List(Box::new(element.clone()))))),
+                    MirInstr::MakeList {
+                        dest,
+                        elems,
+                        element_type: None,
+                    } => {
+                        // A reference-carrying list has no inline element
+                        // type; every element register shares one type.
+                        let element = elems
+                            .first()
+                            .and_then(|element| reg_types.get(&element.0).cloned());
+                        Some((dest, element.map(|element| Ty::List(Box::new(element)))))
+                    }
+                    MirInstr::MakeSet {
+                        dest,
+                        element_type: Some(element),
+                        ..
+                    } => Some((dest, Some(Ty::Set(Box::new(element.clone()))))),
+                    MirInstr::MakeDict {
+                        dest,
+                        key_type: Some(key),
+                        value_type: Some(value),
+                        ..
+                    } => Some((
+                        dest,
+                        Some(Ty::Dict(Box::new(key.clone()), Box::new(value.clone()))),
+                    )),
+                    MirInstr::MakeTuple {
+                        dest,
+                        element_types: Some(elements),
+                        ..
+                    } => Some((dest, Some(Ty::Tuple(elements.clone())))),
+                    MirInstr::MakeTuple {
+                        dest,
+                        elems,
+                        element_types: None,
+                    } => {
+                        // A reference-carrying tuple has no inline element
+                        // types; its shape is its element registers' types.
+                        let elements: Option<Vec<Ty>> = elems
+                            .iter()
+                            .map(|element| reg_types.get(&element.0).cloned())
+                            .collect();
+                        Some((dest, elements.map(Ty::Tuple)))
+                    }
+                    MirInstr::MakeVariant {
+                        dest, alternatives, ..
+                    } => Some((dest, Some(Ty::Variant(alternatives.clone())))),
+                    MirInstr::MakeSimd {
+                        dest, dtype, width, ..
+                    } => Some((
+                        dest,
+                        Some(Ty::Simd {
+                            dtype: *dtype,
+                            width: *width as i64,
+                        }),
+                    )),
+                    MirInstr::VariantIs { dest, .. } => Some((dest, Some(Ty::Bool))),
+                    MirInstr::VariantGet {
+                        dest,
+                        variant,
+                        index,
+                    }
+                    | MirInstr::VariantTake {
+                        dest,
+                        variant,
+                        index,
+                        ..
+                    } => Some((
+                        dest,
+                        reg_types.get(&variant.0).and_then(|ty| match ty {
+                            Ty::Variant(alternatives) => alternatives.get(*index).cloned(),
+                            _ => None,
+                        }),
+                    )),
+                    MirInstr::VariantReplace {
+                        dest,
+                        place,
+                        output_index,
+                        ..
+                    } => Some((
+                        dest,
+                        place.ty.as_ref().and_then(|ty| match ty {
+                            Ty::Variant(alternatives) => alternatives.get(*output_index).cloned(),
+                            _ => None,
+                        }),
+                    )),
+                    MirInstr::HasNext { dest, .. } => Some((dest, Some(Ty::Bool))),
+                    MirInstr::Next { dest, iter, .. } => {
+                        // The element register's type is the loop variable's
+                        // checked binding type (its definition may sit in the
+                        // loop's body block), or falls back to the iterator
+                        // slot's element type.
+                        let consumer = blocks
+                            .iter()
+                            .flat_map(|candidate| candidate.instrs.iter())
+                            .find_map(|candidate| match candidate {
+                                MirInstr::DefVar {
+                                    src,
+                                    binding_ty: Some(ty),
+                                    ..
+                                } if src == dest => Some(ty.clone()),
+                                MirInstr::DefVar { src, var, .. } if src == dest => {
+                                    var_tys.get(var).cloned()
+                                }
+                                MirInstr::Store { place, src } if src == dest => place.ty.clone(),
+                                _ => None,
+                            })
+                            .or_else(|| {
+                                var_tys.get(iter).and_then(|ty| match ty {
+                                    Ty::List(element) | Ty::Set(element) => {
+                                        Some((**element).clone())
+                                    }
+                                    Ty::Range => Some(Ty::Int),
+                                    Ty::Struct(name, _) => {
+                                        declared_return(declarations, &format!("{name}.__next__"))
+                                    }
+                                    _ => None,
+                                })
+                            });
+                        Some((dest, consumer))
+                    }
+                    MirInstr::BeginLoan { marker, .. } | MirInstr::ConsumePlace { marker, .. } => {
+                        Some((marker, Some(Ty::None)))
+                    }
+                    MirInstr::Try {
+                        body,
+                        handler,
+                        orelse,
+                        finalbody,
+                        ..
+                    } => {
+                        for region in std::iter::once(body)
+                            .chain(handler.iter().map(|(_, blocks)| blocks))
+                            .chain(orelse.iter())
+                            .chain(finalbody.iter())
+                        {
+                            changed |= close_blocks(region, reg_types, var_tys, declarations);
+                        }
+                        None
+                    }
+                    _ => None,
+                };
+                if let Some((dest, ty)) = derived {
+                    changed |= record(reg_types, dest, ty);
+                }
+            }
+        }
+        changed
+    }
+
+    fn describe_defining_instr(blocks: &[MirBlock], reg: u32, out: &mut Option<String>) {
+        for block in blocks {
+            for instr in &block.instrs {
+                let mut regs = Vec::new();
+                verify::instruction_result_regs(instr, &mut regs);
+                if regs.iter().any(|candidate| candidate.0 == reg) {
+                    let debug = format!("{instr:?}");
+                    *out = Some(debug.chars().take(80).collect());
+                    return;
+                }
+                if let MirInstr::Try {
+                    body,
+                    handler,
+                    orelse,
+                    finalbody,
+                    ..
+                } = instr
+                {
+                    for region in std::iter::once(body)
+                        .chain(handler.iter().map(|(_, blocks)| blocks))
+                        .chain(orelse.iter())
+                        .chain(finalbody.iter())
+                    {
+                        describe_defining_instr(region, reg, out);
+                        if out.is_some() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut reg_types = std::mem::take(&mut f.reg_types);
+    let mut var_tys = std::mem::take(&mut f.var_tys);
+    // Chains (a handle read of a fresh handle, a call through a just-typed
+    // callable) settle in a few passes; the bound keeps lowering total.
+    for _ in 0..4 {
+        if !close_blocks(&f.blocks, &mut reg_types, &mut var_tys, declarations) {
+            break;
+        }
+    }
+    for reg in 0..f.n_regs {
+        if !reg_types.contains_key(&reg) {
+            let mut producer = None;
+            describe_defining_instr(&f.blocks, reg, &mut producer);
+            invariant_errors.push(format!(
+                "fn '{name}': register r{reg} has no checked type ({})",
+                producer.as_deref().unwrap_or("no defining instruction")
+            ));
+        }
+    }
+    f.reg_types = reg_types;
+    f.var_tys = var_tys;
 }
 
 fn checked_type_or_record(
@@ -2993,6 +3495,14 @@ pub struct MirFunctionDeclaration {
     pub positional_only: Option<usize>,
     pub keyword_only: Option<usize>,
     pub param_decls: Vec<(String, bool)>,
+    /// Checked return type of the callable.
+    pub ret_ty: Ty,
+    /// Checked raising contract and its declared error type.
+    pub raises: bool,
+    pub error_ty: Option<Ty>,
+    /// Whether each runtime parameter is a `mut`/`ref` reference whose final
+    /// value writes back through a caller place. Same order as `param_types`.
+    pub ref_params: Vec<bool>,
 }
 
 /// Translate a source parameter marker into the runtime frame layout. Named
@@ -3057,7 +3567,6 @@ pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
                 params,
                 positional_only,
                 keyword_only,
-                ret,
                 body,
                 ..
             } => {
@@ -3112,6 +3621,28 @@ pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
                             && !matches!(p.convention, Some(ArgConvention::Out))
                     })
                     .collect();
+                let return_site = AnnotationSite::FunctionReturn {
+                    module: s.module.clone(),
+                    declaration: s.span,
+                };
+                let ret_ty = checked_type_or_record(
+                    checked,
+                    return_site.clone(),
+                    &format!("return type of function '{name}'"),
+                    &mut invariant_errors,
+                );
+                let effect = checked
+                    .declaration_effect_at(&return_site)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        invariant_errors
+                            .push(format!("missing checked effect for function '{name}'"));
+                        crate::checked::DeclarationEffect {
+                            raises: false,
+                            error: None,
+                            returns_reference: false,
+                        }
+                    });
                 declarations.functions.push(MirFunctionDeclaration {
                     lowered_name: lowered_name.clone(),
                     param_names: regular.iter().map(|p| p.name.clone()).collect(),
@@ -3167,6 +3698,10 @@ pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
                     positional_only: regular_marker_index(params, *positional_only),
                     keyword_only: effective_keyword_only_index(params, *keyword_only, variadic_idx),
                     param_decls: crate::runtime::classify_param_decls(type_params),
+                    ret_ty: ret_ty.clone(),
+                    raises: effect.raises,
+                    error_ty: effect.error.clone(),
+                    ref_params: regular.iter().map(|p| is_ref(&p.convention)).collect(),
                 });
                 lower_fn_nested(
                     FunctionLowering {
@@ -3176,7 +3711,10 @@ pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
                         parameter_types: ptys,
                         owned_parameters: owned,
                         reference_parameters: refp,
-                        returns_reference: matches!(ret, Some(SourceType::Ref { .. })),
+                        returns_reference: effect.returns_reference,
+                        ret_ty,
+                        raises: effect.raises,
+                        error_ty: effect.error,
                         named_result: named_result.map(|p| p.name.as_str()),
                         body,
                         overloads: &overloads,
@@ -3277,6 +3815,30 @@ pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
                                 && !matches!(param.convention, Some(ArgConvention::Out))
                         })
                         .collect();
+                    let return_site = AnnotationSite::MethodReturn {
+                        module: s.module.clone(),
+                        declaration: s.span,
+                        method: method_index,
+                    };
+                    let ret_ty = checked_type_or_record(
+                        checked,
+                        return_site.clone(),
+                        &format!("return type of method '{source_mangled}'"),
+                        &mut invariant_errors,
+                    );
+                    let effect = checked
+                        .declaration_effect_at(&return_site)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            invariant_errors.push(format!(
+                                "missing checked effect for method '{source_mangled}'"
+                            ));
+                            crate::checked::DeclarationEffect {
+                                raises: false,
+                                error: None,
+                                returns_reference: false,
+                            }
+                        });
                     declarations.functions.push(MirFunctionDeclaration {
                         lowered_name: mangled.clone(),
                         param_names: regular.iter().map(|param| param.name.clone()).collect(),
@@ -3346,6 +3908,13 @@ pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
                             variadic_idx,
                         ),
                         param_decls: Vec::new(),
+                        ret_ty: ret_ty.clone(),
+                        raises: effect.raises,
+                        error_ty: effect.error.clone(),
+                        ref_params: regular
+                            .iter()
+                            .map(|param| is_ref(&param.convention))
+                            .collect(),
                     });
                     // A method's receiver `self` is the implicit first parameter,
                     // followed by the declared params.
@@ -3383,7 +3952,10 @@ pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
                             parameter_types: ptys,
                             owned_parameters: owned,
                             reference_parameters: refp,
-                            returns_reference: matches!(m.ret, Some(SourceType::Ref { .. })),
+                            returns_reference: effect.returns_reference,
+                            ret_ty,
+                            raises: effect.raises,
+                            error_ty: effect.error,
                             named_result: None,
                             body: &m.body,
                             overloads: &overloads,
@@ -3398,16 +3970,19 @@ pub fn lower_checked_program(checked: &CheckedProgram) -> MirProgram {
         }
     }
 
-    functions.push((
-        "__toplevel__".to_string(),
-        lower_cfg_nested(
-            &Cfg::build_checked_fn(checked, &[], &toplevel),
-            &HashMap::new(),
-            &overloads,
-            false,
-            &[],
-        ),
-    ));
+    let mut toplevel_fn = lower_cfg_nested(
+        &Cfg::build_checked_fn(checked, &[], &toplevel),
+        &HashMap::new(),
+        &overloads,
+        false,
+        &[],
+    );
+    // The synthetic module initializer returns nothing and never raises.
+    toplevel_fn.ret_ty = Some(Ty::None);
+    functions.push(("__toplevel__".to_string(), toplevel_fn));
+    for (name, function) in &mut functions {
+        close_register_types(name, function, &declarations, &mut invariant_errors);
+    }
     let mut result = MirProgram {
         functions,
         declarations,

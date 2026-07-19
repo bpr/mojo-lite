@@ -4,9 +4,40 @@ All notable changes to Mojito will be documented in this file. The project uses
 Semantic Versioning while its public Rust API and supported Mojo subset continue
 to evolve under the `0.x` compatibility rules.
 
-## [Unreleased]
+## [0.2.0] - 2026-07-19
+
+Current-Mojo alignment through the pinned 1.0.0b3 nightly, executable origin
+and pointer loans, and completely typed, semantically verified MIR — the
+milestone gating the textual MIR/VM schema and native-backend work.
+
+### Changed
+
+- The public `Backend` trait object is now a statically dispatched enum over
+  concrete implementations. `BackendKind` recognizes the planned
+  `vm`/`cranelift`/`ebpf`/`llvm`/`mlir` seams; `BackendKind::make` parses a
+  backend name and constructs it, and recognized-but-unimplemented backends
+  refuse construction.
 
 ### Added
+
+- MIR is completely value- and instruction-typed: every register — expression
+  results, synthetic handles, markers, control-flow and iterator temporaries —
+  carries a checked type, recorded at emission or copied from existing
+  instruction facts by a closing pass that never re-implements checker
+  inference. Functions and callable declarations retain their checked return
+  types, raising contracts, and per-slot types; the last source-annotation
+  reads left MIR lowering, and parameter slot types now come from checked
+  declaration facts instead of name-matched body expressions.
+- `mir::verify` is the standalone semantic verifier of record over MIR plus
+  checked declaration metadata: place and projection consistency, register
+  bounds and type completeness, store/binding/return/call-argument type
+  consistency through the checker's coercion predicate, CFG-edge validity,
+  effect protection for raising sites, and reference write-back invariants.
+  The compiler pipeline gains a dedicated verification stage
+  (`CompilerError::Verify`) composed with ownership analysis over one lowered
+  program, the VM re-verifies the drop-elaborated program it executes, and the
+  CLI `check`/`own` commands consume the same checked pipeline instead of
+  silently re-checking.
 
 - `UnsafePointer(to=place)` infers an origin-bearing pointer whose provenance is
   the concrete source place, with mutability taken from the owner binding. The
@@ -216,4 +247,5 @@ Initial crates.io release.
 - GPU execution, concurrency/parallelism, distributed execution, Python
   interoperability, MLIR, and optimized native code generation are not included.
 
+[0.2.0]: https://github.com/bpr/mojito/releases/tag/v0.2.0
 [0.1.0]: https://github.com/bpr/mojito/releases/tag/v0.1.0

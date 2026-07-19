@@ -35,7 +35,7 @@ fn origin_ok_fixtures_execute() {
         let checked =
             check_program(&program).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
         check_ownership(&program).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-        let mut backend = BackendKind::Vm.make();
+        let mut backend = BackendKind::make("vm").expect("the register VM is implemented");
         backend
             .run(&checked)
             .unwrap_or_else(|error| panic!("{}: {error}", path.display()));

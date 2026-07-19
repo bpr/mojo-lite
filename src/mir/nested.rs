@@ -342,6 +342,10 @@ pub(super) struct FunctionLowering<'a> {
     pub(super) owned_parameters: Vec<bool>,
     pub(super) reference_parameters: Vec<bool>,
     pub(super) returns_reference: bool,
+    /// Checked return type and raising contract of the declaration.
+    pub(super) ret_ty: Ty,
+    pub(super) raises: bool,
+    pub(super) error_ty: Option<Ty>,
     pub(super) named_result: Option<&'a str>,
     pub(super) body: &'a [Stmt],
     pub(super) overloads: &'a crate::symbol::OverloadSets,
@@ -356,6 +360,9 @@ pub(super) fn lower_fn_nested(request: FunctionLowering<'_>, out: &mut Vec<(Stri
         owned_parameters: owned_params,
         reference_parameters: ref_params,
         returns_reference,
+        ret_ty,
+        raises,
+        error_ty,
         named_result,
         body,
         overloads,
@@ -399,6 +406,12 @@ pub(super) fn lower_fn_nested(request: FunctionLowering<'_>, out: &mut Vec<(Stri
                 NestedInfo {
                     mangled: mangled.clone(),
                     captures: captures.clone(),
+                    callable_ty: checked
+                        .checked_type_at(&AnnotationSite::FunctionType {
+                            module: ds.module.clone(),
+                            declaration: ds.span,
+                        })
+                        .cloned(),
                 },
             );
             liftable.push((ds, captures, mangled));
@@ -445,13 +458,25 @@ pub(super) fn lower_fn_nested(request: FunctionLowering<'_>, out: &mut Vec<(Stri
         }
     }
 
-    let cfg = Cfg::build_checked_fn(checked, param_names, body);
+    let mut cfg = Cfg::build_checked_fn(checked, param_names, body);
+    // Parameter slot types come from the checked declaration, not from
+    // name-matched body expressions (same-named bindings in other functions
+    // must never leak into this function's slots).
+    for (slot, ty) in param_types.iter().enumerate() {
+        cfg.var_types.insert(slot as VarId, ty.clone());
+    }
     let mut f = lower_cfg_nested(&cfg, &registry, overloads, returns_reference, &ref_params);
     f.n_params = param_types.len();
+    for (slot, ty) in param_types.iter().enumerate() {
+        f.var_tys.entry(slot as VarId).or_insert_with(|| ty.clone());
+    }
     f.param_types = param_types;
     f.owned_params = owned_params;
     f.ref_params = ref_params;
     f.returns_reference = returns_reference;
+    f.ret_ty = Some(ret_ty);
+    f.raises = raises;
+    f.error_ty = error_ty;
     if let Some(result) = named_result {
         let slot = f
             .var_names
@@ -522,12 +547,37 @@ pub(super) fn lower_fn_nested(request: FunctionLowering<'_>, out: &mut Vec<(Stri
                 .filter(|capture| capture.kind == crate::ast::CaptureKind::Read)
                 .map(|capture| capture.name.clone())
                 .collect();
-            let ncfg =
+            let mut ncfg =
                 Cfg::build_checked_fn_with_captures(checked, &names, immutable_captures, dbody);
+            // Declared parameter slots take their checked types; capture slots
+            // keep the body-derived types of the enclosing locals they alias.
+            for (slot, ty) in ptys.iter().enumerate().skip(captures.len()) {
+                ncfg.var_types.insert(slot as VarId, ty.clone());
+            }
             let mut nf = lower_cfg_nested(&ncfg, &registry, overloads, false, &refp2);
+            for (slot, ty) in ptys.iter().enumerate() {
+                nf.var_tys
+                    .entry(slot as VarId)
+                    .or_insert_with(|| ty.clone());
+            }
             nf.param_types = ptys;
             nf.owned_params = owned2;
             nf.ref_params = refp2;
+            // The nested `def` was checked as an ordinary declaration, so its
+            // return and raising contract are recorded checked facts.
+            nf.ret_ty = checked
+                .checked_type_at(&AnnotationSite::FunctionReturn {
+                    module: ds.module.clone(),
+                    declaration: ds.span,
+                })
+                .cloned();
+            if let Some(effect) = checked.declaration_effect_at(&AnnotationSite::FunctionReturn {
+                module: ds.module.clone(),
+                declaration: ds.span,
+            }) {
+                nf.raises = effect.raises;
+                nf.error_ty = effect.error.clone();
+            }
             out.push((mangled, nf));
         }
     }

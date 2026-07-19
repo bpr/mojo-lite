@@ -6,7 +6,7 @@ use mojito::{BackendKind, RuntimeError, TypeError, Value, check_program, parse};
 fn run(source: &str) -> Vec<(String, Value)> {
     let program = parse(source).expect("parse error");
     let checked = check_program(&program).expect("type error");
-    let mut backend = BackendKind::Vm.make();
+    let mut backend = BackendKind::make("vm").expect("the register VM is implemented");
     backend.run(&checked).expect("runtime error");
     backend.bindings()
 }
@@ -15,7 +15,7 @@ fn run(source: &str) -> Vec<(String, Value)> {
 fn run_err(source: &str) -> RuntimeError {
     let program = parse(source).expect("parse error");
     let checked = check_program(&program).expect("type error");
-    let mut backend = BackendKind::Vm.make();
+    let mut backend = BackendKind::make("vm").expect("the register VM is implemented");
     backend.run(&checked).expect_err("expected a runtime error")
 }
 
@@ -23,7 +23,7 @@ fn run_err(source: &str) -> RuntimeError {
 fn output(source: &str) -> String {
     let program = parse(source).expect("parse error");
     let checked = check_program(&program).expect("type error");
-    let mut backend = BackendKind::Vm.make();
+    let mut backend = BackendKind::make("vm").expect("the register VM is implemented");
     backend.run(&checked).expect("runtime error");
     backend.output()
 }

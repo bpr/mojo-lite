@@ -14,10 +14,11 @@ refactors; implementation details belong in `docs/architecture.md`.
 | Link | `module::{link_with_options, link_source_with_options, LinkOptions}` | Dependency-first flat program with `SourceSpan` module identity. |
 | Comptime | `comptime::elaborate`, `ct::CtValue` | Ordinary AST with compile-time control resolved. |
 | Check | `checker::{check_program, Checker}`, `checked::CheckedProgram` | Authoritative semantic handoff and side tables. |
-| HIR | `hir::Cfg::{build, build_fn}` | Statement CFG with nested expressions. |
-| MIR | `mir::lower_checked_program`, `mir::MirProgram` | A-normal IR, places, declaration metadata, source table. |
-| Ownership | `analysis::check_ownership_checked` (driving internal `check_ownership_mir`) | Move/init validation. |
-| Drops | `analysis::elaborate_drops_program` | MIR with explicit `DropVar` operations. |
+| HIR | `hir::Cfg::build_checked_fn` (unchecked `build`/`build_fn` are phase-test compatibility) | Statement CFG with nested expressions. |
+| MIR | `mir::lower_checked_program`, `mir::MirProgram` | Fully register-typed A-normal IR, places, declaration metadata, source table. |
+| Verify | `mir::verify::verify` | Semantic verification of typed MIR: register/place types, call contracts, CFG edges, effects, references. |
+| Ownership | `analysis::check_ownership_program` (checked wrapper `check_ownership_checked`) | Move/init and loan validation over lowered MIR. |
+| Drops | `analysis::elaborate_drops_program` | MIR with explicit `DropVar` operations; re-verified before execution. |
 | Execute | `backend::Backend::run`, `backend::vm::VmBackend` | Output and bindings from verified MIR. |
 
 ## Cross-Phase Contracts

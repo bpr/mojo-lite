@@ -845,10 +845,32 @@ need to know the difference between "the value computed by an expression" and
 
 Production checked lowering requires `root_ty`, one result type per projection,
 and the final stored `ty`; the optional wrapper exists only for the deliberately
-unchecked phase-test API. `mir::verify` rejects incomplete production places,
-invalid roots, mismatched projection metadata, and invalid index registers before
-the VM runs. HIR carries the same information earlier as `HirPlace`: stable
-`OwnerId`, root type, typed field/index projections, and final storage type.
+unchecked phase-test API. HIR carries the same information earlier as
+`HirPlace`: stable `OwnerId`, root type, typed field/index projections, and
+final storage type.
+
+Every register is typed. Expression results record their checked type as they
+lower; synthetic registers (handles, markers, short-circuit and iterator
+temporaries) are typed at their emission site; and a `close_register_types`
+pass fills the remaining results by copying facts already present in the
+instruction stream — operand register types, place storage types, inline
+element types, slot types, and declaration returns — never by re-implementing
+checker inference. Loan and consumption markers, which hold no runtime value,
+are typed `Ty::None` by convention. Functions additionally carry their checked
+`ret_ty`, raising contract (`raises`/`error_ty`), and per-slot `var_tys`.
+
+`mir::verify` is the standalone semantic verifier of record. From MIR plus
+`MirDeclarations` alone it checks place completeness and projection
+consistency, register bounds and register-type completeness, store/binding/
+return/call-argument type consistency (through the checker's coercion
+predicate — never re-derived rules), CFG-edge validity (jump-target bounds per
+region, `FallOff`/`EscapeJump` only inside `try` sub-regions), effect
+protection (a raising site in a nonraising function must sit under a handler),
+and reference invariants (`StoreRef` targets reference storage; declared
+write-back parameters receive caller places). The pipeline composes it with
+`analysis::check_ownership_program`, which owns the ownership dataflow; the
+compiler rejects findings as `CompilerError::Verify`, and the VM re-verifies
+the drop-elaborated program it actually executes.
 
 A place's storage type is distinct from its expression value type. For a field
 declared `ref[origin] T`, the place stores `Ty::Ref`, while an ordinary load
@@ -1598,8 +1620,12 @@ The main pressure points are:
   string-to-AST macro channel
 - ABI-sensitive reflection such as byte offsets belongs to the future native
   backends; VM reflection exposes semantic field indexes and checked projections
-- checked declaration metadata can eventually replace the remaining AST types in
-  `MirDeclarations`; the VM-side AST registries themselves have been removed
+- MIR is fully register-typed and semantically verified; the named deferrals
+  are capture-set discovery in `mir/nested.rs` (still free-variable name
+  analysis over AST, though bodies and parameter types are checked facts),
+  name-based callee fallbacks kept for the unchecked phase-test path, nominal
+  callable-conformance facts in `MirDeclarations`, and caching the verified
+  `MirProgram` in `CompiledProgram` to avoid the compiler/VM double lowering
 - source modules and packages are flattened after lexical namespace resolution;
   compiled `.mojoc` artifacts remain future distribution tooling
 - trait support is intentionally incomplete

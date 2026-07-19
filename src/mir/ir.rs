@@ -575,6 +575,17 @@ pub struct MirFunction {
     /// always `false` here. Same order as the params.
     pub ref_params: Vec<bool>,
     pub returns_reference: bool,
+    /// Checked type of each variable slot, as far as lowering recorded one.
+    /// Parameters, bindings, and synthetic locals are covered on the checked
+    /// path; instruction typing and verification read slot types from here.
+    pub var_tys: HashMap<VarId, Ty>,
+    /// Checked return type. `None` only on unchecked compatibility paths;
+    /// production lowering always records it (`Ty::None` for no return).
+    pub ret_ty: Option<Ty>,
+    /// Checked raising contract (`raises Never` records as nonraising).
+    pub raises: bool,
+    /// Declared error type when `raises` is true and the contract is typed.
+    pub error_ty: Option<Ty>,
     pub spans: SpanTable,
     /// Resolved type of registers originating in checked expressions. Synthetic
     /// control-flow registers are filled by instruction typing before verification.

@@ -316,3 +316,23 @@ fn variant_protocols_are_conditioned_on_every_alternative() {
         .expect_err("a Variant is deletable only when every alternative is deletable");
     assert!(matches!(nondeletable, CompilerError::Type(_)));
 }
+
+#[test]
+fn pipeline_verifies_typed_mir_before_execution() {
+    // The verification stage sits between checking and ownership: a healthy
+    // program compiles, and the dedicated error variant renders findings as a
+    // compiler invariant report rather than a user diagnostic.
+    let compiler = Compiler::default();
+    compiler
+        .compile_source(
+            "def main():\n    var x = 1\n    print(x)\n",
+            std::path::Path::new("/tmp/mojito_verify_stage.mojo"),
+        )
+        .expect("a checked program passes MIR verification");
+    let rendered = CompilerError::Verify(vec![
+        "fn 'main': register r1 has no checked type".to_string(),
+    ])
+    .to_string();
+    assert!(rendered.contains("invalid checked program"));
+    assert!(rendered.contains("register r1"));
+}

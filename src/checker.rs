@@ -242,6 +242,12 @@ fn method_satisfies_requirement(got: &MethodSig, required: &MethodSig) -> bool {
     got.error == required.error
 }
 
+/// The checker's value-coercion predicate, shared with MIR verification so the
+/// verifier never re-derives conversion rules.
+pub(crate) fn value_coerces(from: &Ty, to: &Ty) -> bool {
+    coerces(from, to)
+}
+
 fn same_callable_signature(a: &Ty, b: &Ty) -> bool {
     match (a, b) {
         (
@@ -569,6 +575,7 @@ pub fn check_program(stmts: &[Stmt]) -> Result<crate::checked::CheckedProgram, T
         explicit_destroy_types,
         checker.explicit_destroy_calls.into_inner(),
         checker.reference_value_uses.into_inner(),
+        checker.declaration_effects.into_inner(),
     ))
 }
 
@@ -763,6 +770,10 @@ pub struct Checker {
     /// syntax.
     operation_adjustments: RefCell<HashMap<SourceSpan, crate::checked::SemanticAdjustment>>,
     declaration_types: RefCell<HashMap<crate::checked::AnnotationSite, Ty>>,
+    /// Checked raising contract and reference-return fact per callable
+    /// declaration; lowering never re-reads source `raises`/return syntax.
+    declaration_effects:
+        RefCell<HashMap<crate::checked::AnnotationSite, crate::checked::DeclarationEffect>>,
     expression_types: RefCell<HashMap<SourceSpan, Ty>>,
     expression_bindings: RefCell<HashMap<SourceSpan, crate::origin::OwnerId>>,
     /// Stable identities/types for the lexical binders introduced by each
@@ -817,6 +828,7 @@ impl Checker {
             simd_constructions: RefCell::new(HashMap::new()),
             operation_adjustments: RefCell::new(HashMap::new()),
             declaration_types: RefCell::new(HashMap::new()),
+            declaration_effects: RefCell::new(HashMap::new()),
             expression_types: RefCell::new(HashMap::new()),
             expression_bindings: RefCell::new(HashMap::new()),
             comprehension_bindings: RefCell::new(HashMap::new()),
@@ -2538,6 +2550,13 @@ impl Checker {
                         ty.clone(),
                     );
                 }
+                self.declaration_types.borrow_mut().insert(
+                    crate::checked::AnnotationSite::FunctionReturn {
+                        module: stmt.module.clone(),
+                        declaration: stmt.span,
+                    },
+                    ret_ty.clone(),
+                );
                 // A default value must fit its parameter's type.
                 for (p, pty) in params.iter().zip(&param_tys) {
                     if let Some(d) = &p.default {
@@ -2564,6 +2583,17 @@ impl Checker {
                 // becomes a `GenericFunc` (its call sites infer/supply parameters).
                 let declared_error = self.declared_error(*raises, raises_type.as_ref())?;
                 let effect_raises = declared_error.as_ref().is_some_and(|ty| *ty != Ty::Never);
+                self.declaration_effects.borrow_mut().insert(
+                    crate::checked::AnnotationSite::FunctionReturn {
+                        module: stmt.module.clone(),
+                        declaration: stmt.span,
+                    },
+                    crate::checked::DeclarationEffect {
+                        raises: effect_raises,
+                        error: effect_raises.then(|| declared_error.clone()).flatten(),
+                        returns_reference: ref_return.is_some(),
+                    },
+                );
                 let fn_ty = if decls.is_empty() {
                     let regular_tys: Vec<Ty> = params
                         .iter()
@@ -2618,6 +2648,13 @@ impl Checker {
                         ref_return: ref_return.clone().map(Box::new),
                     }
                 };
+                self.declaration_types.borrow_mut().insert(
+                    crate::checked::AnnotationSite::FunctionType {
+                        module: stmt.module.clone(),
+                        declaration: stmt.span,
+                    },
+                    fn_ty.clone(),
+                );
                 if let Err(e) = self.declare(name, fn_ty) {
                     self.tparams.pop();
                     return Err(e);
@@ -3953,6 +3990,26 @@ impl Checker {
                 );
             }
             let sig = self.method_sig(m, method_decls, &all_types)?;
+            self.declaration_types.borrow_mut().insert(
+                crate::checked::AnnotationSite::MethodReturn {
+                    module: declaration.module.clone(),
+                    declaration: declaration.span,
+                    method: method_index,
+                },
+                sig.ret.clone(),
+            );
+            self.declaration_effects.borrow_mut().insert(
+                crate::checked::AnnotationSite::MethodReturn {
+                    module: declaration.module.clone(),
+                    declaration: declaration.span,
+                    method: method_index,
+                },
+                crate::checked::DeclarationEffect {
+                    raises: sig.raises,
+                    error: sig.raises.then(|| sig.error.as_deref().cloned()).flatten(),
+                    returns_reference: sig.ref_return.is_some(),
+                },
+            );
             self.tparams.pop();
             let info = self.structs.get_mut(name).ok_or_else(|| {
                 TypeError::InvariantViolation(format!("struct '{name}' was not registered"))

@@ -21,7 +21,7 @@ pub mod token;
 pub mod types;
 
 // Re-export commonly used types at the crate root for convenience
-pub use analysis::{check_ownership, check_ownership_checked};
+pub use analysis::{check_ownership, check_ownership_checked, check_ownership_program};
 pub use ast::{
     Dtype, Expr, ImportName, ImportNames, InfixOp, Param, PrefixOp, SourceType, Stmt, Type,
     TypeParam,

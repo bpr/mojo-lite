@@ -585,3 +585,42 @@ fn pointer_construction_lowers_to_a_handle_and_owner_loan() {
         "a stable pointer deref substitutes the owner place through the loan"
     );
 }
+
+#[test]
+fn checked_lowering_records_declaration_contracts() {
+    use mojito::{Ty, check_program};
+    let src = "@fieldwise_init\nstruct Box:\n    var value: Int\n    def get(ref self) -> ref[self] Int:\n        return self.value\n\ndef plain() -> Int:\n    return 1\n\ndef failing() raises:\n    raise Error(\"boom\")\n\ndef main():\n    print(plain())\n    try:\n        failing()\n    except err:\n        print(err)\n";
+    let program = parse(src).expect("parse");
+    let checked = check_program(&program).expect("check");
+    let mir = mojito::mir::lower_checked_program(&checked);
+    assert!(
+        mir.invariant_errors.is_empty(),
+        "{:?}",
+        mir.invariant_errors
+    );
+    let function = |name: &str| {
+        &mir.functions
+            .iter()
+            .find(|(candidate, _)| candidate == name)
+            .unwrap_or_else(|| panic!("function '{name}' lowered"))
+            .1
+    };
+    assert_eq!(function("main").ret_ty, Some(Ty::None));
+    assert!(!function("main").raises);
+    assert_eq!(function("plain").ret_ty, Some(Ty::Int));
+    assert!(function("failing").raises);
+    assert_eq!(function("__toplevel__").ret_ty, Some(Ty::None));
+    // The ref-returning method records the checked fact without reading
+    // source return syntax.
+    assert!(function("Box.get").returns_reference);
+    let declaration = |name: &str| {
+        mir.declarations
+            .functions
+            .iter()
+            .find(|declaration| declaration.lowered_name == name)
+            .unwrap_or_else(|| panic!("declaration '{name}' recorded"))
+    };
+    assert_eq!(declaration("plain").ret_ty, Ty::Int);
+    assert!(declaration("failing").raises);
+    assert!(!declaration("plain").raises);
+}

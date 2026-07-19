@@ -6,7 +6,6 @@
 //! places, structured control flow, exceptions, destruction, and runtime
 //! primitives. See `docs/features.md` for the supported language surface.
 
-use super::Backend;
 use crate::ast::Stmt;
 use crate::call::{ArgSlot, CallVariadics, match_call_slots};
 use crate::checked::CheckedConst;
@@ -3594,16 +3593,19 @@ impl VmBackend {
     }
 }
 
-impl Backend for VmBackend {
-    fn run(&mut self, program: &crate::checked::CheckedProgram) -> Result<(), RuntimeError> {
+impl VmBackend {
+    /// Run a checked program, entering through `main()` when present.
+    pub fn run(&mut self, program: &crate::checked::CheckedProgram) -> Result<(), RuntimeError> {
         self.run_prog(build_prog_checked(program)?)
     }
 
-    fn output(&self) -> String {
+    /// Captured standard output.
+    pub fn output(&self) -> String {
         self.output.clone()
     }
 
-    fn bindings(&self) -> Vec<(String, Value)> {
+    /// Final top-level bindings, for the CLI `run` dump.
+    pub fn bindings(&self) -> Vec<(String, Value)> {
         self.bindings.clone()
     }
 }
@@ -3632,7 +3634,13 @@ impl VmBackend {
 }
 
 fn build_prog_checked(checked: &crate::checked::CheckedProgram) -> Result<Prog, RuntimeError> {
-    let mir = crate::analysis::elaborate_drops_program(crate::mir::lower_checked_program(checked));
+    let mut mir =
+        crate::analysis::elaborate_drops_program(crate::mir::lower_checked_program(checked));
+    // The VM executes the drop-elaborated program, so it is re-verified after
+    // the DropVar/edge-cleanup rewrite — the elaborated MIR must satisfy the
+    // same contract the pre-elaboration program did.
+    mir.invariant_errors
+        .extend(crate::mir::verify::verify(&mir));
     if !mir.invariant_errors.is_empty() {
         return Err(RuntimeError::Unsupported(format!(
             "invalid checked program: {}",

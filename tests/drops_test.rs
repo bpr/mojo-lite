@@ -14,7 +14,7 @@ use mojito::{BackendKind, check_program, parse};
 fn vm(src: &str) -> String {
     let program = parse(src).expect("parse error");
     let checked = check_program(&program).expect("type error");
-    let mut backend = BackendKind::Vm.make();
+    let mut backend = BackendKind::make("vm").expect("the register VM is implemented");
     backend.run(&checked).expect("vm run failed");
     backend.output()
 }

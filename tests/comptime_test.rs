@@ -9,7 +9,7 @@ fn run(src: &str) -> Result<String, String> {
     let program = parse(src).map_err(|e| format!("parse: {e}"))?;
     let program = elaborate(program).map_err(|e| format!("comptime: {e}"))?;
     let checked = mojito::check_program(&program).map_err(|e| format!("check: {e:?}"))?;
-    let mut backend = BackendKind::Vm.make();
+    let mut backend = BackendKind::make("vm").expect("the register VM is implemented");
     backend.run(&checked).map_err(|e| format!("run: {e:?}"))?;
     Ok(backend.output())
 }

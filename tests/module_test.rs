@@ -38,7 +38,7 @@ impl Drop for TempDir {
 fn run(entry: &Path) -> Result<String, String> {
     let program = link(entry).map_err(|e| e.to_string())?;
     let checked = check_program(&program).map_err(|e| format!("type error: {e:?}"))?;
-    let mut backend = BackendKind::Vm.make();
+    let mut backend = BackendKind::make("vm").expect("the register VM is implemented");
     backend
         .run(&checked)
         .map_err(|e| format!("runtime error: {e:?}"))?;
@@ -118,7 +118,7 @@ fn custom_search_root_is_used_after_importer_directory() {
     .map_err(|e| e.to_string())
     .unwrap();
     let checked = check_program(&program).unwrap();
-    let mut backend = BackendKind::Vm.make();
+    let mut backend = BackendKind::make("vm").expect("the register VM is implemented");
     backend.run(&checked).unwrap();
     assert_eq!(backend.output(), "42\n");
 }
@@ -146,7 +146,7 @@ fn custom_search_roots_are_tried_in_order() {
     )
     .unwrap();
     let checked = check_program(&program).unwrap();
-    let mut backend = BackendKind::Vm.make();
+    let mut backend = BackendKind::make("vm").expect("the register VM is implemented");
     backend.run(&checked).unwrap();
     assert_eq!(backend.output(), "1\n");
 }
@@ -168,7 +168,7 @@ fn importer_directory_precedes_custom_search_roots() {
     )
     .unwrap();
     let checked = check_program(&program).unwrap();
-    let mut backend = BackendKind::Vm.make();
+    let mut backend = BackendKind::make("vm").expect("the register VM is implemented");
     backend.run(&checked).unwrap();
     assert_eq!(backend.output(), "9\n");
 }

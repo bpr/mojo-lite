@@ -36,8 +36,9 @@ move.
 
 4. `CheckedProgram` is the semantic handoff. Later phases consume checked facts;
    they do not silently re-check or recover unchecked execution.
-5. MIR is the stable waist. Backends consume verified MIR and checked declaration
-   metadata rather than rediscovering language rules from AST syntax.
+5. MIR is the stable waist. Backends consume register-typed MIR that has passed
+   `mir::verify` plus ownership analysis, with checked declaration metadata,
+   rather than rediscovering language rules from AST syntax.
 6. `src/call.rs` owns structural call binding and `src/symbol.rs` owns callable
    identity. Do not duplicate either policy in the checker, MIR, or VM.
 7. Preserve source/module provenance on every AST and lowered location.

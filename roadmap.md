@@ -172,11 +172,11 @@ remain diagnostic locations, not semantic identities. Declaration-wide facts
 such as conformances, layouts, specialization records, and destruction policy
 may remain indexed metadata.
 
-- [ ] **Complete MIR value and instruction typing** — assign checked types to
+- [x] **Complete MIR value and instruction typing** — assign checked types to
   every synthetic register, constant, instruction result, call input/output, and
   effect edge. Preserve root, per-projection, and final-storage place types, and
   reject incomplete metadata without consulting source AST.
-- [ ] **Complete standalone MIR semantic verification** — verify instruction and
+- [x] **Complete standalone MIR semantic verification** — verify instruction and
   call types, CFG edges, ownership state, effects, and reference invariants from
   MIR plus checked declaration metadata alone. Keep the register VM as the
   executable specification and require production MIR to pass this verifier.

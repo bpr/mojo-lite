@@ -29,17 +29,20 @@ use std::collections::{BTreeMap, HashSet};
 pub fn check_ownership(program: &[Stmt]) -> Result<(), OwnershipError> {
     let prog =
         lower_program(program).map_err(|error| OwnershipError::InvalidInput(error.to_string()))?;
-    check_ownership_mir(&prog)
+    check_ownership_program(&prog)
 }
 
 pub fn check_ownership_checked(
     program: &crate::checked::CheckedProgram,
 ) -> Result<(), OwnershipError> {
     let prog = crate::mir::lower_checked_program(program);
-    check_ownership_mir(&prog)
+    check_ownership_program(&prog)
 }
 
-fn check_ownership_mir(prog: &MirProgram) -> Result<(), OwnershipError> {
+/// Run the ownership analysis over an already-lowered program — the
+/// standalone-MIR core the pipeline composes with `mir::verify` so production
+/// MIR is fully verified before execution.
+pub fn check_ownership_program(prog: &MirProgram) -> Result<(), OwnershipError> {
     for (_name, f) in &prog.functions {
         analyze_moves(f)?;
         analyze_loans(f)?;
@@ -381,6 +384,10 @@ fn elaborate_drops(f: &MirFunction) -> MirFunction {
         owned_params: f.owned_params.clone(),
         ref_params: f.ref_params.clone(),
         returns_reference: f.returns_reference,
+        var_tys: f.var_tys.clone(),
+        ret_ty: f.ret_ty.clone(),
+        raises: f.raises,
+        error_ty: f.error_ty.clone(),
         spans: SpanTable(f.spans.0.clone()),
         reg_types: f.reg_types.clone(),
     }

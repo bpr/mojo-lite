@@ -60,7 +60,7 @@ fn vm(source: &str) -> String {
     let program = parse(source).expect("parse error");
     let program = elaborate(program).expect("comptime error");
     let checked = check_program(&program).expect("type error");
-    let mut backend = BackendKind::Vm.make();
+    let mut backend = BackendKind::make("vm").expect("the register VM is implemented");
     backend.run(&checked).expect("runtime error");
     backend.output()
 }
@@ -598,7 +598,7 @@ fn importing_a_name_extends_the_local_overload_set() {
     );
     let program = link(&entry).expect("link error");
     let checked = check_program(&program).expect("type error");
-    let mut backend = BackendKind::Vm.make();
+    let mut backend = BackendKind::make("vm").expect("the register VM is implemented");
     backend.run(&checked).expect("runtime error");
     assert_eq!(backend.output(), "10 20\n");
 }
